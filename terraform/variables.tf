@@ -50,3 +50,15 @@ variable "clickhouse_node_count" {
   type        = number
   default     = 4
 }
+
+variable "operator_version" {
+  description = "Altinity clickhouse-operator version (pinned)"
+  type        = string
+  default     = "0.27.1"
+}
+
+variable "clickhouse_namespace" {
+  description = "Namespace for the ClickHouse cluster and Keeper"
+  type        = string
+  default     = "clickhouse"
+}
