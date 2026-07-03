@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clickhouse-backup
+  namespace: clickhouse
+  annotations:
+    # Replace with `terraform output -raw backup_role_arn` before apply
+    eks.amazonaws.com/role-arn: "REPLACE_WITH_BACKUP_ROLE_ARN"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-backup-config
+  namespace: clickhouse
+data:
+  # Replace with `terraform output -raw backup_bucket` and your region before apply
+  S3_BUCKET: "REPLACE_WITH_BUCKET"
+  S3_REGION: "us-east-1"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: clickhouse-backup-daily
+  namespace: clickhouse
+spec:
+  schedule: "0 2 * * *" # daily 02:00 UTC
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: clickhouse-backup
+          restartPolicy: OnFailure
+          containers:
+            - name: trigger
+              image: curlimages/curl:8.10.1
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  BACKUP="backup-$(date +%Y%m%d-%H%M%S)"
+                  # One pod per shard is enough; loop over both shard leader pods.
+                  for HOST in chi-ch-main-0-0 chi-ch-main-1-0; do
+                    curl -sf -X POST "http://$HOST.clickhouse.svc.cluster.local:7171/backup/create?name=$BACKUP"
+                    curl -sf -X POST "http://$HOST.clickhouse.svc.cluster.local:7171/backup/upload/$BACKUP"
+                  done
