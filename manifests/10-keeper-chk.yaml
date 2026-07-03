@@ -18,6 +18,9 @@ spec:
   templates:
     podTemplates:
       - name: keeper-pod
+        metadata:
+          labels:
+            app: clickhouse-keeper # MUST be set here — the anti-affinity/spread selectors below match this
         spec:
           nodeSelector:
             workload: keeper
