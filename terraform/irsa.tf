@@ -38,7 +38,7 @@ resource "aws_iam_role" "backup" {
 data "aws_iam_policy_document" "backup_s3" {
   statement {
     effect  = "Allow"
-    actions = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+    actions = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"]
     resources = [
       aws_s3_bucket.backup.arn,
       "${aws_s3_bucket.backup.arn}/*",
