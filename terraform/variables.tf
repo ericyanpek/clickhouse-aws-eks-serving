@@ -62,3 +62,9 @@ variable "clickhouse_namespace" {
   type        = string
   default     = "clickhouse"
 }
+
+variable "backup_bucket_name" {
+  description = "S3 bucket name for clickhouse-backup (must be globally unique). Empty = auto-name from cluster."
+  type        = string
+  default     = ""
+}
