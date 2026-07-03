@@ -25,7 +25,7 @@ module "eks" {
       disk_size     = 50 # root EBS; data lives on instance-store NVMe
       desired_size  = var.clickhouse_node_count
       min_size      = var.clickhouse_node_count
-      max_size      = var.clickhouse_node_count + 2
+      max_size      = var.clickhouse_node_count + 2 # headroom for node replacement only; new i4i nodes = empty local disks, replica rebuild required
       zones         = var.availability_zones
       labels        = { "workload" = "clickhouse" }
       taints = [{
