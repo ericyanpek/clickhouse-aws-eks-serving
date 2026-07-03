@@ -218,19 +218,15 @@ module "eks" {
   public_cidr        = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
   private_cidr       = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
 
-  # Blueprint requires the community EKS module defaults; keep NAT + private nodes.
-  enable_nat_gateway = true
-  single_nat_gateway = true
-
-  default_ami_type     = "AL2023_x86_64_STANDARD"
-  default_ami_type_arm = "AL2023_ARM_64_STANDARD"
-  autoscaler_version   = "1.34.0"
-  autoscaler_replicas  = 1
-  endpoint_public_access = true
-  public_access_cidrs    = ["0.0.0.0/0"] # user SHOULD restrict to their office/VPN CIDR
-  enable_secrets_encryption = false
-  cluster_enabled_log_types = ["api", "audit"]
-  tags = {}
+  # NOTE: pinned v0.5.7 //eks submodule accepts ONLY these inputs. Inputs like
+  # single_nat_gateway / default_ami_type / endpoint_public_access /
+  # enable_secrets_encryption / cluster_enabled_log_types were added upstream
+  # AFTER v0.5.7 and must NOT be passed here (validate errors otherwise).
+  enable_nat_gateway  = true
+  autoscaler_version  = "1.34.0"
+  autoscaler_replicas = 1
+  public_access_cidrs = ["0.0.0.0/0"] # user SHOULD restrict to their office/VPN CIDR
+  tags                = {}
 
   node_pools = [
     {
@@ -354,27 +350,16 @@ git commit -m "feat(tf): install Altinity operator 0.27.1 via blueprint submodul
 **Files:**
 - Create: `terraform/storage.tf`
 
-Keeper uses gp3 (must survive node loss, small, relocatable). ClickHouse uses local NVMe via the sig-storage local-static-provisioner, which discovers instance-store disks mounted under a discovery dir and publishes them as `local` PVs bound to a `local-storage` StorageClass (`WaitForFirstConsumer`).
+Keeper uses gp3 — **reuse the blueprint's existing `gp3-encrypted` StorageClass** (the v0.5.7 `//eks` submodule already creates it as the cluster default via `eks/addons.tf`; do NOT redefine it — a duplicate `kubernetes_storage_class` with the same metadata name collides at apply time). ClickHouse uses local NVMe via the sig-storage local-static-provisioner, which discovers instance-store disks mounted under `/mnt/disks` and publishes them as `local` PVs bound to a `local-storage` StorageClass (`WaitForFirstConsumer`).
+
+**Verified chart facts (helm repo, 2026-07):** the only published `local-static-provisioner` versions are `1.0.0`, `2.0.0`, `2.8.0`. Use **`2.8.0`**. In 2.x the values schema puts `nodeSelector` and `tolerations` at **top level** (NOT under a `daemonset` key — that wrapper was 1.0.0-only and is silently ignored by 2.x, which would place the DaemonSet on every node).
 
 - [ ] **Step 1: Write `terraform/storage.tf`**
 
 ```hcl
-# gp3 for Keeper (and any non-CH PVC). WaitForFirstConsumer so the volume is
-# created in the same AZ as the scheduled pod.
-resource "kubernetes_storage_class" "gp3" {
-  metadata {
-    name = "gp3-encrypted"
-  }
-  storage_provisioner    = "ebs.csi.aws.com"
-  volume_binding_mode    = "WaitForFirstConsumer"
-  allow_volume_expansion = true
-  reclaim_policy         = "Delete"
-  parameters = {
-    type      = "gp3"
-    encrypted = "true"
-    fsType    = "ext4"
-  }
-}
+# NOTE: gp3-encrypted StorageClass is already created (as cluster default) by the
+# blueprint //eks submodule (eks/addons.tf). Keeper's CHK references it by name.
+# Do NOT redefine it here — a duplicate metadata.name collides at apply.
 
 # local-storage class for ClickHouse instance-store NVMe. No provisioner —
 # PVs are published by the local-static-provisioner DaemonSet below.
@@ -389,36 +374,37 @@ resource "kubernetes_storage_class" "local" {
 
 # sig-storage local-static-provisioner: discovers NVMe under /mnt/disks and
 # publishes them as `local` PVs on the local-storage class.
+# NOTE: i4i instance-store NVMe must be formatted + mounted under /mnt/disks
+# BEFORE this is useful — AL2023 does not auto-mount instance store. See README
+# "Preparing i4i NVMe". On a fresh node with empty /mnt/disks, no PVs appear and
+# ClickHouse PVCs stay Pending.
 resource "helm_release" "local_static_provisioner" {
   depends_on = [module.eks, kubernetes_storage_class.local]
 
   name       = "local-static-provisioner"
   repository = "https://kubernetes-sigs.github.io/sig-storage-local-static-provisioner"
   chart      = "local-static-provisioner"
-  version    = "1.7.0" # user confirms latest compatible at apply time
+  version    = "2.8.0" # verified published version; user confirms latest compatible at apply time
   namespace  = "kube-system"
 
+  # v2.x schema: nodeSelector + tolerations are TOP-LEVEL (no `daemonset` wrapper).
   values = [yamlencode({
     classes = [{
-      name         = "local-storage"
-      hostDir      = "/mnt/disks"
-      mountDir     = "/mnt/disks"
+      name                = "local-storage"
+      hostDir             = "/mnt/disks"
+      mountDir            = "/mnt/disks"
       blockCleanerCommand = ["/scripts/shred.sh", "2"]
     }]
-    daemonset = {
-      nodeSelector = { workload = "clickhouse" }
-      tolerations = [{
-        key      = "dedicated"
-        operator = "Equal"
-        value    = "clickhouse"
-        effect   = "NoSchedule"
-      }]
-    }
+    nodeSelector = { workload = "clickhouse" }
+    tolerations = [{
+      key      = "dedicated"
+      operator = "Equal"
+      value    = "clickhouse"
+      effect   = "NoSchedule"
+    }]
   })]
 }
 ```
-
-> **Implementer note / user-facing caveat for README:** i4i instance-store NVMe must be formatted and mounted under `/mnt/disks/<disk>` before the provisioner can publish it. This is done via a node bootstrap/user-data script or a prep DaemonSet. Add a README subsection "Preparing i4i NVMe" documenting this; the AL2023 AMI does not auto-mount instance store. (Covered in README task.)
 
 - [ ] **Step 2: Validate**
 
@@ -504,7 +490,9 @@ git commit -m "feat(tf): encrypted, versioned, private S3 bucket for backups"
 **Files:**
 - Create: `terraform/irsa.tf`
 
-The blueprint's `//eks` submodule doesn't export the OIDC provider ARN, so we resolve it via data sources against the created cluster.
+The blueprint's `//eks` submodule doesn't export the OIDC provider ARN, BUT the community EKS module it wraps (`terraform-aws-modules/eks/aws ~> 20.8`, IRSA enabled by default) **already creates the OIDC provider**. So we must **reference it via a data source**, NOT create a new one — creating `aws_iam_openid_connect_provider` for the same issuer collides at apply with `EntityAlreadyExists`.
+
+> Note: the `tls` provider pinned in `versions.tf` (Task 1) becomes unused with this data-source approach; that's harmless (an unused `required_providers` entry does not fail validate). Leave it — a later task may use it, and removing it churns the lockfile.
 
 - [ ] **Step 1: Write `terraform/irsa.tf`**
 
@@ -514,14 +502,10 @@ data "aws_eks_cluster" "this" {
   depends_on = [module.eks]
 }
 
-data "tls_certificate" "oidc" {
+# The OIDC provider is already created by the blueprint's EKS module (enable_irsa).
+# Reference it as a DATA source — creating a new one collides (EntityAlreadyExists).
+data "aws_iam_openid_connect_provider" "this" {
   url = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
-}
-
-resource "aws_iam_openid_connect_provider" "this" {
-  url             = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.oidc.certificates[0].sha1_fingerprint]
 }
 
 data "aws_iam_policy_document" "backup_assume" {
@@ -530,16 +514,16 @@ data "aws_iam_policy_document" "backup_assume" {
     effect  = "Allow"
     principals {
       type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.this.arn]
+      identifiers = [data.aws_iam_openid_connect_provider.this.arn]
     }
     condition {
       test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.this.url, "https://", "")}:sub"
+      variable = "${replace(data.aws_iam_openid_connect_provider.this.url, "https://", "")}:sub"
       values   = ["system:serviceaccount:${var.clickhouse_namespace}:clickhouse-backup"]
     }
     condition {
       test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.this.url, "https://", "")}:aud"
+      variable = "${replace(data.aws_iam_openid_connect_provider.this.url, "https://", "")}:aud"
       values   = ["sts.amazonaws.com"]
     }
   }
@@ -760,6 +744,9 @@ spec:
   templates:
     podTemplates:
       - name: keeper-pod
+        metadata:
+          labels:
+            app: clickhouse-keeper # MUST be set here — the anti-affinity/spread selectors below match this
         spec:
           nodeSelector:
             workload: keeper
@@ -932,7 +919,9 @@ spec:
               storage: 800Gi # matches i4i.xlarge instance-store; adjust per instance
 ```
 
-> **Note on anti-affinity label:** `clickhouse.altinity.com/app: chop` is the operator's standard pod label. The `requiredDuringScheduling` host anti-affinity ensures no two CH pods share a node; combined with 4 pods on a 4-node pool across 3 AZs, `topologySpreadConstraints` spreads them across zones. Because local-NVMe pins pods, `WaitForFirstConsumer` guarantees the PV is created on the node the scheduler picks.
+> **Note on anti-affinity label:** `clickhouse.altinity.com/app: chop` is the operator's standard pod label (auto-applied). Selectors are additionally scoped with `clickhouse.altinity.com/chi: ch` so they only count THIS installation's pods. The `requiredDuringScheduling` host anti-affinity ensures no two CH pods share a node; combined with 4 pods on a 4-node pool across 3 AZs, `topologySpreadConstraints` spreads them across zones. Because local-NVMe pins pods, `WaitForFirstConsumer` guarantees the PV is created on the node the scheduler picks.
+>
+> **IMPORTANT ordering (implemented in Task 10 + deploy.sh):** the CHI podTemplate sets `serviceAccountName: clickhouse-backup` for backup-sidecar IRSA. That SA is created in `30-backup-cronjob.yaml`, so deploy.sh MUST apply the SA before the CHI (see Task 13). The `admin` user defaults to `networks/ip: 127.0.0.1/32` (localhost-only) with an empty password placeholder — README documents setting a real sha256 hash and widening the network before use.
 
 - [ ] **Step 2: Validate YAML parses**
 
@@ -1106,7 +1095,8 @@ eval "$(terraform output -raw configure_kubectl)"
 cd ..
 
 echo "==> [2/5] waiting for operator to be ready"
-kubectl -n kube-system rollout status deploy/clickhouse-operator --timeout=180s || true
+# Blueprint installs the operator as helm release 'altinity-clickhouse-operator' in kube-system.
+kubectl -n kube-system rollout status deploy/altinity-clickhouse-operator --timeout=180s || true
 
 echo "==> [3/5] substituting backup role ARN and bucket into manifests"
 tmpdir=$(mktemp -d)
@@ -1114,12 +1104,21 @@ cp manifests/*.yaml "$tmpdir/"
 sed -i.bak "s|REPLACE_WITH_BACKUP_ROLE_ARN|$ROLE_ARN|g" "$tmpdir/30-backup-cronjob.yaml"
 sed -i.bak "s|REPLACE_WITH_BUCKET|$BUCKET|g; s|S3_REGION: \"us-east-1\"|S3_REGION: \"$REGION\"|g" "$tmpdir/30-backup-cronjob.yaml"
 
+# Fail-fast if any placeholder survived substitution (would silently break IRSA/backup).
+if grep -q "REPLACE_WITH" "$tmpdir/30-backup-cronjob.yaml"; then
+  echo "ERROR: unsubstituted REPLACE_WITH placeholder remains in 30-backup-cronjob.yaml" >&2
+  exit 1
+fi
+
 echo "==> [4/5] applying manifests in order"
 kubectl apply -f "$tmpdir/00-namespace.yaml"
+# The clickhouse-backup ServiceAccount + ConfigMap must exist BEFORE the CHI, because the
+# CHI podTemplate sets serviceAccountName: clickhouse-backup and the sidecar reads the ConfigMap.
+# 30 defines the SA/ConfigMap (and the CronJob, harmless to create early), so apply it before 20.
+kubectl apply -f "$tmpdir/30-backup-cronjob.yaml"
 kubectl apply -f "$tmpdir/10-keeper-chk.yaml"
 kubectl -n clickhouse wait --for=condition=Ready pod -l app=clickhouse-keeper --timeout=300s || true
 kubectl apply -f "$tmpdir/20-clickhouse-chi.yaml"
-kubectl apply -f "$tmpdir/30-backup-cronjob.yaml"
 kubectl apply -f "$tmpdir/40-grafana-dashboard.yaml"
 
 echo "==> [5/5] done. Watch rollout with: kubectl -n clickhouse get chi,chk,pods -w"
