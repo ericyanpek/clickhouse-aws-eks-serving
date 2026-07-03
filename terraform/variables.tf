@@ -19,6 +19,11 @@ variable "cluster_name" {
   description = "EKS cluster name"
   type        = string
   default     = "clickhouse-eks"
+
+  validation {
+    condition     = can(regex("^[a-z0-9-]{1,52}$", var.cluster_name))
+    error_message = "cluster_name must be lowercase letters, numbers, and hyphens, max 52 chars (feeds the S3 backup bucket auto-name, which has a 63-char limit)."
+  }
 }
 
 variable "aws_profile" {

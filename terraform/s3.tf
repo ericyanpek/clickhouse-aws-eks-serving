@@ -4,6 +4,9 @@ locals {
 
 resource "aws_s3_bucket" "backup" {
   bucket = local.backup_bucket
+  # WARNING: allows `terraform destroy` to delete a non-empty bucket (all backups lost).
+  # Appropriate for disposable/test clusters. For production, set to false and drain manually.
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_versioning" "backup" {
