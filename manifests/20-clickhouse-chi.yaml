@@ -15,8 +15,11 @@ spec:
         - host: keeper-keeper.clickhouse.svc.cluster.local
           port: 2181
     users:
-      admin/password_sha256_hex: "" # set via secret at apply; placeholder documented in README
-      admin/networks/ip: "::/0"
+      # SECURITY: empty password_sha256_hex = passwordless admin. Left empty as a placeholder —
+      # set a real sha256 hash AND widen networks/ip before use. See README "Set the admin password".
+      # Default networks/ip is localhost-only so a bare `kubectl apply` does NOT expose an open superuser.
+      admin/password_sha256_hex: ""
+      admin/networks/ip: "127.0.0.1/32"
       admin/profile: default
     clusters:
       - name: main
@@ -36,6 +39,9 @@ spec:
     podTemplates:
       - name: ch-pod
         spec:
+          # backup sidecar assumes the S3 IAM role via IRSA through this SA
+          # (created in 30-backup-cronjob.yaml — must be applied before this CHI).
+          serviceAccountName: clickhouse-backup
           nodeSelector:
             workload: clickhouse
           tolerations:
@@ -49,6 +55,7 @@ spec:
                 - labelSelector:
                     matchLabels:
                       clickhouse.altinity.com/app: chop
+                      clickhouse.altinity.com/chi: ch
                   topologyKey: kubernetes.io/hostname
           topologySpreadConstraints:
             - maxSkew: 1
@@ -57,6 +64,7 @@ spec:
               labelSelector:
                 matchLabels:
                   clickhouse.altinity.com/app: chop
+                  clickhouse.altinity.com/chi: ch
           containers:
             - name: clickhouse
               image: "clickhouse/clickhouse-server:24.8"
@@ -70,6 +78,13 @@ spec:
             - name: clickhouse-backup
               image: "altinity/clickhouse-backup:2.6.0"
               args: ["server"]
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
               env:
                 - name: LOG_LEVEL
                   value: "info"
@@ -98,3 +113,14 @@ spec:
           resources:
             requests:
               storage: 800Gi # matches i4i.xlarge instance-store; adjust per instance
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ch-pdb
+  namespace: clickhouse
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      clickhouse.altinity.com/chi: ch
