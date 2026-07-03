@@ -26,3 +26,27 @@ variable "aws_profile" {
   type        = string
   default     = null
 }
+
+variable "cluster_version" {
+  description = "EKS Kubernetes version"
+  type        = string
+  default     = "1.34"
+}
+
+variable "vpc_cidr" {
+  description = "VPC CIDR block"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "clickhouse_instance_type" {
+  description = "Instance type for ClickHouse nodes — MUST be a local-NVMe family (i4i/i3). Default i4i.xlarge."
+  type        = string
+  default     = "i4i.xlarge"
+}
+
+variable "clickhouse_node_count" {
+  description = "Number of ClickHouse nodes = shards × replicas. Design is 2×2 = 4."
+  type        = number
+  default     = 4
+}
