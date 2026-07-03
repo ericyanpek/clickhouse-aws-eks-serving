@@ -9,16 +9,19 @@ terraform init
 terraform apply
 BUCKET=$(terraform output -raw backup_bucket)
 ROLE_ARN=$(terraform output -raw backup_role_arn)
-REGION=$(terraform output -raw configure_kubectl | grep -oE 'region [a-z0-9-]+' | awk '{print $2}')
+REGION=$(terraform output -raw region)
+[ -n "$REGION" ] || { echo "ERROR: could not read region from terraform output" >&2; exit 1; }
 eval "$(terraform output -raw configure_kubectl)"
 cd ..
 
 echo "==> [2/5] waiting for operator to be ready"
 # Blueprint installs the operator as helm release 'altinity-clickhouse-operator' in kube-system.
-kubectl -n kube-system rollout status deploy/altinity-clickhouse-operator --timeout=180s || true
+kubectl -n kube-system rollout status deploy/altinity-clickhouse-operator --timeout=180s \
+  || echo "WARNING: operator rollout did not complete in time — CHI apply may fail" >&2
 
 echo "==> [3/5] substituting backup role ARN and bucket into manifests"
 tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
 cp manifests/*.yaml "$tmpdir/"
 sed -i.bak "s|REPLACE_WITH_BACKUP_ROLE_ARN|$ROLE_ARN|g" "$tmpdir/30-backup-cronjob.yaml"
 sed -i.bak "s|REPLACE_WITH_BUCKET|$BUCKET|g; s|S3_REGION: \"us-east-1\"|S3_REGION: \"$REGION\"|g" "$tmpdir/30-backup-cronjob.yaml"

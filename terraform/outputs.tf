@@ -19,3 +19,7 @@ output "backup_role_arn" {
 output "clickhouse_namespace" {
   value = var.clickhouse_namespace
 }
+
+output "region" {
+  value = var.region
+}

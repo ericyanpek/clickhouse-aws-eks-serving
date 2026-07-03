@@ -24,9 +24,16 @@ kubectl -n "$NS" exec chi-ch-main-0-1 -c clickhouse -- clickhouse-client -q \
   "SELECT count() FROM default.t_local"
 
 echo "==> total across shards via distributed"
-run "SELECT count() FROM default.t_dist"
+DIST_COUNT=$(run "SELECT count() FROM default.t_dist" | tr -d '[:space:]')
+echo "distributed count = $DIST_COUNT"
 
 echo "==> replication health"
 run "SELECT database, table, is_readonly, absolute_delay FROM system.replicas WHERE table='t_local'"
+REPLICA_ROWS=$(run "SELECT count() FROM system.replicas WHERE table='t_local'" | tr -d '[:space:]')
 
-echo "==> PASS if distributed count == 1000 and replica count > 0"
+if [ "$DIST_COUNT" = "1000" ] && [ "$REPLICA_ROWS" -gt 0 ] 2>/dev/null; then
+  echo "==> SMOKE TEST PASSED (distributed count=1000, replicas registered=$REPLICA_ROWS)"
+else
+  echo "==> SMOKE TEST FAILED (distributed count=$DIST_COUNT expected 1000; replicas=$REPLICA_ROWS expected >0)" >&2
+  exit 1
+fi
