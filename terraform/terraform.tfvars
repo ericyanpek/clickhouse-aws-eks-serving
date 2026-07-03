@@ -17,5 +17,5 @@ backup_bucket_name = ""
 enable_monitoring = true
 # grafana_admin_password = "set-me"   # uncomment and set, or change after first login
 
-# SECURITY: restrict EKS API access to your CIDR before apply (default is world-open).
-# public_access_cidrs = ["203.0.113.0/24"]
+# SECURITY: default is world-open. Restrict to your office/VPN CIDR before production.
+public_access_cidrs = ["0.0.0.0/0"]

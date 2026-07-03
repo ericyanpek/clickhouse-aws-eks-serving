@@ -14,7 +14,7 @@ module "eks" {
 
   autoscaler_version  = "1.34.0"
   autoscaler_replicas = 1
-  public_access_cidrs = ["0.0.0.0/0"] # user SHOULD restrict to their office/VPN CIDR
+  public_access_cidrs = var.public_access_cidrs
   tags                = {}
 
   node_pools = [
