@@ -8,7 +8,7 @@ terraform {
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = ">= 2.25.2"
+      version = ">= 2.25.2, < 3.0" # v3 not yet tested against operator/monitoring resources
     }
     helm = {
       source  = "hashicorp/helm"
@@ -16,7 +16,7 @@ terraform {
     }
     tls = {
       source  = "hashicorp/tls"
-      version = ">= 4.0"
+      version = "~> 4.0"
     }
   }
 
