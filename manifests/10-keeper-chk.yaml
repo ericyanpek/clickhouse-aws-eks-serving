@@ -61,3 +61,14 @@ spec:
           resources:
             requests:
               storage: 20Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keeper-pdb
+  namespace: clickhouse
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: clickhouse-keeper
