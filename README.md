@@ -58,9 +58,8 @@ Edit `terraform/terraform.tfvars` before running anything:
 region             = "us-east-1"
 availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
 
-# 2. Set a globally unique S3 bucket name for backups.
-#    Leave empty to auto-name as "<cluster_name>-ch-backups".
-backup_bucket_name = "my-company-ch-backups-prod"
+# 2. S3 bucket name for backups.
+backup_bucket_name = ""   # empty = auto-name "<cluster_name>-ch-backups"; set a globally-unique name to override
 
 # 3. SECURITY: restrict to your office/VPN CIDR — do NOT leave world-open in production.
 public_access_cidrs = ["203.0.113.0/24"]
@@ -71,7 +70,7 @@ public_access_cidrs = ["203.0.113.0/24"]
 
 # 5. Set a Grafana admin password (or change it after first login).
 #    If left empty the chart default "prom-operator" is used.
-grafana_admin_password = "set-me"
+# grafana_admin_password = "set-me"   # uncomment and set, or change after first login (default: prom-operator)
 ```
 
 Key defaults to be aware of:
@@ -186,7 +185,7 @@ The test:
 4. Reads back from the peer replica of shard 0 to verify cross-replica sync.
 5. Reads the distributed count and the replication health from `system.replicas`.
 
-Expected output:
+Expected output (the replica count is printed live; expect 4 on a healthy 2×2 cluster):
 
 ```
 ==> SMOKE TEST PASSED (distributed count=1000, replicas registered=4)
