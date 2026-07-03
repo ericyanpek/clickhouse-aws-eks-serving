@@ -73,3 +73,16 @@ variable "backup_bucket_name" {
   type        = string
   default     = ""
 }
+
+variable "enable_monitoring" {
+  description = "Install kube-prometheus-stack (Prometheus + Grafana)"
+  type        = bool
+  default     = true
+}
+
+variable "grafana_admin_password" {
+  description = "Grafana admin password. Empty = chart default (change after first login)."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
