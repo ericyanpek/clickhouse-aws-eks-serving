@@ -12,7 +12,7 @@
 |---|---|
 | 产出 | 可评审的 IaC 代码,用户自己 apply |
 | 拓扑 | **2 分片 × 2 副本 + 3 Keeper**(4 个 ClickHouse 节点 + 3 Keeper 节点) |
-| EKS 来源 | 全新 VPC + EKS(基于 Altinity Terraform EKS Blueprint 思路) |
+| EKS 来源 | 全新 VPC + EKS,**复用 Altinity Terraform EKS Blueprint 的 `eks/` 子模块(钉 v0.5.7)**;方案 1 混合式 |
 | 存储 | **本地 NVMe**(i4i 实例),方案 A:钉住 + 双副本兜底 |
 | 网络暴露 | ClusterIP(集群内部访问) |
 | 监控 | Prometheus + Grafana(kube-prometheus-stack) |
@@ -34,6 +34,22 @@
 **Keeper 例外**:Keeper 用 **gp3** 而非本地盘。Keeper 数据小、需持久、挂一个节点要能在别处用 PV 重建——本地盘做不到。
 
 ---
+
+## 2.5 复用 Altinity EKS Blueprint(方案 1 混合式,已确认)
+
+经审查上游 `Altinity/terraform-aws-eks-clickhouse`(v0.5.7)源码,确定分工:
+
+**复用 blueprint 的部分(成熟、AWS 官方合作,不重造轮子):**
+- `//eks` 子模块:VPC + 3 AZ 子网 + NAT + EKS 集群 + 节点组 + cluster-autoscaler + IAM。作为 child module 引用(该子模块不含内部 provider 块,可干净消费)。
+- `//clickhouse-operator` 子模块:安装 Altinity operator(版本钉到 `0.27.1`,覆盖其默认 `0.24.4`)。
+
+**丢弃 blueprint 的部分(封闭、表达不了本设计):**
+- `//clickhouse-cluster` 子模块——弃用。其 CHI 拓扑写死在上游 helm chart `clickhouse-eks`(0.1.8),TF 仅暴露 zones/instance_type/name/user/password,**无法配置 2×2 分片副本、本地 NVMe(它写死 `gp3-encrypted`)、反亲和、备份**。改为我们自己写 CHI/CHK manifests。
+
+**blueprint 接口约束(计划中必须遵守):**
+- `eks_node_pools` 节点名**强制** `clickhouse` 或 `system` 前缀(有 validation)→ Keeper 节点组命名为 `system-keeper`。
+- Provider 版本锁:AWS `~> 5.40`、helm `>= 2.9, < 3.0`、kubernetes `>= 2.25.2`。
+- OIDC provider ARN 未在根 outputs 暴露 → clickhouse-backup 的 IRSA 由我们在 wrapper 里用 `data.aws_eks_cluster` + `aws_iam_openid_connect_provider` 数据源自建。
 
 ## 3. 整体架构
 
@@ -76,13 +92,14 @@ clickhouse-deployment/
 │   ├── clickhouse-on-eks-research.md        # 已有调研
 │   └── superpowers/specs/2026-07-03-...-design.md  # 本设计文档
 ├── terraform/
-│   ├── main.tf              # provider, backend
-│   ├── vpc.tf               # VPC + 3 AZ 子网 + NAT
-│   ├── eks.tf               # EKS 集群 + 3 节点组(system/clickhouse/keeper)
-│   ├── storage.tf           # gp3 StorageClass + local-static-provisioner
-│   ├── irsa.tf              # clickhouse-backup 的 IAM role (IRSA)
-│   ├── s3.tf                # 备份 bucket
-│   ├── addons.tf            # EBS CSI, operator, kube-prometheus-stack (helm)
+│   ├── versions.tf          # provider 版本锁(aws ~>5.40, helm <3, k8s >=2.25)+ backend
+│   ├── providers.tf         # aws/kubernetes/helm provider(指向 EKS,exec 取 token)
+│   ├── eks.tf               # module "eks" → Altinity blueprint //eks 子模块 (v0.5.7)
+│   ├── operator.tf          # module "operator" → blueprint //clickhouse-operator (钉 0.27.1)
+│   ├── storage.tf           # gp3 StorageClass + local-static-provisioner (helm)
+│   ├── monitoring.tf        # kube-prometheus-stack (helm)
+│   ├── irsa.tf              # OIDC 数据源 + clickhouse-backup 的 IAM role/policy
+│   ├── s3.tf                # 备份 bucket(加密/阻断公有/版本化)
 │   ├── variables.tf         # 所有可调参数(版本、实例类型、副本数…)
 │   ├── outputs.tf           # kubeconfig 命令、service 地址、bucket 名
 │   └── terraform.tfvars     # 钉定的默认值(apply 前审这个)
