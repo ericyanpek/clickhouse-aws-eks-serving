@@ -63,6 +63,27 @@
 
 ---
 
+## 3.5 与 AWS `data-on-eks` 参考栈的对比
+
+AWS 官方的 [data-on-eks](https://awslabs.github.io/data-on-eks/docs/datastacks/databases/clickhouse-on-eks/infra) 提供了另一个 ClickHouse-on-EKS 参考实现。两者**同源(都基于 Altinity operator)、异路**:它是"功能全开的数据平台样板",本方案是"为特定定位做减法的精简生产方案"。
+
+| 维度 | AWS data-on-eks(参考栈) | 本方案 | 实质 |
+|---|---|---|---|
+| 节点伸缩 | **Karpenter**(按需/Spot,pod 驱动) | cluster-autoscaler(蓝图自带,固定节点组) | 平台弹性 vs 依赖少、可评审 |
+| 应用交付 | **ArgoCD(GitOps)** 全家桶 | 裸 Terraform + kubectl | 平台工程 vs 心智负担低 |
+| 拓扑 | **3 分片 × 3 副本(9 Pod)** | **1 分片 × 3 副本(3 Pod)** | 展示分布式全貌 vs "先扩容、后分片" |
+| 机型 | Graviton m6g.8xlarge | Graviton i8g.4xlarge | 都 ARM,存储家族不同 |
+| 存储 | **EBS gp3 500Gi/副本** | **本地 NVMe ~3.75TB** | 稳妥恢复快 vs IO 上限高(靠副本+S3 兜底) |
+| Operator / Keeper | Altinity / 3 节点 | Altinity 0.27.1 / 3 节点 + PDB | 同源 |
+| 反亲和 / 备份 | 文档未体现 | 显式反亲和+zone spread+PDB / clickhouse-backup→S3 | 本方案更严格、补齐备份 |
+
+**三个关键分歧不是对错,是定位不同:**
+- **Karpenter/ArgoCD vs 固定节点组/Terraform**:前者面向"已有平台团队的数据平台",后者面向"要一套可控的 ClickHouse,而非一套平台"。
+- **3×3 vs 1×3**:前者演示分布式,后者遵循"scale-up first, shard last"(分片无自动 rebalance,先垂直做大 + `parallel_replicas`)。
+- **EBS vs 本地 NVMe**:前者稳妥,后者为压测/serving 加速追求 IO 上限,并配齐其前提(跨 AZ 反亲和 + S3 备份 + NVMe 挂载)。
+
+> 一句话:**data-on-eks 教你"分布式怎么搭";本方案主张"先别急着分布式",并把依赖收敛到最小。** 两者可互为参照——见下节"演进方向"。
+
 ## 4. 架构一览
 
 ```
