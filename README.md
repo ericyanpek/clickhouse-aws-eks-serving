@@ -11,12 +11,13 @@
 
 ## 1. 这套方案解决什么问题
 
-在 EKS 上跑生产级 ClickHouse,业界现成的起点主要有两个,各有明显短板:
+在 AWS 上运行生产级 ClickHouse 有多条成熟路径,各自面向不同需求,并无绝对优劣:
 
-- **Altinity Terraform EKS Blueprint**(官方、与 AWS EKS 团队合作):基础设施层(VPC / EKS / 节点组 / IAM / autoscaler)非常成熟,但其内置的 ClickHouse 集群层把拓扑**写死在上游 Helm chart 里**,只暴露 zones / instance_type / name / user / password 五个参数,**无法表达自定义分片副本、本地 NVMe、反亲和调度、备份**。
-- **ClickHouse Cloud BYOC**:全托管、省心,但控制平面在 ClickHouse 一侧,定制空间有限,且非纯自持。
+- **ClickHouse Cloud on AWS**(AWS Marketplace 可采购):原厂托管 SaaS。存算分离架构(SharedMergeTree + S3 对象存储),计算按需自动伸缩、可 idle,工程与管理优化成熟,轻运维。**面向希望把运维完全交给原厂、按用量付费、快速上线的团队**——这是多数场景下省心且稳妥的首选。详见 [§3.6 与 ClickHouse Cloud on AWS 的对比](#36-与-clickhouse-cloud-on-aws-的对比)。
+- **Altinity Terraform EKS Blueprint**(官方、与 AWS EKS 团队合作):自管路线的成熟起点。基础设施层(VPC / EKS / 节点组 / IAM / autoscaler)久经考验;但其内置的 ClickHouse 集群层把拓扑封装在上游 Helm chart 内,仅暴露 zones / instance_type / name / user / password 五个参数,难以表达自定义分片副本、本地 NVMe、反亲和调度、备份等生产诉求。
+- **本方案**:同属自管路线,在蓝图基础上做**针对性取舍**——复用其成熟的基础设施层,把封装的集群层替换为**自管的 CHI/CHK 声明式清单**。在"不重造 VPC/EKS 轮子"的同时,拿回对 ClickHouse 拓扑、存储、调度与运维的完全控制权。
 
-本方案取两者之长:**用蓝图久经考验的基础设施层,把封闭的集群层换成自管的 CHI/CHK 声明式清单**,从而在"不重造 VPC/EKS 轮子"的同时,拿回对 ClickHouse 拓扑与运维的完全控制权。
+**本方案的定位不是取代托管服务,而是覆盖"需要完全运行在自己 AWS 账号内、深度定制、本地 NVMe IO 特性、并纳入自有 IaC/GitOps/合规体系"的场景。** 若这些不是硬需求,ClickHouse Cloud on AWS 往往是更省心的选择。
 
 ---
 
@@ -63,6 +64,12 @@
 
 被验证推翻的上游宣传(见调研报告):蓝图"负责 backup/recovery"未被证实——它只部署 operator,备份能力需自建(即本方案第 4/6/11 项)。
 
+**相较蓝图的进阶价值,提炼为四点:**
+1. **拓扑与存储自主**:蓝图把集群层锁死在 5 个参数;本方案用声明式 CHI/CHK 拿回分片副本、本地 NVMe、存储类的完全控制——这是从"能跑"到"按需生产化"的关键差别。
+2. **性能选型到位**:Graviton(i8g)+ 本地 NVMe 直连 + 专属节点资源模型(CPU 不设 limit 避免 CFS throttle、内存 request==limit、page cache ratio),把单节点性能压到该机型的上限——蓝图默认的通用 x86 + gp3 达不到。
+3. **生产必备的补齐**:独立 Keeper + PDB、跨 AZ 反亲和、clickhouse-backup→S3(蓝图完全没有)、i8g NVMe 自动挂载(蓝图不处理,否则 PVC 永久 Pending)。
+4. **流程健壮性**:两阶段 apply(避开 helm provider 连接未就绪集群)、两阶段 teardown(避免 provider 竞争导致状态损坏/资源残留计费)——这些是蓝图单次 apply/destroy 不具备的工程加固,来自真实部署中踩过的坑。
+
 ---
 
 ## 3.5 与 AWS `data-on-eks` 参考栈的对比
@@ -85,6 +92,32 @@ AWS 官方的 [data-on-eks](https://awslabs.github.io/data-on-eks/docs/datastack
 - **EBS vs 本地 NVMe**:前者稳妥,后者为压测/serving 加速追求 IO 上限,并配齐其前提(跨 AZ 反亲和 + S3 备份 + NVMe 挂载)。
 
 > 一句话:**data-on-eks 教你"分布式怎么搭";本方案主张"先别急着分布式",并把依赖收敛到最小。** 两者可互为参照——见下节"演进方向"。
+
+## 3.6 与 ClickHouse Cloud on AWS 的对比
+
+[ClickHouse Cloud on AWS](https://clickhouse.com/cloud)(AWS Marketplace 可采购)是原厂托管 SaaS,也是多数团队的稳妥首选。它与本方案是**两种架构范式**,不是"托管版 vs 弱化版"——真正的区别在架构哲学与运维模型,各有最佳场景。
+
+| 维度 | ClickHouse Cloud on AWS(原厂 SaaS) | 本方案(自管 EKS) | 实质 |
+|---|---|---|---|
+| 运维模型 | **全托管、轻运维**,原厂负责升级/伸缩/故障 | 自运维(operator 辅助),责任在自己 | ⭐ Cloud 的核心优势 |
+| 存储架构 | **存算分离**,数据在 S3,`SharedMergeTree` | 存算一体,本地 NVMe,`ReplicatedMergeTree` | 范式不同(见下) |
+| 弹性 | **计算独立伸缩、可 idle 近零、按用量计费** | 固定节点组(可演进到弹性) | ⭐ Cloud 优势 |
+| 副本协调 | 经 S3 + Keeper,**副本间不互传数据** | 副本间 fetch part(interserver) | 各有取舍 |
+| IO 路径 | 以 S3 为主(计算侧缓存机制官方未详述) | **本地 NVMe 直连**,低延迟高 IOPS | IO 敏感场景本方案理论占优 |
+| 定制深度 | 平台化,定制在托管边界内 | **内核参数/调度/存储类/拓扑完全可改** | ⭐ 本方案优势 |
+| 数据主权 | 标准版数据面在 CH 账号;另有 **BYOC**(数据面在你 VPC) | **完全在自己 AWS 账号内** | 各有选项 |
+| 成本结构 | 按用量 + 托管价值(省人力) | 基础设施成本 + 自运维人力 | 结构不同,不宜简单比高低 |
+| 采购/合规 | Marketplace 一键采购,原厂 SLA | 纳入自有 IaC/GitOps/合规审计流程 | 取决于组织要求 |
+
+**先明确肯定 ClickHouse Cloud 的优势(都是真实的):** 原厂托管的轻运维体验、`SharedMergeTree` 面向对象存储的工程优化(更高插入吞吐、更好的后台 merge、副本扩展无需互传数据)、计算的弹性伸缩与 idle、以及 AWS Marketplace 的采购便利与原厂 SLA。**对绝大多数希望"专注业务、少碰基础设施"的团队,它是更优解。**
+
+**本方案的差异化价值,在于覆盖托管边界之外的场景:**
+- **完全自持**:全部资源运行在自己的 AWS 账号内,满足强数据主权/合规审计诉求(BYOC 也能自持,但本方案的定制自由度更高)。
+- **深度定制**:内核参数、调度亲和、存储类、拓扑均可改到位——托管服务出于稳定性会限制这类底层旋钮。
+- **本地 NVMe 的 IO 特性**:存算一体 + 本地盘直连,在对**热数据低延迟扫描/点查**敏感的场景有架构层面的 IO 优势。
+- **纳入自有 IaC 体系**:整套是可评审的 Terraform + 声明式清单,天然融入既有 GitOps/CI/合规流程。
+
+> **严谨说明**:两者的 IO 路径不同(本地 NVMe 直连 vs S3+缓存),本方案在 IO 敏感负载上**理论**有延迟优势,但官方未提供与自管本地盘的量化对比,故本仓库**不声称"更快"**——请以自身负载在 [`docs/perf-testing-plan.md`](./docs/perf-testing-plan.md) 下实测为准。选型应回到需求:**要省心与弹性 → ClickHouse Cloud;要自持、定制与本地盘 IO → 本方案。**
 
 ## 4. 架构一览
 
