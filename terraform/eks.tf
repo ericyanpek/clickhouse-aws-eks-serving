@@ -54,14 +54,16 @@ module "eks" {
     },
     {
       name          = "system-keeper"
-      instance_type = "t3.medium"
-      ami_type      = "AL2023_x86_64_STANDARD" # explicit — blueprint default AL2_x86_64 fails on 1.34
-      disk_size     = 20
-      desired_size  = 1 # PER AZ → 3 zones × 1 = 3 Keeper nodes (odd quorum across AZs)
-      min_size      = 1
-      max_size      = 1
-      zones         = var.availability_zones
-      labels        = { "workload" = "keeper" }
+      instance_type = "m7g.large" # Graviton, NON-burstable: Keeper is on the write/DDL
+      # critical path; a burstable t3 would stall the whole
+      # cluster when CPU credits exhaust under load.
+      ami_type     = "AL2023_ARM_64_STANDARD" # ARM64 to match m7g (Graviton)
+      disk_size    = 20
+      desired_size = 1 # PER AZ → 3 zones × 1 = 3 Keeper nodes (odd quorum across AZs)
+      min_size     = 1
+      max_size     = 1
+      zones        = var.availability_zones
+      labels       = { "workload" = "keeper" }
       taints = [{
         key    = "dedicated"
         value  = "keeper"
