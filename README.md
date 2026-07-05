@@ -1,369 +1,126 @@
-# ClickHouse on EKS
+# ClickHouse on Amazon EKS —— 生产级部署方案
 
-Production-grade ClickHouse cluster on AWS EKS, managed by the Altinity operator, built with Terraform.
+**中文** · [English](./README.en.md)
 
-## Overview
+> 一套将 ClickHouse 以 **1 分片 × 3 副本** 拓扑部署到 Amazon EKS 的可评审、可执行 IaC。
+> 复用 Altinity 官方 Terraform 蓝图的基础设施层,替换其封闭的集群层,换取对分片/副本拓扑、本地 NVMe、调度亲和性与备份的完全控制。
+>
+> 操作手册见 [`README.en.md`](./README.en.md)(英文,含前置条件、部署步骤、验证、成本、销毁)。本文只讲**方案的意义、取舍与相对上游蓝图的差异**。
 
-This repository provisions a complete ClickHouse deployment on AWS EKS:
+---
 
-- **ClickHouse**: 1 shard x 3 replicas (3 pods) on `i8g.4xlarge` nodes (ARM/Graviton) with local NVMe storage
-- **ClickHouse Keeper**: 3-node quorum on `gp3-encrypted` EBS volumes, spread across 3 AZs
-- **Operator**: Altinity clickhouse-operator v0.27.1, installed as Helm release `altinity-clickhouse-operator` in `kube-system`
-- **Infrastructure**: New VPC + EKS cluster built from the Altinity Terraform EKS Blueprint (`//eks` + `//clickhouse-operator` submodules, pinned v0.5.7)
-- **Monitoring**: Prometheus + Grafana via `kube-prometheus-stack`
-- **Backup**: `clickhouse-backup` sidecar writing to S3 via IRSA (IAM Roles for Service Accounts)
-- **Networking**: All ClickHouse services are `ClusterIP` (internal only); access via `kubectl port-forward`
+## 1. 这套方案解决什么问题
 
-Reference documents:
-- [Design spec](docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) — architecture decisions and component choices
-- [Research notes](docs/clickhouse-on-eks-research.md) — evaluated alternatives and pinned version rationale
+在 EKS 上跑生产级 ClickHouse,业界现成的起点主要有两个,各有明显短板:
 
-## Prerequisites
+- **Altinity Terraform EKS Blueprint**(官方、与 AWS EKS 团队合作):基础设施层(VPC / EKS / 节点组 / IAM / autoscaler)非常成熟,但其内置的 ClickHouse 集群层把拓扑**写死在上游 Helm chart 里**,只暴露 zones / instance_type / name / user / password 五个参数,**无法表达自定义分片副本、本地 NVMe、反亲和调度、备份**。
+- **ClickHouse Cloud BYOC**:全托管、省心,但控制平面在 ClickHouse 一侧,定制空间有限,且非纯自持。
 
-| Tool | Version |
-|------|---------|
-| Terraform | >= 1.5 |
-| AWS CLI | any recent; credentials must be configured |
-| kubectl | matching target cluster version |
-| helm | >= 3 |
+本方案取两者之长:**用蓝图久经考验的基础设施层,把封闭的集群层换成自管的 CHI/CHK 声明式清单**,从而在"不重造 VPC/EKS 轮子"的同时,拿回对 ClickHouse 拓扑与运维的完全控制权。
 
-**AWS account requirements:**
+---
 
-- Sufficient `i8g.4xlarge` instance quota in your target region (3 instances needed). `i8g` is a Graviton/ARM instance family. Check Service Quotas in the AWS console (`EC2 > Running On-Demand G instances`) and request an increase if needed.
-- IAM permissions covering: EKS, VPC/EC2, IAM (role + policy + OIDC provider creation), S3.
-- The deploying IAM principal must be able to create IAM roles with `iam:CreateRole`, `iam:AttachRolePolicy`, and `iam:PassRole`.
+## 2. 出处与依据(Provenance)
 
-## Cost Warning
+本方案不是凭空设计,而是在权威来源上做减法与定制。所有引用均可追溯:
 
-This deployment runs continuously and incurs significant AWS charges:
+| 来源 | 用途 | 链接 |
+|---|---|---|
+| **Altinity Terraform AWS EKS Blueprint** `v0.5.7` | 复用其 `//eks`(VPC/EKS/节点组/IAM/autoscaler)与 `//clickhouse-operator` 子模块 | https://github.com/Altinity/terraform-aws-eks-clickhouse |
+| **Altinity Kubernetes Operator for ClickHouse** `0.27.1` | 通过 CHI / CHK CRD 声明式管理 ClickHouse 集群与 Keeper | https://github.com/Altinity/clickhouse-operator |
+| **ClickHouse 官方 BYOC on AWS** | 验证了 "operator-on-EKS" 模式在规模化生产中的可行性 | https://clickhouse.com/blog/building-clickhouse-byoc-on-aws |
+| **ClickHouse Keeper 官方文档 / Altinity KB** | 协调层选型(NuRAFT,替代 ZooKeeper)与 3 节点奇数 quorum | https://clickhouse.com/docs/guides/sre/keeper/clickhouse-keeper |
+| **sig-storage local-static-provisioner** `2.8.0` | 将 i8g 本地 NVMe 发布为 `local` PV | https://github.com/kubernetes-sigs/sig-storage-local-static-provisioner |
+| **kube-prometheus-stack** + Altinity Grafana dashboard `#12163` | 监控栈 | https://grafana.com/grafana/dashboards/12163 |
 
-| Resource | Count | Estimated cost |
-|----------|-------|---------------|
-| `i8g.4xlarge` (ClickHouse nodes, ARM/Graviton) | 3 | ~$1.35/hr each (approx; confirm current pricing) |
-| `t3.medium` (Keeper nodes) | 3 | ~$0.042/hr each |
-| `t3.large` (EKS system nodes) | 2 | ~$0.083/hr each |
-| NAT Gateway | 1-3 | ~$0.045/hr + data |
-| EKS control plane | 1 | $0.10/hr |
+调研与设计依据(仓库内):
+- [`docs/clickhouse-on-eks-research.md`](./docs/clickhouse-on-eks-research.md) —— 生态组件与最佳实践调研(多源交叉验证,带引用)
+- [`docs/notes-ck-on-eks-best-practices-2026.md`](./docs/notes-ck-on-eks-best-practices-2026.md) —— 拓扑/机型/资源模型/存储/恢复的推演笔记(本方案拓扑对齐的依据)
+- [`docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md`](./docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) —— 设计规格
+- [`docs/perf-testing-plan.md`](./docs/perf-testing-plan.md) —— 性能与压力测试计划(数据集与流程,带核实的出处)
 
-**Total: roughly $120-160+ USD per day** (the 3× i8g.4xlarge alone are ~$97/day; larger instances for load testing push this higher). Run `./scripts/teardown.sh` as soon as you are done to stop charges. Do not leave the cluster running unattended.
+---
 
-The S3 backup bucket is NOT deleted by teardown — see [Teardown](#teardown) for manual removal.
+## 3. 与上游蓝图的关键差异
 
-## Configure
+这是本方案的核心价值所在。**复用 = 蓝图已验证的部分;替换/新增 = 蓝图表达不了、但生产必需的部分。**
 
-Edit `terraform/terraform.tfvars` before running anything:
+| 维度 | Altinity Blueprint(默认) | 本方案 | 为什么这么改 |
+|---|---|---|---|
+| **基础设施层** | `//eks` 子模块 | ✅ **原样复用**(钉 `v0.5.7`) | 成熟、AWS 官方合作,不重造轮子 |
+| **Operator 安装** | `//clickhouse-operator` | ✅ **复用**,版本钉到 `0.27.1`(覆盖默认 0.24.4) | 用近期稳定版,可复现 |
+| **集群拓扑层** | `//clickhouse-cluster`(封闭 Helm chart) | ❌ **弃用**,改为自管 CHI/CHK 清单 | 蓝图只暴露 5 个参数,无法表达下列所有定制 |
+| **分片 / 副本** | 写死在 chart | **1 分片 × 3 副本**,可任意调整 | "先垂直扩容,分片最后"——分片无自动 rebalance,3 副本兼顾 HA 与读扩展 |
+| **存储** | 写死 `gp3-encrypted`(EBS) | **本地 NVMe**(i8g,~3.75TB)+ local-static-provisioner | merge/扫描是重 IO,本地盘直连 PCIe 显著更快;durability 交给 3 副本 + S3 |
+| **机型** | 通用 x86 | **i8g.4xlarge(ARM/Graviton)** | ClickHouse 在 Graviton 上性价比领先;官方一等公民 |
+| **资源模型** | chart 默认 | 专属节点:**CPU request 高 / 不设 limit**,内存 **request==limit**,`max_server_memory_usage_to_ram_ratio: 0.9` | 独占节点上 CPU limit 会触发 CFS throttle 伤查询延迟;为 page cache 留余量 |
+| **调度** | 有限 | **一 Pod 一节点** + hostname 反亲和 + 跨 3 AZ zone spread + PDB | 副本不同机不同 AZ,单点/单可用区故障不致命 |
+| **Keeper** | 随 chart | **独立 CHK**(3 节点跨 AZ,gp3,PDB minAvailable=2) | 协调层与数据层隔离,是硬性最佳实践 |
+| **备份** | ❌ 无 | **clickhouse-backup → S3**,经 IRSA 授权,每日 CronJob | 本地盘无快照,S3 备份是唯一灾难兜底 |
+| **NVMe 挂载** | ❌ 不处理 | **bootstrap DaemonSet** 格式化并挂载 i8g 本地盘至 `/mnt/disks` | AL2023 不自动挂 instance store,不处理则 PVC 永久 Pending |
+| **apply 流程** | 单次 | **两阶段 apply**(先 AWS 基础设施,再 in-cluster helm/k8s 资源) | 避免 helm/kubernetes provider 连接尚未就绪的集群导致中途卡死 |
+| **销毁流程** | 单次 destroy | **两阶段 teardown**(先删 in-cluster 资源,再删集群) | 避免 destroy 时 provider 竞争导致状态损坏、资源残留计费 |
 
-```hcl
-# 1. Confirm region and AZs exist in your AWS account
-region             = "us-east-1"
-availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+被验证推翻的上游宣传(见调研报告):蓝图"负责 backup/recovery"未被证实——它只部署 operator,备份能力需自建(即本方案第 4/6/11 项)。
 
-# 2. S3 bucket name for backups.
-backup_bucket_name = ""   # empty = auto-name "<cluster_name>-ch-backups"; set a globally-unique name to override
+---
 
-# 3. SECURITY: restrict to your office/VPN CIDR — do NOT leave world-open in production.
-public_access_cidrs = ["203.0.113.0/24"]
+## 3.5 与 AWS `data-on-eks` 参考栈的对比
 
-# 4. ClickHouse image tag. Default "24.8" is the current LTS (24.8.x).
-#    Keeper uses the same tag in manifests/10-keeper-chk.yaml.
-#    Check https://clickhouse.com/docs/en/whats-new/changelog for the latest patch.
+AWS 官方的 [data-on-eks](https://awslabs.github.io/data-on-eks/docs/datastacks/databases/clickhouse-on-eks/infra) 提供了另一个 ClickHouse-on-EKS 参考实现。两者**同源(都基于 Altinity operator)、异路**:它是"功能全开的数据平台样板",本方案是"为特定定位做减法的精简生产方案"。
 
-# 5. Set a Grafana admin password (or change it after first login).
-#    If left empty the chart default "prom-operator" is used.
-# grafana_admin_password = "set-me"   # uncomment and set, or change after first login (default: prom-operator)
-```
+| 维度 | AWS data-on-eks(参考栈) | 本方案 | 实质 |
+|---|---|---|---|
+| 节点伸缩 | **Karpenter**(按需/Spot,pod 驱动) | cluster-autoscaler(蓝图自带,固定节点组) | 平台弹性 vs 依赖少、可评审 |
+| 应用交付 | **ArgoCD(GitOps)** 全家桶 | 裸 Terraform + kubectl | 平台工程 vs 心智负担低 |
+| 拓扑 | **3 分片 × 3 副本(9 Pod)** | **1 分片 × 3 副本(3 Pod)** | 展示分布式全貌 vs "先扩容、后分片" |
+| 机型 | Graviton m6g.8xlarge | Graviton i8g.4xlarge | 都 ARM,存储家族不同 |
+| 存储 | **EBS gp3 500Gi/副本** | **本地 NVMe ~3.75TB** | 稳妥恢复快 vs IO 上限高(靠副本+S3 兜底) |
+| Operator / Keeper | Altinity / 3 节点 | Altinity 0.27.1 / 3 节点 + PDB | 同源 |
+| 反亲和 / 备份 | 文档未体现 | 显式反亲和+zone spread+PDB / clickhouse-backup→S3 | 本方案更严格、补齐备份 |
 
-Key defaults to be aware of:
+**三个关键分歧不是对错,是定位不同:**
+- **Karpenter/ArgoCD vs 固定节点组/Terraform**:前者面向"已有平台团队的数据平台",后者面向"要一套可控的 ClickHouse,而非一套平台"。
+- **3×3 vs 1×3**:前者演示分布式,后者遵循"scale-up first, shard last"(分片无自动 rebalance,先垂直做大 + `parallel_replicas`)。
+- **EBS vs 本地 NVMe**:前者稳妥,后者为压测/serving 加速追求 IO 上限,并配齐其前提(跨 AZ 反亲和 + S3 备份 + NVMe 挂载)。
 
-- `cluster_name` defaults to `clickhouse-eks` — must be lowercase, alphanumeric + hyphens, max 46 chars.
-- `clickhouse_instance_type` defaults to `i8g.4xlarge`. Must be an ARM NVMe instance family (`i8g`, `im4gn`, or `i4g`). Switching to an x86 instance requires also changing `clickhouse_ami_type` (default `AL2023_ARM_64_STANDARD`). Do not change to a non-NVMe type without reworking storage.
-- `clickhouse_ami_type` defaults to `AL2023_ARM_64_STANDARD` for Graviton. Change to `AL2023_x86_64_STANDARD` if switching to an x86 instance family.
-- `clickhouse_node_count` defaults to `3` (one dedicated node per replica).
-- `public_access_cidrs` defaults to `["0.0.0.0/0"]` — world-open. **Restrict this before production.**
+> 一句话:**data-on-eks 教你"分布式怎么搭";本方案主张"先别急着分布式",并把依赖收敛到最小。** 两者可互为参照——见下节"演进方向"。
 
-**Resource model (dedicated nodes):** Each `i8g.4xlarge` runs exactly one ClickHouse pod. The CHI sets CPU request `"14"` with **no CPU limit** (avoids CFS throttle on bursty queries), and memory request == limit `"110Gi"` (Guaranteed QoS). The `max_server_memory_usage_to_ram_ratio` CHI setting is `"0.9"`, reserving ~10% of RAM for the OS page cache. Verify `110Gi` is below the node's allocatable memory with `kubectl describe node <clickhouse-node>` before applying.
-
-**Load testing:** To run load tests, bump `clickhouse_instance_type` to a larger i8g size (e.g. `i8g.8xlarge` or `i8g.12xlarge`). You must also manually re-tune the CHI CPU/memory resource requests and the data volume size in `manifests/20-clickhouse-chi.yaml` — these values are hand-sized to `i8g.4xlarge` and will be incorrect for other instance sizes.
-
-## Preparing NVMe Disks
-
-AWS AL2023 does **not** automatically format or mount instance store (NVMe) disks. The `local-static-provisioner` that backs the `local-storage` StorageClass expects pre-formatted disks mounted under `/mnt/disks` on each ClickHouse node.
-
-If this is not done before ClickHouse pods are scheduled, the PVCs will remain in `Pending` state.
-
-**You must handle this for your node setup.** Common approaches:
-
-1. **Node bootstrap user-data** — add a shell script to the EKS managed node group launch template that runs on first boot:
-   ```bash
-   #!/bin/bash
-   DISK=/dev/nvme1n1   # adjust device name; i8g.4xlarge has one instance-store NVMe disk (~3.75TB)
-   mkdir -p /mnt/disks/nvme1
-   if ! blkid "$DISK"; then
-     mkfs.xfs -f "$DISK"
-   fi
-   mount "$DISK" /mnt/disks/nvme1
-   echo "$DISK /mnt/disks/nvme1 xfs defaults,nofail 0 2" >> /etc/fstab
-   ```
-   The exact device path (`/dev/nvme1n1`, `/dev/nvme2n1`, etc.) varies by instance type and AMI. Check `lsblk` on a running node to confirm.
-
-2. **Prep DaemonSet** — deploy a privileged DaemonSet with `hostPID: true` and `hostPath` volume that runs the format+mount before the provisioner runs. This is suitable if you cannot modify the launch template.
-
-After NVMe disks are mounted, the local-static-provisioner will discover them and create `PersistentVolume` objects automatically. Verify with:
-
-```bash
-kubectl get pv | grep local-storage
-```
-
-## Deploy
-
-Run from the repository root:
-
-```bash
-./scripts/deploy.sh
-```
-
-What it does (in order):
-
-1. **`terraform init` + `terraform apply`** — creates the VPC, EKS cluster, node groups, Altinity operator (Helm), `local-static-provisioner` (Helm), `kube-prometheus-stack` (Helm), S3 backup bucket, and IRSA role. Terraform will prompt for approval unless you pass `-auto-approve` (suitable only for automation).
-2. **Configures kubectl** — runs `aws eks update-kubeconfig` using the `configure_kubectl` Terraform output.
-3. **Waits for the operator** — polls `altinity-clickhouse-operator` deployment in `kube-system` for readiness.
-4. **Substitutes placeholders** — injects `backup_role_arn`, `backup_bucket`, and `region` (from Terraform outputs) into a temp copy of `manifests/30-backup-cronjob.yaml`. Fails fast if any `REPLACE_WITH_*` placeholder remains.
-5. **Applies manifests in dependency order**:
-   - `00-namespace.yaml` — creates the `clickhouse` namespace
-   - `30-backup-cronjob.yaml` — ServiceAccount (`clickhouse-backup`) + ConfigMap + CronJob. **Must precede the CHI** because the CHI podTemplate references this ServiceAccount.
-   - `10-keeper-chk.yaml` — 3-node ClickHouse Keeper; waits up to 5 minutes for readiness
-   - `20-clickhouse-chi.yaml` — 1x3 ClickHouse cluster
-   - `40-grafana-dashboard.yaml` — Grafana dashboard ConfigMap (placeholder JSON; see [Monitoring](#monitoring))
-
-Watch the rollout:
-
-```bash
-kubectl -n clickhouse get chi,chk,pods -w
-```
-
-## Set the Admin Password
-
-The CHI ships with an **empty** `admin` password locked to `127.0.0.1/32` (localhost). This is intentional — a bare `kubectl apply` does not expose an open superuser. However, you must set a real password before any meaningful use.
-
-**Step 1: Generate a SHA-256 hash of your password**
-
-```bash
-echo -n 'yourpassword' | sha256sum
-# example output: 65e84be33532fb784c48129675f9eff3a682b27168c0ea744b2cf58ee02337c5  -
-```
-
-**Step 2: Edit `manifests/20-clickhouse-chi.yaml`**
-
-Find the `users` section and update:
-
-```yaml
-configuration:
-  users:
-    admin/password_sha256_hex: "65e84be33532fb784c48129675f9eff3a682b27168c0ea744b2cf58ee02337c5"
-    admin/networks/ip: "10.0.0.0/8"   # or your VPC/VPN CIDR; or "0.0.0.0/0,::/0" for any
-    admin/profile: default
-```
-
-**Step 3: Re-apply**
-
-```bash
-kubectl apply -f manifests/20-clickhouse-chi.yaml
-```
-
-The operator performs a rolling restart. Watch progress:
-
-```bash
-kubectl -n clickhouse get chi ch -w
-```
-
-## Verify
-
-After the cluster is fully up (all 3 ClickHouse pods and 3 Keeper pods `Running`):
-
-```bash
-./scripts/smoke-test.sh
-```
-
-The test:
-1. Queries `system.clusters` to confirm the 1x3 topology (1 shard, 3 replicas).
-2. Creates `default.t_local` (ReplicatedMergeTree) and `default.t_dist` (Distributed) on all nodes.
-3. Inserts 1,000 rows via the distributed table and waits 3 seconds for replication.
-4. Reads back from the peer replica of shard 0 to verify cross-replica sync.
-5. Reads the distributed count and the replication health from `system.replicas`.
-
-Expected output (the check queries `system.replicas` on a single pod, which reports that
-pod's own replica entry — so a healthy result is `replicas registered=1`; the pass condition
-is simply count > 0). Cluster-wide replica health is shown by the earlier `system.clusters`
-query, which lists all 3 replicas of the shard:
+## 4. 架构一览
 
 ```
-==> SMOKE TEST PASSED (distributed count=1000, replicas registered=1)
+┌───────────────────────────── 新建 VPC (3 AZ) ─────────────────────────────┐
+│  EKS 集群                                                                  │
+│   ├─ system 节点组 (t3, gp3)     : operator / kube-prometheus-stack        │
+│   ├─ clickhouse 节点组 (i8g.4xlarge, 本地 NVMe, 3× 跨 AZ)                   │
+│   │     shard0-replica0 (a)   shard0-replica1 (b)   shard0-replica2 (c)    │
+│   │     —— 一 Pod 一节点,反亲和 + zone spread,CHI CRD 声明               │
+│   └─ system-keeper 节点组 (t3, gp3, 3× 跨 AZ)  : ClickHouse Keeper (CHK)   │
+└────────────────┬───────────────────────────────────┬──────────────────────┘
+                 │ IRSA                               │ 每日备份
+                 ▼                                    ▼
+        ClickHouse Service (ClusterIP)         S3 Bucket (加密/版本化/阻断公有)
 ```
 
-If the test fails, check operator logs and CHI status:
+- **分层解耦**:Terraform 管 AWS 基础设施 + Helm addons;Kubernetes 清单管 ClickHouse 业务拓扑(CHI/CHK)。改拓扑不动 Terraform。
+- **协调层**:ClickHouse Keeper(C++/NuRAFT,ZooKeeper 协议兼容),3 节点奇数 quorum,独立于数据节点。
 
-```bash
-kubectl -n kube-system logs deploy/altinity-clickhouse-operator -c clickhouse-operator --tail=50
-kubectl -n clickhouse describe chi ch
-```
+---
 
-## Access
+## 5. 适用边界(严谨说明)
 
-ClickHouse services are `ClusterIP` only. First, find the actual service name:
+本方案针对一个**明确定位**做了自洽取舍,范围内接近最优;超出范围时取舍会变,不应硬套:
 
-```bash
-kubectl -n clickhouse get svc
-```
+- **✅ 适用**:ClickHouse 作为湖仓/数仓下游的轻量 OLAP / BI serving 加速层;读多写少;有上游可重灌数据兜底 durability。
+- **⚠️ 需重估**:
+  - 若 ClickHouse 是**唯一数据源(SoT)**、无上游兜底 → 本地 NVMe 的"会丢"不再可接受,应回到 EBS + 备份为主。
+  - 若**极高吞吐实时摄入**(写重于读)→ 写放大成为主约束,副本/分片策略需重估。
+  - 若**超大规模、单查询需跨大量机器扇出** → 必须真正分片,1 分片 scale-up 顶不住;届时先用 `parallel_replicas` 推迟撞墙,再引入分片。
 
-The Altinity operator names the cluster service after the CHI name; for the CHI named `ch` with cluster `main` the service is typically `clickhouse-ch`. Confirm from the output above, then port-forward:
+同时,本方案**只产出 IaC,不代为执行 `terraform apply`**——真实资源创建、配额、凭证与费用(约 $120–160/天)由使用者掌控。
 
-```bash
-# HTTP interface (port 8123)
-kubectl -n clickhouse port-forward svc/clickhouse-ch 8123:8123
+---
 
-# In a separate terminal:
-curl -u admin:yourpassword "http://localhost:8123/?query=SELECT+version()"
-```
+## 6. 一句话总结
 
-For the native TCP interface (port 9000):
-
-```bash
-kubectl -n clickhouse port-forward svc/clickhouse-ch 9000:9000
-clickhouse-client --host localhost --port 9000 --user admin --password yourpassword
-```
-
-To access a specific pod directly (for shard/replica targeting):
-
-```bash
-kubectl -n clickhouse port-forward pod/chi-ch-main-0-0 8123:8123
-```
-
-## Monitoring
-
-Grafana is deployed in the `monitoring` namespace. Port-forward to access:
-
-```bash
-kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
-```
-
-Open `http://localhost:3000`. Default credentials: `admin` / `prom-operator` (or the password you set in `terraform.tfvars`).
-
-**Import the ClickHouse Operator dashboard (Grafana.com #12163):**
-
-The file `manifests/40-grafana-dashboard.yaml` ships with a placeholder JSON. Replace it with the real dashboard before applying:
-
-```bash
-curl -sL "https://grafana.com/api/dashboards/12163/revisions/latest/download" \
-  > /tmp/ch-dashboard.json
-
-# Then either import via the Grafana UI (+ > Import > Upload JSON file)
-# or replace the placeholder in the ConfigMap and re-apply:
-kubectl -n monitoring create configmap clickhouse-operator-dashboard \
-  --from-file=clickhouse-operator.json=/tmp/ch-dashboard.json \
-  --dry-run=client -o yaml \
-  | kubectl apply -f -
-```
-
-Prometheus scrapes ClickHouse metrics exposed by the operator on each pod's `/metrics` endpoint.
-
-## Backup / Restore
-
-### Automated backup
-
-A `CronJob` named `clickhouse-backup-daily` in the `clickhouse` namespace triggers daily at **02:00 UTC**. With a single shard, any replica holds the full dataset, so the CronJob backs up only `chi-ch-main-0-0`, creating a local snapshot then uploading it to the S3 bucket.
-
-Check the last run:
-
-```bash
-kubectl -n clickhouse get cronjob clickhouse-backup-daily
-kubectl -n clickhouse get jobs | grep backup
-```
-
-### Manual backup
-
-Trigger an immediate backup against a specific pod:
-
-```bash
-BACKUP="manual-$(date +%Y%m%d-%H%M%S)"
-kubectl -n clickhouse port-forward pod/chi-ch-main-0-0 7171:7171 &
-curl -sf -X POST "http://localhost:7171/backup/create?name=$BACKUP&background=false"
-curl -sf -X POST "http://localhost:7171/backup/upload/$BACKUP?background=false"
-```
-
-### Restore
-
-```bash
-BACKUP="backup-20260101-020000"   # use the exact name from S3
-kubectl -n clickhouse port-forward pod/chi-ch-main-0-0 7171:7171 &
-curl -sf -X POST "http://localhost:7171/backup/download/$BACKUP"
-curl -sf -X POST "http://localhost:7171/backup/restore/$BACKUP"
-```
-
-List available backups:
-
-```bash
-curl -s "http://localhost:7171/backup/list"
-```
-
-The sidecar REST API reference is at `https://github.com/Altinity/clickhouse-backup#rest-api`.
-
-### Backup bucket
-
-Get the bucket name at any time:
-
-```bash
-cd terraform && terraform output -raw backup_bucket
-```
-
-The bucket has versioning enabled. It is **not** deleted by `teardown.sh` (to protect against accidental data loss).
-
-## Teardown
-
-```bash
-./scripts/teardown.sh
-```
-
-Two-phase destruction to avoid orphaned cloud resources:
-
-1. **Delete ClickHouse + Keeper** — the operator cleans up associated PVCs and services.
-2. **Targeted Terraform destroy** — destroys in-cluster Helm releases (`kube-prometheus-stack`, `local-static-provisioner`) and the `monitoring` namespace while the EKS API is still reachable. This prevents the Terraform helm/kubernetes provider from hanging on a destroyed cluster.
-3. **Full `terraform destroy`** — tears down the EKS cluster, VPC, node groups, IRSA role, and all remaining AWS resources.
-
-After teardown, manually delete the S3 backup bucket if you no longer need the data:
-
-```bash
-aws s3 rb "s3://$(cd terraform && terraform output -raw backup_bucket)" --force
-```
-
-Note: `terraform output` above requires the Terraform state to still exist. If state was already removed, substitute the bucket name directly.
-
-## Terraform Outputs
-
-| Output | Description |
-|--------|-------------|
-| `cluster_name` | EKS cluster name |
-| `configure_kubectl` | `aws eks update-kubeconfig` command |
-| `backup_bucket` | S3 bucket name |
-| `backup_role_arn` | IAM role ARN annotated on the `clickhouse-backup` ServiceAccount |
-| `clickhouse_namespace` | Kubernetes namespace (`clickhouse`) |
-| `region` | AWS region |
-
-Retrieve any output:
-
-```bash
-cd terraform && terraform output -raw <output_name>
-```
-
-## Known Caveats
-
-- **Local NVMe is ephemeral**: if an `i8g` node is terminated or replaced, the local disk data is lost. ClickHouse recovers by re-syncing the replica from one of the surviving AZ replicas via Keeper. This rebuild can be slow for large datasets (3400Gi per replica). Use the daily S3 backup as an additional safety net.
-
-- **Blueprint provider version locks**: the Altinity EKS Blueprint pins the AWS provider to `~>5.40` and the Helm provider to `<3`. Do not upgrade these without testing against the blueprint modules.
-
-- **`public_access_cidrs` defaults to world-open**: `["0.0.0.0/0"]` exposes the EKS Kubernetes API server publicly. Restrict to your office/VPN CIDR before production use.
-
-- **Admin password must be set before production**: the default CHI configuration ships with an empty password locked to localhost. Follow [Set the Admin Password](#set-the-admin-password) before allowing any application traffic.
-
-- **NVMe mount prep is required**: ClickHouse PVCs will stay `Pending` until instance-store disks are formatted and mounted under `/mnt/disks` on each ClickHouse node. See [Preparing NVMe Disks](#preparing-nvme-disks).
-
-- **No external load balancer by default**: all services are `ClusterIP`. Exposing ClickHouse externally requires adding an `Ingress` or `LoadBalancer` service — this is intentional to reduce the attack surface.
+> **站在 Altinity 官方蓝图成熟的基础设施地基上,把它封闭、表达力不足的集群层,换成一套自管的、声明式的、面向生产的 ClickHouse 拓扑——用最小的重复劳动,换回对分片副本、本地 NVMe、调度亲和、备份与升级流程的完全控制。**
