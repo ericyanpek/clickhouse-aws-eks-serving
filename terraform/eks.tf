@@ -30,10 +30,10 @@ module "eks" {
       instance_type = var.clickhouse_instance_type
       ami_type      = var.clickhouse_ami_type # ARM64 for i8g/Graviton
       disk_size     = 50                      # root EBS; data lives on instance-store NVMe
-      desired_size  = 1                       # PER AZ → 3 zones × 1 = 3 ClickHouse nodes (1 shard × 3 replicas)
+      desired_size  = 1                       # PER AZ → len(clickhouse_zones) × 1 nodes (= CHI replicasCount)
       min_size      = 1
-      max_size      = 2 # per-AZ headroom for node replacement; new i8g nodes = empty local NVMe, replica rebuild required
-      zones         = var.availability_zones
+      max_size      = 2                    # per-AZ headroom for node replacement; new i8g nodes = empty local NVMe, replica rebuild required
+      zones         = var.clickhouse_zones # 2 AZs now (1×2) due to i8g capacity; keeper/system stay on all 3 AZs
       labels        = { "workload" = "clickhouse" }
       taints = [{
         key    = "dedicated"
@@ -65,6 +65,26 @@ module "eks" {
       taints = [{
         key    = "dedicated"
         value  = "keeper"
+        effect = "NO_SCHEDULE"
+      }]
+    },
+    {
+      # Dedicated, non-burstable load-generation node. Runs clickhouse-benchmark pods
+      # (pinned via nodeSelector workload=bench + toleration) so the benchmark client
+      # never competes with ClickHouse for CPU/page-cache. Single AZ (no HA needed).
+      # Also usable as an SSM interactive-query box (node role gets SSM policy in irsa.tf).
+      name          = "system-bench"
+      instance_type = var.bench_instance_type # c7g.2xlarge = 8 vCPU / 16 GiB, Graviton, non-burstable
+      ami_type      = "AL2023_ARM_64_STANDARD"
+      disk_size     = 50
+      desired_size  = 1
+      min_size      = 1
+      max_size      = 1
+      zones         = [var.availability_zones[0]] # single AZ (1a) — near a ClickHouse replica
+      labels        = { "workload" = "bench" }
+      taints = [{
+        key    = "dedicated"
+        value  = "bench"
         effect = "NO_SCHEDULE"
       }]
     }

@@ -15,11 +15,15 @@ spec:
         - host: keeper-keeper.clickhouse.svc.cluster.local
           port: 2181
     users:
-      # SECURITY: empty password_sha256_hex = passwordless admin. Left empty as a placeholder —
-      # set a real sha256 hash AND widen networks/ip before use. See README "Set the admin password".
-      # Default networks/ip is localhost-only so a bare `kubectl apply` does NOT expose an open superuser.
-      admin/password_sha256_hex: ""
-      admin/networks/ip: "127.0.0.1/32"
+      # SECURITY: password_sha256_hex must be a valid 64-char hex — an empty string is REJECTED
+      # by ClickHouse (CANNOT_LOAD_CONFIG, exit 91). Generate before apply and substitute the
+      # placeholder below (deploy.sh does this, like the S3 backup placeholders):
+      #   printf '%s' 'your-strong-password' | sha256sum
+      # NEVER commit a real hash to a public repo.
+      admin/password_sha256_hex: "REPLACE_WITH_ADMIN_SHA256"
+      # networks/ip: open to the VPC CIDR so in-cluster clients (e.g. benchmark pods) can connect.
+      # Narrow this to specific subnets/pods for production.
+      admin/networks/ip: "10.0.0.0/8"
       admin/profile: default
     settings:
       # Cap query working memory at 90% of the container memory limit, leaving ~10%
@@ -29,11 +33,13 @@ spec:
     clusters:
       - name: main
         layout:
-          # 1 shard × 3 replicas: scale UP first (re-sharding has no auto-rebalance).
-          # Each replica holds the full dataset; reads spread across all 3, HA tolerates 2 losses.
-          # Add shards only when a single query outgrows one node's CPU or the data outgrows one disk.
+          # 1 shard × 2 replicas (temporary — i8g capacity limited us to 2 AZs; target is 3).
+          # Each replica holds the full dataset; reads spread across both, HA tolerates 1 loss.
+          # To scale to 3 replicas later: add a 3rd AZ to clickhouse_zones (tfvars) + set replicasCount: 3.
+          # Scale UP first (re-sharding has no auto-rebalance); add shards only when a single query
+          # outgrows one node's CPU or the data outgrows one disk.
           shardsCount: 1
-          replicasCount: 3
+          replicasCount: 2
   templates:
     serviceTemplates:
       - name: ch-cluster-ip
@@ -75,7 +81,7 @@ spec:
                   clickhouse.altinity.com/chi: ch
           containers:
             - name: clickhouse
-              image: "clickhouse/clickhouse-server:24.8"
+              image: "clickhouse/clickhouse-server:25.3"
               # Resource model for a DEDICATED node (one pod per i8g.4xlarge: 16 vCPU / 128 GiB).
               # - CPU: high request, NO limit. A CPU limit = CFS quota that throttles ClickHouse's
               #   parallel scan/merge threads at peak; on a dedicated node there is nothing to
@@ -129,15 +135,16 @@ spec:
             requests:
               storage: 3400Gi # matches i8g.4xlarge instance-store (~3.75TB); adjust per instance size
 ---
-# 1 shard × 3 replicas: keep at least 2 replicas up during voluntary disruptions
-# (node drain, rolling restart) so reads stay served and only one replica rebuilds at a time.
+# 1 shard × 2 replicas: keep at least 1 replica up during voluntary disruptions
+# (node drain, rolling restart) so reads stay served. With only 2 replicas, minAvailable
+# MUST be 1 — setting 2 would block every voluntary disruption. Bump to 2 when scaling to 3 replicas.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: ch-pdb
   namespace: clickhouse
 spec:
-  minAvailable: 2
+  minAvailable: 1
   selector:
     matchLabels:
       clickhouse.altinity.com/chi: ch

@@ -40,16 +40,25 @@ echo "==> [3/7] waiting for operator to be ready"
 kubectl -n kube-system rollout status deploy/altinity-clickhouse-operator --timeout=180s \
   || echo "WARNING: operator rollout did not complete in time — CHI apply may fail" >&2
 
-echo "==> [4/7] substituting backup role ARN and bucket into manifests"
+echo "==> [4/7] substituting backup role ARN, bucket, and admin password into manifests"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 cp manifests/*.yaml "$tmpdir/"
 sed -i.bak "s|REPLACE_WITH_BACKUP_ROLE_ARN|$ROLE_ARN|g" "$tmpdir/30-backup-cronjob.yaml"
 sed -i.bak "s|REPLACE_WITH_BUCKET|$BUCKET|g; s|S3_REGION: \"us-east-1\"|S3_REGION: \"$REGION\"|g" "$tmpdir/30-backup-cronjob.yaml"
 
-# Fail-fast if any placeholder survived substitution (would silently break IRSA/backup).
-if grep -q "REPLACE_WITH" "$tmpdir/30-backup-cronjob.yaml"; then
-  echo "ERROR: unsubstituted REPLACE_WITH placeholder remains in 30-backup-cronjob.yaml" >&2
+# Admin password: require CLICKHOUSE_ADMIN_PASSWORD in the environment, hash it, and
+# substitute into the CHI. Never stored in the repo (the manifest ships a placeholder).
+if [ -z "${CLICKHOUSE_ADMIN_PASSWORD:-}" ]; then
+  echo "ERROR: set CLICKHOUSE_ADMIN_PASSWORD env var before deploy (used to hash the admin password)." >&2
+  exit 1
+fi
+ADMIN_SHA=$(printf '%s' "$CLICKHOUSE_ADMIN_PASSWORD" | sha256sum | awk '{print $1}')
+sed -i.bak "s|REPLACE_WITH_ADMIN_SHA256|$ADMIN_SHA|g" "$tmpdir/20-clickhouse-chi.yaml"
+
+# Fail-fast if any placeholder survived substitution (would silently break IRSA/backup/auth).
+if grep -rq "REPLACE_WITH" "$tmpdir/30-backup-cronjob.yaml" "$tmpdir/20-clickhouse-chi.yaml"; then
+  echo "ERROR: unsubstituted REPLACE_WITH placeholder remains in manifests" >&2
   exit 1
 fi
 

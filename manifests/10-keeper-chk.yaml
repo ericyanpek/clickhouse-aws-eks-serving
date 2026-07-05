@@ -45,7 +45,10 @@ spec:
                   app: clickhouse-keeper
           containers:
             - name: clickhouse-keeper
-              image: "clickhouse/clickhouse-keeper:24.8"
+              # 25.3 LTS: operator 0.27.1 injects coordination settings (use_xid_64,
+              # async_replication) that 24.8 rejects with UNKNOWN_SETTING. Keeper + server
+              # image versions must be compatible with the operator's rendered config.
+              image: "clickhouse/clickhouse-keeper:25.3"
               resources:
                 requests:
                   cpu: "1"
@@ -61,14 +64,6 @@ spec:
           resources:
             requests:
               storage: 20Gi
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: keeper-pdb
-  namespace: clickhouse
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: clickhouse-keeper
+# NOTE: no manual PodDisruptionBudget here — the Altinity operator auto-creates a Keeper
+# PDB (chk-keeper-keeper, maxUnavailable:1) that protects the Raft quorum. A second manual
+# PDB selecting the same pods causes "matches multiple PodDisruptionBudgets" warnings.

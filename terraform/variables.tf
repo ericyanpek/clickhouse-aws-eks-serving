@@ -50,15 +50,26 @@ variable "clickhouse_instance_type" {
   default     = "i8g.4xlarge"
 }
 
-# NOTE: ClickHouse node count is NOT set here. The blueprint creates one node group per
-# (pool × AZ) and applies desired_size PER AZ, so node count = (nodes per AZ) × len(availability_zones).
-# eks.tf pins the clickhouse pool to 1 node per AZ → with 3 AZs that is 3 nodes (1 shard × 3 replicas).
-# To change replica count, change the number of AZs (and the CHI replicasCount), not a node_count var.
+# NOTE: ClickHouse node count is NOT set as a count var. The blueprint creates one node group
+# per (pool × AZ) and applies desired_size PER AZ, so ClickHouse node count = len(clickhouse_zones)
+# (1 node per AZ, pinned in eks.tf). Replica count in the CHI must match len(clickhouse_zones).
+
+variable "clickhouse_zones" {
+  description = "AZs for the ClickHouse data pool = number of replicas (1 node per AZ). Subset of availability_zones. Currently 2 AZs (1×2) due to i8g capacity; add a 3rd AZ here + bump CHI replicasCount to scale to 3 replicas later."
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b"]
+}
 
 variable "clickhouse_ami_type" {
   description = "EKS AMI type for the ClickHouse node pool. Must be ARM64 for i8g/Graviton (AL2023_ARM_64_STANDARD); switch to AL2023_x86_64_STANDARD only if using an x86 instance family."
   type        = string
   default     = "AL2023_ARM_64_STANDARD"
+}
+
+variable "bench_instance_type" {
+  description = "Instance type for the dedicated load-generation (system-bench) node. Graviton, non-burstable. Runs clickhouse-benchmark pods and doubles as an SSM interactive-query box."
+  type        = string
+  default     = "c7g.2xlarge"
 }
 
 variable "operator_version" {
