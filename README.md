@@ -38,7 +38,8 @@
 - [`docs/clickhouse-on-eks-research.md`](./docs/clickhouse-on-eks-research.md) —— 生态组件与最佳实践调研(多源交叉验证,带引用)
 - [`docs/notes-ck-on-eks-best-practices-2026.md`](./docs/notes-ck-on-eks-best-practices-2026.md) —— 拓扑/机型/资源模型/存储/恢复的推演笔记(本方案拓扑对齐的依据)
 - [`docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md`](./docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) —— 设计规格
-- [`docs/perf-testing-plan.md`](./docs/perf-testing-plan.md) —— 性能与压力测试计划(数据集与流程,带核实的出处)
+- [`docs/perf-testing-plan.md`](./docs/perf-testing-plan.md)
+- [`docs/perf-test-report.md`](./docs/perf-test-report.md) —— **性能测试报告(实测数据)**:ClickBench 43 查询延迟、并发读扩展、parallel_replicas 加速、HA 混沌,全部真实数字 —— 性能与压力测试计划(数据集与流程,带核实的出处)
 - [`docs/community-corroboration.md`](./docs/community-corroboration.md) —— **社区/官方对本方案五条设计主张的印证**(附最接近的真实实践与诚实 caveat)
 
 ---
