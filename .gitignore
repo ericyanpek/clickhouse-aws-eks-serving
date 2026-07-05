@@ -20,3 +20,6 @@ terraform.rc
 # Editor
 *.swp
 *.bak
+
+# user-specific values (copy from .example)
+terraform/terraform.tfvars
