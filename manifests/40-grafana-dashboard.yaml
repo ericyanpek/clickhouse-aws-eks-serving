@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-operator-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    # Grafana sidecar fetches this dashboard by gnetId from grafana.com
+    k8s-sidecar-target-directory: "/tmp/dashboards"
+data:
+  clickhouse-operator.json: |
+    {
+      "__inputs": [],
+      "__requires": [],
+      "id": null,
+      "title": "ClickHouse Operator (placeholder — replace with dashboard #12163 JSON)",
+      "panels": [],
+      "schemaVersion": 39,
+      "version": 1
+    }

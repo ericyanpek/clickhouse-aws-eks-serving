@@ -1,0 +1,143 @@
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: ch
+  namespace: clickhouse
+spec:
+  defaults:
+    templates:
+      podTemplate: ch-pod
+      dataVolumeClaimTemplate: ch-data
+      serviceTemplate: ch-cluster-ip
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-keeper.clickhouse.svc.cluster.local
+          port: 2181
+    users:
+      # SECURITY: empty password_sha256_hex = passwordless admin. Left empty as a placeholder —
+      # set a real sha256 hash AND widen networks/ip before use. See README "Set the admin password".
+      # Default networks/ip is localhost-only so a bare `kubectl apply` does NOT expose an open superuser.
+      admin/password_sha256_hex: ""
+      admin/networks/ip: "127.0.0.1/32"
+      admin/profile: default
+    settings:
+      # Cap query working memory at 90% of the container memory limit, leaving ~10%
+      # for the OS page cache (ClickHouse reads compressed parts through page cache).
+      # CK reads its cgroup limit, so this ratio is relative to the container limit.
+      max_server_memory_usage_to_ram_ratio: "0.9"
+    clusters:
+      - name: main
+        layout:
+          # 1 shard × 3 replicas: scale UP first (re-sharding has no auto-rebalance).
+          # Each replica holds the full dataset; reads spread across all 3, HA tolerates 2 losses.
+          # Add shards only when a single query outgrows one node's CPU or the data outgrows one disk.
+          shardsCount: 1
+          replicasCount: 3
+  templates:
+    serviceTemplates:
+      - name: ch-cluster-ip
+        spec:
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 8123
+            - name: native
+              port: 9000
+    podTemplates:
+      - name: ch-pod
+        spec:
+          # backup sidecar assumes the S3 IAM role via IRSA through this SA
+          # (created in 30-backup-cronjob.yaml — must be applied before this CHI).
+          serviceAccountName: clickhouse-backup
+          nodeSelector:
+            workload: clickhouse
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: clickhouse
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      clickhouse.altinity.com/app: chop
+                      clickhouse.altinity.com/chi: ch
+                  topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  clickhouse.altinity.com/app: chop
+                  clickhouse.altinity.com/chi: ch
+          containers:
+            - name: clickhouse
+              image: "clickhouse/clickhouse-server:24.8"
+              # Resource model for a DEDICATED node (one pod per i8g.4xlarge: 16 vCPU / 128 GiB).
+              # - CPU: high request, NO limit. A CPU limit = CFS quota that throttles ClickHouse's
+              #   parallel scan/merge threads at peak; on a dedicated node there is nothing to
+              #   protect against, and modern CK is cgroup-aware (sizes its thread pool to the node).
+              # - Memory: request == limit (Guaranteed QoS, avoids eviction). Set BELOW allocatable,
+              #   not node capacity: kube-reserved + system-reserved + DaemonSets take a slice.
+              #   Verify with `kubectl describe node` and adjust; page-cache headroom is handled by
+              #   max_server_memory_usage_to_ram_ratio 0.9 above.
+              resources:
+                requests:
+                  cpu: "14"
+                  memory: "110Gi"
+                limits:
+                  memory: "110Gi"
+            - name: clickhouse-backup
+              image: "altinity/clickhouse-backup:2.6.0"
+              args: ["server"]
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              env:
+                - name: LOG_LEVEL
+                  value: "info"
+                - name: REMOTE_STORAGE
+                  value: "s3"
+                - name: S3_BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-backup-config
+                      key: S3_BUCKET
+                - name: S3_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-backup-config
+                      key: S3_REGION
+                - name: S3_PATH
+                  value: "backup"
+              ports:
+                - name: backup-rest
+                  containerPort: 7171
+    volumeClaimTemplates:
+      - name: ch-data
+        spec:
+          storageClassName: local-storage
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 3400Gi # matches i8g.4xlarge instance-store (~3.75TB); adjust per instance size
+---
+# 1 shard × 3 replicas: keep at least 2 replicas up during voluntary disruptions
+# (node drain, rolling restart) so reads stay served and only one replica rebuilds at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ch-pdb
+  namespace: clickhouse
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      clickhouse.altinity.com/chi: ch

@@ -1,0 +1,74 @@
+apiVersion: "clickhouse-keeper.altinity.com/v1"
+kind: "ClickHouseKeeperInstallation"
+metadata:
+  name: keeper
+  namespace: clickhouse
+spec:
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 3
+    settings:
+      logger/level: "information"
+  defaults:
+    templates:
+      podTemplate: keeper-pod
+      dataVolumeClaimTemplate: keeper-data
+  templates:
+    podTemplates:
+      - name: keeper-pod
+        metadata:
+          labels:
+            app: clickhouse-keeper # MUST be set here — the anti-affinity/spread selectors below match this
+        spec:
+          nodeSelector:
+            workload: keeper
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: keeper
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: clickhouse-keeper
+                  topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  app: clickhouse-keeper
+          containers:
+            - name: clickhouse-keeper
+              image: "clickhouse/clickhouse-keeper:24.8"
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "1Gi"
+                limits:
+                  cpu: "2"
+                  memory: "2Gi"
+    volumeClaimTemplates:
+      - name: keeper-data
+        spec:
+          storageClassName: gp3-encrypted
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keeper-pdb
+  namespace: clickhouse
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: clickhouse-keeper
