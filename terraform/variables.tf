@@ -50,11 +50,10 @@ variable "clickhouse_instance_type" {
   default     = "i8g.4xlarge"
 }
 
-variable "clickhouse_node_count" {
-  description = "Number of ClickHouse nodes = shards × replicas. Design is 1 shard × 3 replicas = 3 (scale-up first; add shards only when a single query outgrows one node)."
-  type        = number
-  default     = 3
-}
+# NOTE: ClickHouse node count is NOT set here. The blueprint creates one node group per
+# (pool × AZ) and applies desired_size PER AZ, so node count = (nodes per AZ) × len(availability_zones).
+# eks.tf pins the clickhouse pool to 1 node per AZ → with 3 AZs that is 3 nodes (1 shard × 3 replicas).
+# To change replica count, change the number of AZs (and the CHI replicasCount), not a node_count var.
 
 variable "clickhouse_ami_type" {
   description = "EKS AMI type for the ClickHouse node pool. Must be ARM64 for i8g/Graviton (AL2023_ARM_64_STANDARD); switch to AL2023_x86_64_STANDARD only if using an x86 instance family."

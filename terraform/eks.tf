@@ -18,15 +18,21 @@ module "eks" {
   public_access_cidrs = var.public_access_cidrs
   tags                = {}
 
+  # IMPORTANT — blueprint node-pool semantics (verified in v0.5.7 eks/main.tf):
+  # the module creates ONE node group per (pool × zone), and desired/min/max are applied
+  # PER node group (per AZ), NOT as a pool total. So a pool spanning 3 AZs with desired=3
+  # yields 3×3 = 9 nodes. To get "1 node per AZ" set desired=min=max=1 with 3 zones.
+  # Also: ami_type MUST be set explicitly — the blueprint default is AL2_x86_64, which EKS
+  # rejects on k8s >= 1.33 ("AMI Type AL2_x86_64 is only supported for 1.32 or earlier").
   node_pools = [
     {
       name          = "clickhouse"
       instance_type = var.clickhouse_instance_type
       ami_type      = var.clickhouse_ami_type # ARM64 for i8g/Graviton
       disk_size     = 50                      # root EBS; data lives on instance-store NVMe
-      desired_size  = var.clickhouse_node_count
-      min_size      = var.clickhouse_node_count
-      max_size      = var.clickhouse_node_count + 1 # headroom for node replacement only; new i8g nodes = empty local NVMe, replica rebuild required
+      desired_size  = 1                       # PER AZ → 3 zones × 1 = 3 ClickHouse nodes (1 shard × 3 replicas)
+      min_size      = 1
+      max_size      = 2 # per-AZ headroom for node replacement; new i8g nodes = empty local NVMe, replica rebuild required
       zones         = var.availability_zones
       labels        = { "workload" = "clickhouse" }
       taints = [{
@@ -38,22 +44,22 @@ module "eks" {
     {
       name          = "system"
       instance_type = "t3.large"
-      ami_type      = null
+      ami_type      = "AL2023_x86_64_STANDARD" # explicit — blueprint default AL2_x86_64 fails on 1.34
       disk_size     = 20
-      desired_size  = 2
-      min_size      = 2
-      max_size      = 4
+      desired_size  = 1 # PER AZ → 3 zones × 1 = 3 system nodes (operator/monitoring/autoscaler)
+      min_size      = 1
+      max_size      = 2
       zones         = var.availability_zones
       labels        = { "workload" = "system" }
     },
     {
       name          = "system-keeper"
       instance_type = "t3.medium"
-      ami_type      = null
+      ami_type      = "AL2023_x86_64_STANDARD" # explicit — blueprint default AL2_x86_64 fails on 1.34
       disk_size     = 20
-      desired_size  = 3
-      min_size      = 3
-      max_size      = 3
+      desired_size  = 1 # PER AZ → 3 zones × 1 = 3 Keeper nodes (odd quorum across AZs)
+      min_size      = 1
+      max_size      = 1
       zones         = var.availability_zones
       labels        = { "workload" = "keeper" }
       taints = [{
