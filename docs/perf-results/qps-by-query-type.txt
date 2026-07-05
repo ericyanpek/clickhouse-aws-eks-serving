@@ -1,0 +1,16 @@
+===== A. 点查(命中主键索引,CounterID 精确) =====
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 2782, QPS: 2779.819, RPS: 43873889.084, MiB/s: 167.397, result RPS: 2779.819, result MiB/s: 0.021.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 2735, QPS: 2732.585, RPS: 43128383.994, MiB/s: 164.553, result RPS: 2732.585, result MiB/s: 0.021.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 33302, QPS: 2774.391, RPS: 43788216.938, MiB/s: 167.071, result RPS: 2774.391, result MiB/s: 0.021.
+===== B. 中等:带过滤的聚合(命中索引后聚合一个 CounterID) =====
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 373, QPS: 370.053, RPS: 3156752385.258, MiB/s: 24084.109, result RPS: 3700.534, result MiB/s: 0.042.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 375, QPS: 374.944, RPS: 3198473446.388, MiB/s: 24402.416, result RPS: 3749.442, result MiB/s: 0.043.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 4443, QPS: 369.720, RPS: 3153907947.442, MiB/s: 24062.408, result RPS: 3697.199, result MiB/s: 0.042.
+===== C. 纯连接开销(SELECT 1,无扫描) =====
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 5864, QPS: 5862.098, RPS: 5862.098, MiB/s: 0.006, result RPS: 5862.098, result MiB/s: 0.006.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 5869, QPS: 5868.446, RPS: 5868.446, MiB/s: 0.006, result RPS: 5868.446, result MiB/s: 0.006.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 70224, QPS: 5851.224, RPS: 5851.224, MiB/s: 0.006, result RPS: 5851.224, result MiB/s: 0.006.
+===== D. 全表聚合(对照:之前测的重查询) =====
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 50, QPS: 48.303, RPS: 4830136632.509, MiB/s: 18425.509, result RPS: 483.026, result MiB/s: 0.006.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 50, QPS: 49.393, RPS: 4939162501.539, MiB/s: 18841.410, result RPS: 493.929, result MiB/s: 0.006.
+clickhouse-ch.clickhouse.svc.cluster.local:9000, queries: 583, QPS: 47.900, RPS: 4789883552.996, MiB/s: 18271.956, result RPS: 479.000, result MiB/s: 0.005.
