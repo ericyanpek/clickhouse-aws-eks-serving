@@ -1,6 +1,8 @@
 output "configure_kubectl" {
   description = "Run this to configure kubectl access"
-  value       = "aws eks --region ${var.region} update-kubeconfig --name ${module.eks.cluster_name}"
+  # Include --profile when set, matching the provider exec auth in providers.tf —
+  # otherwise deploy.sh writes a kubeconfig using the wrong (default) credentials.
+  value = var.aws_profile != null ? "aws eks --region ${var.region} update-kubeconfig --name ${module.eks.cluster_name} --profile ${var.aws_profile}" : "aws eks --region ${var.region} update-kubeconfig --name ${module.eks.cluster_name}"
 }
 
 output "cluster_name" {

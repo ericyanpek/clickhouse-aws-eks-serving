@@ -12,7 +12,8 @@ module "eks" {
   # Blueprint requires the community EKS module defaults; keep NAT + private nodes.
   enable_nat_gateway = true
 
-  autoscaler_version  = "1.34.0"
+  autoscaler_version = "1.34.0" # keep major.minor in sync with cluster_version (1.34) when bumping
+
   autoscaler_replicas = 1
   public_access_cidrs = var.public_access_cidrs
   tags                = {}

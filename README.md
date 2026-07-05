@@ -191,10 +191,13 @@ The test:
 4. Reads back from the peer replica of shard 0 to verify cross-replica sync.
 5. Reads the distributed count and the replication health from `system.replicas`.
 
-Expected output (the replica count is printed live; expect 3 on a healthy 1×3 cluster (3 replicas of the single shard)):
+Expected output (the check queries `system.replicas` on a single pod, which reports that
+pod's own replica entry — so a healthy result is `replicas registered=1`; the pass condition
+is simply count > 0). Cluster-wide replica health is shown by the earlier `system.clusters`
+query, which lists all 3 replicas of the shard:
 
 ```
-==> SMOKE TEST PASSED (distributed count=1000, replicas registered=3)
+==> SMOKE TEST PASSED (distributed count=1000, replicas registered=1)
 ```
 
 If the test fails, check operator logs and CHI status:
