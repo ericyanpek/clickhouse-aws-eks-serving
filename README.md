@@ -6,7 +6,7 @@ Production-grade ClickHouse cluster on AWS EKS, managed by the Altinity operator
 
 This repository provisions a complete ClickHouse deployment on AWS EKS:
 
-- **ClickHouse**: 2 shards x 2 replicas (4 pods) on `i4i.xlarge` nodes with local NVMe storage
+- **ClickHouse**: 1 shard x 3 replicas (3 pods) on `i8g.4xlarge` nodes (ARM/Graviton) with local NVMe storage
 - **ClickHouse Keeper**: 3-node quorum on `gp3-encrypted` EBS volumes, spread across 3 AZs
 - **Operator**: Altinity clickhouse-operator v0.27.1, installed as Helm release `altinity-clickhouse-operator` in `kube-system`
 - **Infrastructure**: New VPC + EKS cluster built from the Altinity Terraform EKS Blueprint (`//eks` + `//clickhouse-operator` submodules, pinned v0.5.7)
@@ -29,7 +29,7 @@ Reference documents:
 
 **AWS account requirements:**
 
-- Sufficient `i4i.xlarge` instance quota in your target region (4 instances needed). Check Service Quotas in the AWS console (`EC2 > Running On-Demand I instances`) and request an increase if needed.
+- Sufficient `i8g.4xlarge` instance quota in your target region (3 instances needed). `i8g` is a Graviton/ARM instance family. Check Service Quotas in the AWS console (`EC2 > Running On-Demand G instances`) and request an increase if needed.
 - IAM permissions covering: EKS, VPC/EC2, IAM (role + policy + OIDC provider creation), S3.
 - The deploying IAM principal must be able to create IAM roles with `iam:CreateRole`, `iam:AttachRolePolicy`, and `iam:PassRole`.
 
@@ -39,13 +39,13 @@ This deployment runs continuously and incurs significant AWS charges:
 
 | Resource | Count | Estimated cost |
 |----------|-------|---------------|
-| `i4i.xlarge` (ClickHouse nodes) | 4 | ~$0.374/hr each |
+| `i8g.4xlarge` (ClickHouse nodes, ARM/Graviton) | 3 | ~$1.35/hr each (approx; confirm current pricing) |
 | `t3.medium` (Keeper nodes) | 3 | ~$0.042/hr each |
 | `t3.large` (EKS system nodes) | 2 | ~$0.083/hr each |
 | NAT Gateway | 1-3 | ~$0.045/hr + data |
 | EKS control plane | 1 | $0.10/hr |
 
-**Total: roughly $60-90+ USD per day.** Run `./scripts/teardown.sh` as soon as you are done to stop charges. Do not leave the cluster running unattended.
+**Total: roughly $120-160+ USD per day** (the 3× i8g.4xlarge alone are ~$97/day; larger instances for load testing push this higher). Run `./scripts/teardown.sh` as soon as you are done to stop charges. Do not leave the cluster running unattended.
 
 The S3 backup bucket is NOT deleted by teardown — see [Teardown](#teardown) for manual removal.
 
@@ -76,10 +76,16 @@ public_access_cidrs = ["203.0.113.0/24"]
 Key defaults to be aware of:
 
 - `cluster_name` defaults to `clickhouse-eks` — must be lowercase, alphanumeric + hyphens, max 46 chars.
-- `clickhouse_instance_type` must be an NVMe instance family (`i4i` or `i3`). Do not change to a non-NVMe type without reworking storage.
+- `clickhouse_instance_type` defaults to `i8g.4xlarge`. Must be an ARM NVMe instance family (`i8g`, `im4gn`, or `i4g`). Switching to an x86 instance requires also changing `clickhouse_ami_type` (default `AL2023_ARM_64_STANDARD`). Do not change to a non-NVMe type without reworking storage.
+- `clickhouse_ami_type` defaults to `AL2023_ARM_64_STANDARD` for Graviton. Change to `AL2023_x86_64_STANDARD` if switching to an x86 instance family.
+- `clickhouse_node_count` defaults to `3` (one dedicated node per replica).
 - `public_access_cidrs` defaults to `["0.0.0.0/0"]` — world-open. **Restrict this before production.**
 
-## Preparing i4i NVMe Disks
+**Resource model (dedicated nodes):** Each `i8g.4xlarge` runs exactly one ClickHouse pod. The CHI sets CPU request `"14"` with **no CPU limit** (avoids CFS throttle on bursty queries), and memory request == limit `"110Gi"` (Guaranteed QoS). The `max_server_memory_usage_to_ram_ratio` CHI setting is `"0.9"`, reserving ~10% of RAM for the OS page cache. Verify `110Gi` is below the node's allocatable memory with `kubectl describe node <clickhouse-node>` before applying.
+
+**Load testing:** To run load tests, bump `clickhouse_instance_type` to a larger i8g size (e.g. `i8g.8xlarge` or `i8g.12xlarge`). You must also manually re-tune the CHI CPU/memory resource requests and the data volume size in `manifests/20-clickhouse-chi.yaml` — these values are hand-sized to `i8g.4xlarge` and will be incorrect for other instance sizes.
+
+## Preparing NVMe Disks
 
 AWS AL2023 does **not** automatically format or mount instance store (NVMe) disks. The `local-static-provisioner` that backs the `local-storage` StorageClass expects pre-formatted disks mounted under `/mnt/disks` on each ClickHouse node.
 
@@ -90,7 +96,7 @@ If this is not done before ClickHouse pods are scheduled, the PVCs will remain i
 1. **Node bootstrap user-data** — add a shell script to the EKS managed node group launch template that runs on first boot:
    ```bash
    #!/bin/bash
-   DISK=/dev/nvme1n1   # adjust device name; i4i.xlarge has one instance-store disk
+   DISK=/dev/nvme1n1   # adjust device name; i8g.4xlarge has one instance-store NVMe disk (~3.75TB)
    mkdir -p /mnt/disks/nvme1
    if ! blkid "$DISK"; then
      mkfs.xfs -f "$DISK"
@@ -126,7 +132,7 @@ What it does (in order):
    - `00-namespace.yaml` — creates the `clickhouse` namespace
    - `30-backup-cronjob.yaml` — ServiceAccount (`clickhouse-backup`) + ConfigMap + CronJob. **Must precede the CHI** because the CHI podTemplate references this ServiceAccount.
    - `10-keeper-chk.yaml` — 3-node ClickHouse Keeper; waits up to 5 minutes for readiness
-   - `20-clickhouse-chi.yaml` — 2x2 ClickHouse cluster
+   - `20-clickhouse-chi.yaml` — 1x3 ClickHouse cluster
    - `40-grafana-dashboard.yaml` — Grafana dashboard ConfigMap (placeholder JSON; see [Monitoring](#monitoring))
 
 Watch the rollout:
@@ -172,23 +178,23 @@ kubectl -n clickhouse get chi ch -w
 
 ## Verify
 
-After the cluster is fully up (all 4 ClickHouse pods and 3 Keeper pods `Running`):
+After the cluster is fully up (all 3 ClickHouse pods and 3 Keeper pods `Running`):
 
 ```bash
 ./scripts/smoke-test.sh
 ```
 
 The test:
-1. Queries `system.clusters` to confirm the 2x2 topology.
+1. Queries `system.clusters` to confirm the 1x3 topology (1 shard, 3 replicas).
 2. Creates `default.t_local` (ReplicatedMergeTree) and `default.t_dist` (Distributed) on all nodes.
 3. Inserts 1,000 rows via the distributed table and waits 3 seconds for replication.
 4. Reads back from the peer replica of shard 0 to verify cross-replica sync.
 5. Reads the distributed count and the replication health from `system.replicas`.
 
-Expected output (the replica count is printed live; expect 4 on a healthy 2×2 cluster):
+Expected output (the replica count is printed live; expect 3 on a healthy 1×3 cluster (3 replicas of the single shard)):
 
 ```
-==> SMOKE TEST PASSED (distributed count=1000, replicas registered=4)
+==> SMOKE TEST PASSED (distributed count=1000, replicas registered=3)
 ```
 
 If the test fails, check operator logs and CHI status:
@@ -261,7 +267,7 @@ Prometheus scrapes ClickHouse metrics exposed by the operator on each pod's `/me
 
 ### Automated backup
 
-A `CronJob` named `clickhouse-backup-daily` in the `clickhouse` namespace triggers daily at **02:00 UTC**. It calls the `clickhouse-backup` sidecar REST API (port 7171) on `chi-ch-main-0-0` and `chi-ch-main-1-0` (one pod per shard), creating a local snapshot then uploading it to the S3 bucket.
+A `CronJob` named `clickhouse-backup-daily` in the `clickhouse` namespace triggers daily at **02:00 UTC**. With a single shard, any replica holds the full dataset, so the CronJob backs up only `chi-ch-main-0-0`, creating a local snapshot then uploading it to the S3 bucket.
 
 Check the last run:
 
@@ -347,7 +353,7 @@ cd terraform && terraform output -raw <output_name>
 
 ## Known Caveats
 
-- **Local NVMe is ephemeral**: if an `i4i` node is terminated or replaced, the local disk data is lost. ClickHouse recovers by re-syncing the replica from the surviving AZ replica via Keeper. This rebuild can be slow for large datasets. Use the daily S3 backup as an additional safety net.
+- **Local NVMe is ephemeral**: if an `i8g` node is terminated or replaced, the local disk data is lost. ClickHouse recovers by re-syncing the replica from one of the surviving AZ replicas via Keeper. This rebuild can be slow for large datasets (3400Gi per replica). Use the daily S3 backup as an additional safety net.
 
 - **Blueprint provider version locks**: the Altinity EKS Blueprint pins the AWS provider to `~>5.40` and the Helm provider to `<3`. Do not upgrade these without testing against the blueprint modules.
 
@@ -355,6 +361,6 @@ cd terraform && terraform output -raw <output_name>
 
 - **Admin password must be set before production**: the default CHI configuration ships with an empty password locked to localhost. Follow [Set the Admin Password](#set-the-admin-password) before allowing any application traffic.
 
-- **i4i NVMe mount prep is required**: ClickHouse PVCs will stay `Pending` until instance-store disks are formatted and mounted under `/mnt/disks` on each ClickHouse node. See [Preparing i4i NVMe Disks](#preparing-i4i-nvme-disks).
+- **NVMe mount prep is required**: ClickHouse PVCs will stay `Pending` until instance-store disks are formatted and mounted under `/mnt/disks` on each ClickHouse node. See [Preparing NVMe Disks](#preparing-nvme-disks).
 
 - **No external load balancer by default**: all services are `ClusterIP`. Exposing ClickHouse externally requires adding an `Ingress` or `LoadBalancer` service — this is intentional to reduce the attack surface.

@@ -21,11 +21,11 @@ module "eks" {
     {
       name          = "clickhouse"
       instance_type = var.clickhouse_instance_type
-      ami_type      = null
-      disk_size     = 50 # root EBS; data lives on instance-store NVMe
+      ami_type      = var.clickhouse_ami_type # ARM64 for i8g/Graviton
+      disk_size     = 50                      # root EBS; data lives on instance-store NVMe
       desired_size  = var.clickhouse_node_count
       min_size      = var.clickhouse_node_count
-      max_size      = var.clickhouse_node_count + 2 # headroom for node replacement only; new i4i nodes = empty local disks, replica rebuild required
+      max_size      = var.clickhouse_node_count + 1 # headroom for node replacement only; new i8g nodes = empty local NVMe, replica rebuild required
       zones         = var.availability_zones
       labels        = { "workload" = "clickhouse" }
       taints = [{

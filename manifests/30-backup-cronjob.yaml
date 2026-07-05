@@ -43,11 +43,10 @@ spec:
                 - |
                   set -e
                   BACKUP="backup-$(date +%Y%m%d-%H%M%S)"
-                  # One pod per shard is enough; loop over both shard leader pods.
-                  for HOST in chi-ch-main-0-0 chi-ch-main-1-0; do
-                    BASE="http://$HOST.clickhouse.svc.cluster.local:7171"
-                    # background=false makes the REST calls synchronous so curl -sf waits and
-                    # a real failure fails the job (create is async by default → upload would race).
-                    curl -sf -X POST "$BASE/backup/create?name=$BACKUP&background=false"
-                    curl -sf -X POST "$BASE/backup/upload/$BACKUP?background=false"
-                  done
+                  # 1 shard: any replica holds the full dataset, so back up one replica only.
+                  # (chi-<chi>-<cluster>-<shard>-<replica>; shard 0, replica 0.)
+                  BASE="http://chi-ch-main-0-0.clickhouse.svc.cluster.local:7171"
+                  # background=false makes the REST calls synchronous so curl -sf waits and
+                  # a real failure fails the job (create is async by default → upload would race).
+                  curl -sf -X POST "$BASE/backup/create?name=$BACKUP&background=false"
+                  curl -sf -X POST "$BASE/backup/upload/$BACKUP?background=false"

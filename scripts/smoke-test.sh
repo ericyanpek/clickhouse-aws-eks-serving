@@ -23,7 +23,9 @@ echo "==> verify replication (query the OTHER replica of shard 0)"
 kubectl -n "$NS" exec chi-ch-main-0-1 -c clickhouse -- clickhouse-client -q \
   "SELECT count() FROM default.t_local"
 
-echo "==> total across shards via distributed"
+# 1 shard: the Distributed table is a single-hop passthrough (kept to exercise the path;
+# you could query the local ReplicatedMergeTree directly instead).
+echo "==> total via distributed (1 shard = single hop)"
 DIST_COUNT=$(run "SELECT count() FROM default.t_dist" | tr -d '[:space:]')
 echo "distributed count = $DIST_COUNT"
 

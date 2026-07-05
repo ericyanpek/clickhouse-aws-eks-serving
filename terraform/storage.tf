@@ -15,9 +15,9 @@ resource "kubernetes_storage_class" "local" {
 
 # sig-storage local-static-provisioner: discovers NVMe under /mnt/disks and
 # publishes them as `local` PVs on the local-storage class.
-# NOTE: i4i instance-store NVMe must be formatted + mounted under /mnt/disks
+# NOTE: i8g instance-store NVMe must be formatted + mounted under /mnt/disks
 # BEFORE this is useful — AL2023 does not auto-mount instance store. See README
-# "Preparing i4i NVMe". On a fresh node with empty /mnt/disks, no PVs appear and
+# "Preparing NVMe Disks". On a fresh node with empty /mnt/disks, no PVs appear and
 # ClickHouse PVCs stay Pending.
 resource "helm_release" "local_static_provisioner" {
   depends_on = [module.eks, kubernetes_storage_class.local]

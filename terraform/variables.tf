@@ -45,15 +45,21 @@ variable "vpc_cidr" {
 }
 
 variable "clickhouse_instance_type" {
-  description = "Instance type for ClickHouse nodes — MUST be a local-NVMe family (i4i/i3). Default i4i.xlarge."
+  description = "Instance type for ClickHouse nodes — ARM/Graviton local-NVMe family (i8g/im4gn/i4g). Default i8g.4xlarge (16 vCPU / 128 GiB / ~3.75TB NVMe). If you change the size, also re-tune the CHI container resources + data volume size in manifests/20-clickhouse-chi.yaml (they are hand-sized to this instance)."
   type        = string
-  default     = "i4i.xlarge"
+  default     = "i8g.4xlarge"
 }
 
 variable "clickhouse_node_count" {
-  description = "Number of ClickHouse nodes = shards × replicas. Design is 2×2 = 4."
+  description = "Number of ClickHouse nodes = shards × replicas. Design is 1 shard × 3 replicas = 3 (scale-up first; add shards only when a single query outgrows one node)."
   type        = number
-  default     = 4
+  default     = 3
+}
+
+variable "clickhouse_ami_type" {
+  description = "EKS AMI type for the ClickHouse node pool. Must be ARM64 for i8g/Graviton (AL2023_ARM_64_STANDARD); switch to AL2023_x86_64_STANDARD only if using an x86 instance family."
+  type        = string
+  default     = "AL2023_ARM_64_STANDARD"
 }
 
 variable "operator_version" {

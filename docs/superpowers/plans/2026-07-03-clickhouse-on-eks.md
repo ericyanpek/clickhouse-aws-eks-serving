@@ -1,5 +1,15 @@
 # ClickHouse on EKS Implementation Plan
 
+> **⚠️ HISTORICAL RECORD — topology since revised.** This plan documents the ORIGINAL build
+> (2 shards × 2 replicas on i4i.xlarge/x86, 4 nodes). After implementation, the design was
+> deliberately re-aligned to **1 shard × 3 replicas on i8g.4xlarge (ARM/Graviton), 3 nodes**,
+> plus the dedicated-node resource model (CPU request high / no CPU limit, memory request==limit,
+> `max_server_memory_usage_to_ram_ratio: 0.9`). The CURRENT source of truth is the code itself and
+> [`../specs/2026-07-03-clickhouse-on-eks-design.md`](../specs/2026-07-03-clickhouse-on-eks-design.md).
+> The task-by-task structure below (blueprint reuse, storage, IRSA, monitoring, ordering, reviews)
+> is still accurate; only the shard/replica counts and instance family changed. Not rewritten to
+> preserve the executed build history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Produce reviewable, executable IaC that stands up a 2-shard × 2-replica ClickHouse cluster on a new EKS cluster with 3-node Keeper, local NVMe storage, Prometheus/Grafana, and clickhouse-backup to S3 — using the Altinity Terraform EKS Blueprint's `eks/` and `clickhouse-operator/` submodules for infrastructure, and our own CHI/CHK manifests for topology.
