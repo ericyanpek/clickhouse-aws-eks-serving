@@ -1,0 +1,106 @@
+# NVMe bootstrap for ClickHouse nodes.
+#
+# WHY: i8g instances ship a local NVMe instance-store disk, but the AL2023 EKS AMI does
+# NOT format or mount it. The local-static-provisioner (installed by Terraform) only
+# publishes PVs for disks already mounted under /mnt/disks. Without this DaemonSet the
+# NVMe stays raw, no local PVs appear, and the ClickHouse PVCs stay Pending forever.
+#
+# WHAT: a privileged DaemonSet on the clickhouse node pool that, per node, finds the
+# unmounted instance-store NVMe device, makes an ext4 filesystem on it once (idempotent),
+# and bind-ready mounts it at /mnt/disks/<device> so the provisioner discovers it.
+#
+# NOTE: instance-store data is ephemeral (lost on stop/terminate) — that is intended here;
+# durability comes from the 3 replicas + S3 backup. The DaemonSet only formats a disk that
+# has NO filesystem, so it will not wipe an already-provisioned disk on pod restart.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvme-bootstrap
+  namespace: kube-system
+  labels:
+    app: nvme-bootstrap
+spec:
+  selector:
+    matchLabels:
+      app: nvme-bootstrap
+  template:
+    metadata:
+      labels:
+        app: nvme-bootstrap
+    spec:
+      # Only on ClickHouse nodes; tolerate their dedicated taint.
+      nodeSelector:
+        workload: clickhouse
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: clickhouse
+          effect: NoSchedule
+      hostPID: true
+      containers:
+        - name: bootstrap
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          securityContext:
+            privileged: true
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              MNT_ROOT=/mnt/disks
+              mkdir -p "$MNT_ROOT"
+
+              echo "[nvme-bootstrap] scanning for instance-store NVMe devices..."
+              # Amazon instance-store NVMe reports model "Amazon EC2 NVMe Instance Storage".
+              # EBS root/data volumes report "Amazon Elastic Block Store" — we must NOT touch those.
+              for dev in /dev/nvme*n1; do
+                [ -b "$dev" ] || continue
+                model=$(nvme id-ctrl "$dev" 2>/dev/null | awk -F: '/^mn /{print $2}' | xargs || true)
+                echo "[nvme-bootstrap] $dev model='$model'"
+                case "$model" in
+                  *Instance\ Storage*) ;;      # instance-store — proceed
+                  *) echo "[nvme-bootstrap] skip $dev (not instance storage)"; continue ;;
+                esac
+
+                # Skip if already mounted anywhere.
+                if findmnt -S "$dev" >/dev/null 2>&1; then
+                  echo "[nvme-bootstrap] $dev already mounted, skip"; continue
+                fi
+
+                # Make a filesystem only if the device has none (idempotent across restarts).
+                if ! blkid "$dev" >/dev/null 2>&1; then
+                  echo "[nvme-bootstrap] mkfs.ext4 on $dev"
+                  mkfs.ext4 -m 0 -E lazy_itable_init=1,lazy_journal_init=1 "$dev"
+                fi
+
+                target="$MNT_ROOT/$(basename "$dev")"
+                mkdir -p "$target"
+                echo "[nvme-bootstrap] mounting $dev -> $target"
+                mount -o defaults,noatime "$dev" "$target"
+              done
+
+              echo "[nvme-bootstrap] done; disks under $MNT_ROOT:"
+              ls -l "$MNT_ROOT" || true
+              # Stay alive so the DaemonSet pod is Running (not CrashLoop) and re-runs on restart.
+              sleep infinity
+          volumeMounts:
+            - name: disks
+              mountPath: /mnt/disks
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              memory: "128Mi"
+      volumes:
+        - name: disks
+          hostPath:
+            path: /mnt/disks
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev

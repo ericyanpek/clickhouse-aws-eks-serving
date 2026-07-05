@@ -32,7 +32,15 @@ if grep -q "REPLACE_WITH" "$tmpdir/30-backup-cronjob.yaml"; then
   exit 1
 fi
 
-echo "==> [4/5] applying manifests in order"
+echo "==> [4/6] formatting + mounting i8g NVMe on ClickHouse nodes"
+# i8g instance-store NVMe is not auto-mounted by AL2023; this DaemonSet mounts it under
+# /mnt/disks so the local-static-provisioner can publish local PVs. Without it the
+# ClickHouse PVCs stay Pending. Runs in kube-system, targets workload=clickhouse nodes.
+kubectl apply -f "$tmpdir/05-nvme-bootstrap.yaml"
+kubectl -n kube-system rollout status ds/nvme-bootstrap --timeout=180s \
+  || echo "WARNING: nvme-bootstrap DaemonSet not ready — ClickHouse PVCs may stay Pending" >&2
+
+echo "==> [5/6] applying manifests in order"
 kubectl apply -f "$tmpdir/00-namespace.yaml"
 # The clickhouse-backup ServiceAccount + ConfigMap must exist BEFORE the CHI, because the
 # CHI podTemplate sets serviceAccountName: clickhouse-backup and the sidecar reads the ConfigMap.
@@ -42,4 +50,4 @@ kubectl -n clickhouse wait --for=condition=Ready pod -l app=clickhouse-keeper --
 kubectl apply -f "$tmpdir/20-clickhouse-chi.yaml"
 kubectl apply -f "$tmpdir/40-grafana-dashboard.yaml"
 
-echo "==> [5/5] done. Watch rollout with: kubectl -n clickhouse get chi,chk,pods -w"
+echo "==> [6/6] done. Watch rollout with: kubectl -n clickhouse get chi,chk,pods -w"

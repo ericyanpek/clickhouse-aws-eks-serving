@@ -10,9 +10,10 @@ kubectl delete -f manifests/10-keeper-chk.yaml --ignore-not-found
 kubectl -n clickhouse delete pvc --all --ignore-not-found
 sleep 20
 
-echo "==> deleting backup resources + clickhouse namespace"
+echo "==> deleting backup resources + clickhouse namespace + nvme bootstrap"
 kubectl delete -f manifests/30-backup-cronjob.yaml --ignore-not-found
 kubectl delete namespace clickhouse --ignore-not-found
+kubectl delete -f manifests/05-nvme-bootstrap.yaml --ignore-not-found
 
 echo "==> terraform destroy (phase 1: in-cluster helm/k8s resources while API is still alive)"
 cd terraform
