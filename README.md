@@ -51,10 +51,11 @@
 |---|---|---|---|
 | **基础设施层** | `//eks` 子模块 | ✅ **原样复用**(钉 `v0.5.7`) | 成熟、AWS 官方合作,不重造轮子 |
 | **Operator 安装** | `//clickhouse-operator` | ✅ **复用**,版本钉到 `0.27.1`(覆盖默认 0.24.4) | 用近期稳定版,可复现 |
+| **Operator 选型** | Altinity operator | Altinity operator(未用 2026-01 发布的官方 operator) | Altinity 成熟、生产验证充分、CHK/CHI 能力齐;官方 operator 较新,待观察 |
 | **集群拓扑层** | `//clickhouse-cluster`(封闭 Helm chart) | ❌ **弃用**,改为自管 CHI/CHK 清单 | 蓝图只暴露 5 个参数,无法表达下列所有定制 |
 | **分片 / 副本** | 写死在 chart | **1 分片 × 3 副本**,可任意调整 | "先垂直扩容,分片最后"——分片无自动 rebalance,3 副本兼顾 HA 与读扩展 |
-| **存储** | 写死 `gp3-encrypted`(EBS) | **本地 NVMe**(i8g,~3.75TB)+ local-static-provisioner | merge/扫描是重 IO,本地盘直连 PCIe 显著更快;durability 交给 3 副本 + S3 |
-| **机型** | 通用 x86 | **i8g.4xlarge(ARM/Graviton)** | ClickHouse 在 Graviton 上性价比领先;官方一等公民 |
+| **存储** | 写死 `gp3-encrypted`(EBS) | **本地 NVMe**(i8g,~3.75TB)+ local-static-provisioner | merge/扫描是重 IO,本地盘直连 PCIe 显著更快;durability 靠 3 副本(在线)+ S3 每日备份(灾备兜底,非主存储) |
+| **机型** | 通用 x86 | **i8g.4xlarge(ARM/Graviton)**,镜像锁 `clickhouse-server:24.8`(稳定 LTS,非 latest) | ClickHouse 在 Graviton 上性价比领先;官方一等公民。锁 LTS 求可复现,升级前实测 |
 | **资源模型** | chart 默认 | 专属节点:**CPU request 高 / 不设 limit**,内存 **request==limit**,`max_server_memory_usage_to_ram_ratio: 0.9` | 独占节点上 CPU limit 会触发 CFS throttle 伤查询延迟;为 page cache 留余量 |
 | **调度** | 有限 | **一 Pod 一节点** + hostname 反亲和 + 跨 3 AZ zone spread + PDB | 副本不同机不同 AZ,单点/单可用区故障不致命 |
 | **Keeper** | 随 chart | **独立 CHK**(3 节点跨 AZ,gp3,PDB minAvailable=2) | 协调层与数据层隔离,是硬性最佳实践 |
@@ -145,11 +146,27 @@ AWS 官方的 [data-on-eks](https://awslabs.github.io/data-on-eks/docs/datastack
 
 本方案针对一个**明确定位**做了自洽取舍,范围内接近最优;超出范围时取舍会变,不应硬套:
 
-- **✅ 适用**:ClickHouse 作为湖仓/数仓下游的轻量 OLAP / BI serving 加速层;读多写少;有上游可重灌数据兜底 durability。
+- **✅ 适用**:ClickHouse 作为湖仓/数仓下游的轻量 OLAP / BI serving 加速层;读多写少;**上游有可重灌的数据源**(湖仓/数仓/Kafka),ClickHouse 里的数据可被重建。
 - **⚠️ 需重估**:
-  - 若 ClickHouse 是**唯一数据源(SoT)**、无上游兜底 → 本地 NVMe 的"会丢"不再可接受,应回到 EBS + 备份为主。
+  - 若 ClickHouse 是**唯一数据源(SoT)**、无上游可重灌 → 本地 NVMe 的"会丢"不再可接受,应回到 EBS + 备份为主。
   - 若**极高吞吐实时摄入**(写重于读)→ 写放大成为主约束,副本/分片策略需重估。
   - 若**超大规模、单查询需跨大量机器扇出** → 必须真正分片,1 分片 scale-up 顶不住;届时先用 `parallel_replicas` 推迟撞墙,再引入分片。
+
+> **⚠️ 关于 durability 的诚实澄清(定位 vs 当前实现)**:
+> 本方案在**理念上**把 ClickHouse 当作"可重建的 serving 层",真相源应在上游湖仓——但**本仓库当前并未接入上游 SoT**,只实现了 **clickhouse-backup 每日全量到 S3**。因此 S3 在这里的角色是**备份/灾备(backup/DR),不是 source of truth**。若你要真正的"可重建到任意时点"语义,需自行接上上游湖仓/Kafka 或 ClickHouse 的 `s3` disk(见 [§3.6](#36-与-clickhouse-cloud-on-aws-的对比) 对 ClickHouse Cloud 存算分离的对比)。
+
+### 恢复模型(RPO / RTO)
+
+本方案是**两级恢复**,两条路径的代价差一个数量级:
+
+| 故障场景 | 恢复方式 | RPO | RTO |
+|---|---|---|---|
+| **部分丢失**(1–2 个副本 / 单节点) | 从存活副本重建(operator + Keeper 自动) | **0**(存活副本数据完整) | **分钟级**;服务不中断,读容量临时降约 1/3,源副本双重负载 |
+| **全部丢失**(3 副本全没 / 整 AZ 级) | 仅能从 S3 每日备份恢复 | **最多 24h**(每日备份粒度) | **分钟到小时级**——S3 恢复是**全量重建 MergeTree**(读 + 重排序 + 重压缩 + 重建稀疏索引),不是文件拷贝 |
+
+> 降低 RPO:把 clickhouse-backup 从每日全量改为**全量 + 增量**(如每小时增量),可把 RPO 压到 24h 以下。这是配置项,未在默认清单里开启。
+
+**拓扑是固定 3 节点(重要)**:clickhouse 节点池 `max_size` 留了每 AZ 1 台的余量,但那是给**节点替换**用的——新起的 i8g 节点带的是**空的本地 NVMe**,必须完成一次副本全量重建才成为可用副本。因此**本拓扑实际是固定 3 数据节点,不是弹性 scale-out**;autoscaler 的作用是"换掉坏节点",不是"按负载加容量"。要加读容量,靠加副本(改 CHI `replicasCount` + AZ 数),不是靠 autoscaler。
 
 同时,本方案**只产出 IaC,不代为执行 `terraform apply`**——真实资源创建、配额、凭证与费用(约 $120–160/天)由使用者掌控。
 
