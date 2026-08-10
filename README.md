@@ -1,178 +1,228 @@
-# ClickHouse on Amazon EKS —— 生产级部署方案
+# ClickHouse on Amazon EKS OLAP 加速层
 
 **中文** · [English](./README.en.md)
 
-> 一套将 ClickHouse 以 **1 分片 × 3 副本** 拓扑部署到 Amazon EKS 的可评审、可执行 IaC。
-> 复用 Altinity 官方 Terraform 蓝图的基础设施层,替换其封闭的集群层,换取对分片/副本拓扑、本地 NVMe、调度亲和性与备份的完全控制。
+> **架构前提:** 数据湖仓是唯一权威数据事实来源（Source of Truth, SoT），保存完整历史并支持重放。ClickHouse 只保存从湖仓派生、可重建的 MergeTree 数据，用作低延迟 OLAP / BI 查询加速层；它不是主数据存储，也不是唯一事实来源。
 >
-> 操作手册见 [`README.en.md`](./README.en.md)(英文,含前置条件、部署步骤、验证、成本、销毁)。本文只讲**方案的意义、取舍与相对上游蓝图的差异**。
+> 本仓库只部署 ClickHouse on EKS，不创建上游湖仓，也不实现 Kafka/Flink 摄入作业。采用本方案前，必须已经有可重放的数据湖仓和对应的批量或流式同步链路。仓库创建的 S3 bucket 仅用于 ClickHouse 备份/灾备，**不是湖仓 SoT**。
 
----
+## 1. 项目定位与价值
 
-## 1. 这套方案解决什么问题
+本项目提供一套可评审、可执行的 Terraform + Kubernetes IaC，在自有 AWS 账号中部署：
 
-在 AWS 上运行生产级 ClickHouse 有多条成熟路径,各自面向不同需求,并无绝对优劣:
+- ClickHouse：**1 分片 × 3 副本**，每副本独占一个跨 AZ 的 `i8g.4xlarge` 节点和本地 NVMe。
+- ClickHouse Keeper：3 节点跨 AZ quorum，数据存放在持久化 EBS。
+- Altinity ClickHouse Operator `0.27.1`。
+- Prometheus、Grafana、每日 S3 备份和 IRSA 权限。
+- NVMe 初始化、部署、验证、节点丢失恢复和有序销毁脚本。
 
-- **ClickHouse Cloud on AWS**(AWS Marketplace 可采购):原厂托管 SaaS。存算分离架构(SharedMergeTree + S3 对象存储),计算按需自动伸缩、可 idle,工程与管理优化成熟,轻运维。**面向希望把运维完全交给原厂、按用量付费、快速上线的团队**——这是多数场景下省心且稳妥的首选。详见 [§3.6 与 ClickHouse Cloud on AWS 的对比](#36-与-clickhouse-cloud-on-aws-的对比)。
-- **Altinity Terraform EKS Blueprint**(官方、与 AWS EKS 团队合作):自管路线的成熟起点。基础设施层(VPC / EKS / 节点组 / IAM / autoscaler)久经考验;但其内置的 ClickHouse 集群层把拓扑封装在上游 Helm chart 内,仅暴露 zones / instance_type / name / user / password 五个参数,难以表达自定义分片副本、本地 NVMe、反亲和调度、备份等生产诉求。
-- **本方案**:同属自管路线,在蓝图基础上做**针对性取舍**——复用其成熟的基础设施层,把封装的集群层替换为**自管的 CHI/CHK 声明式清单**。在"不重造 VPC/EKS 轮子"的同时,拿回对 ClickHouse 拓扑、存储、调度与运维的完全控制权。
+它的核心价值不是替代 ClickHouse Cloud，而是为以下场景提供自管参考实现：
 
-**本方案的定位不是取代托管服务,而是覆盖"需要完全运行在自己 AWS 账号内、深度定制、本地 NVMe IO 特性、并纳入自有 IaC/GitOps/合规体系"的场景。** 若这些不是硬需求,ClickHouse Cloud on AWS 往往是更省心的选择。
+- 数据必须完全运行在自己的 AWS 账号和 VPC 内。
+- 需要控制 ClickHouse 拓扑、调度、内核参数、存储和升级节奏。
+- 数据湖仓已经承接唯一数据事实，需要一个可重建的热查询加速层。
+- 需要用同一套 IaC 做 POC、成本评估、性能验证和合规评审。
 
----
+对于从 ClickHouse Cloud 迁移到 OSS 的 POC，本仓库可回答 EKS 部署、存储、HA、备份和运维问题；它**不包含** Kafka/Flink 双写、历史数据回填、结果比对或切流逻辑，这些属于上游数据管道。
 
-## 2. 出处与依据(Provenance)
+## 2. 当前架构
 
-本方案不是凭空设计,而是在权威来源上做减法与定制。所有引用均可追溯:
-
-| 来源 | 用途 | 链接 |
-|---|---|---|
-| **Altinity Terraform AWS EKS Blueprint** `v0.5.7` | 复用其 `//eks`(VPC/EKS/节点组/IAM/autoscaler)与 `//clickhouse-operator` 子模块 | https://github.com/Altinity/terraform-aws-eks-clickhouse |
-| **Altinity Kubernetes Operator for ClickHouse** `0.27.1` | 通过 CHI / CHK CRD 声明式管理 ClickHouse 集群与 Keeper | https://github.com/Altinity/clickhouse-operator |
-| **ClickHouse 官方 BYOC on AWS** | 验证了 "operator-on-EKS" 模式在规模化生产中的可行性 | https://clickhouse.com/blog/building-clickhouse-byoc-on-aws |
-| **ClickHouse Keeper 官方文档 / Altinity KB** | 协调层选型(NuRAFT,替代 ZooKeeper)与 3 节点奇数 quorum | https://clickhouse.com/docs/guides/sre/keeper/clickhouse-keeper |
-| **sig-storage local-static-provisioner** `2.8.0` | 将 i8g 本地 NVMe 发布为 `local` PV | https://github.com/kubernetes-sigs/sig-storage-local-static-provisioner |
-| **kube-prometheus-stack** + Altinity Grafana dashboard `#12163` | 监控栈 | https://grafana.com/grafana/dashboards/12163 |
-
-调研与设计依据(仓库内):
-- [`docs/clickhouse-on-eks-research.md`](./docs/clickhouse-on-eks-research.md) —— 生态组件与最佳实践调研(多源交叉验证,带引用)
-- [`docs/notes-ck-on-eks-best-practices-2026.md`](./docs/notes-ck-on-eks-best-practices-2026.md) —— 拓扑/机型/资源模型/存储/恢复的推演笔记(本方案拓扑对齐的依据)
-- [`docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md`](./docs/superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) —— 设计规格
-- [`docs/perf-testing-plan.md`](./docs/perf-testing-plan.md) —— 性能与压力测试计划(数据集与流程,带核实的出处)
-- [`docs/perf-test-report.md`](./docs/perf-test-report.md) —— **性能测试报告(实测数据)**:ClickBench 43 查询延迟、并发读扩展、parallel_replicas 加速、HA 混沌,全部真实数字
-- [`docs/community-corroboration.md`](./docs/community-corroboration.md) —— **社区/官方对本方案五条设计主张的印证**(附最接近的真实实践与诚实 caveat)
-
----
-
-## 3. 与上游蓝图的关键差异
-
-这是本方案的核心价值所在。**复用 = 蓝图已验证的部分;替换/新增 = 蓝图表达不了、但生产必需的部分。**
-
-| 维度 | Altinity Blueprint(默认) | 本方案 | 为什么这么改 |
-|---|---|---|---|
-| **基础设施层** | `//eks` 子模块 | ✅ **原样复用**(钉 `v0.5.7`) | 成熟、AWS 官方合作,不重造轮子 |
-| **Operator 安装** | `//clickhouse-operator` | ✅ **复用**,版本钉到 `0.27.1`(覆盖默认 0.24.4) | 用近期稳定版,可复现 |
-| **Operator 选型** | Altinity operator | Altinity operator(未用 2026-01 发布的官方 operator) | Altinity 成熟、生产验证充分、CHK/CHI 能力齐;官方 operator 较新,待观察 |
-| **集群拓扑层** | `//clickhouse-cluster`(封闭 Helm chart) | ❌ **弃用**,改为自管 CHI/CHK 清单 | 蓝图只暴露 5 个参数,无法表达下列所有定制 |
-| **分片 / 副本** | 写死在 chart | **1 分片 × 3 副本**,可任意调整 | "先垂直扩容,分片最后"——分片无自动 rebalance,3 副本兼顾 HA 与读扩展 |
-| **存储** | 写死 `gp3-encrypted`(EBS) | **本地 NVMe**(i8g,~3.75TB)+ local-static-provisioner | merge/扫描是重 IO,本地盘直连 PCIe 显著更快;durability 靠 3 副本(在线)+ S3 每日备份(灾备兜底,非主存储) |
-| **机型** | 通用 x86 | **i8g.4xlarge(ARM/Graviton)**,镜像锁 `clickhouse-server:24.8`(稳定 LTS,非 latest) | ClickHouse 在 Graviton 上性价比领先;官方一等公民。锁 LTS 求可复现,升级前实测 |
-| **资源模型** | chart 默认 | 专属节点:**CPU request 高 / 不设 limit**,内存 **request==limit**,`max_server_memory_usage_to_ram_ratio: 0.9` | 独占节点上 CPU limit 会触发 CFS throttle 伤查询延迟;为 page cache 留余量 |
-| **调度** | 有限 | **一 Pod 一节点** + hostname 反亲和 + 跨 3 AZ zone spread + PDB | 副本不同机不同 AZ,单点/单可用区故障不致命 |
-| **Keeper** | 随 chart | **独立 CHK**(3 节点跨 AZ,gp3,PDB minAvailable=2) | 协调层与数据层隔离,是硬性最佳实践 |
-| **备份** | ❌ 无 | **clickhouse-backup → S3**,经 IRSA 授权,每日 CronJob | 本地盘无快照,S3 备份是唯一灾难兜底 |
-| **NVMe 挂载** | ❌ 不处理 | **bootstrap DaemonSet** 格式化并挂载 i8g 本地盘至 `/mnt/disks` | AL2023 不自动挂 instance store,不处理则 PVC 永久 Pending |
-| **apply 流程** | 单次 | **两阶段 apply**(先 AWS 基础设施,再 in-cluster helm/k8s 资源) | 避免 helm/kubernetes provider 连接尚未就绪的集群导致中途卡死 |
-| **销毁流程** | 单次 destroy | **两阶段 teardown**(先删 in-cluster 资源,再删集群) | 避免 destroy 时 provider 竞争导致状态损坏、资源残留计费 |
-
-被验证推翻的上游宣传(见调研报告):蓝图"负责 backup/recovery"未被证实——它只部署 operator,备份能力需自建(即本方案第 4/6/11 项)。
-
-**相较蓝图的进阶价值,提炼为四点:**
-1. **拓扑与存储自主**:蓝图把集群层锁死在 5 个参数;本方案用声明式 CHI/CHK 拿回分片副本、本地 NVMe、存储类的完全控制——这是从"能跑"到"按需生产化"的关键差别。
-2. **性能选型到位**:Graviton(i8g)+ 本地 NVMe 直连 + 专属节点资源模型(CPU 不设 limit 避免 CFS throttle、内存 request==limit、page cache ratio),把单节点性能压到该机型的上限——蓝图默认的通用 x86 + gp3 达不到。
-3. **生产必备的补齐**:独立 Keeper + PDB、跨 AZ 反亲和、clickhouse-backup→S3(蓝图完全没有)、i8g NVMe 自动挂载(蓝图不处理,否则 PVC 永久 Pending)。
-4. **流程健壮性**:两阶段 apply(避开 helm provider 连接未就绪集群)、两阶段 teardown(避免 provider 竞争导致状态损坏/资源残留计费)——这些是蓝图单次 apply/destroy 不具备的工程加固,来自真实部署中踩过的坑。
-
----
-
-## 3.5 与 AWS `data-on-eks` 参考栈的对比
-
-AWS 官方的 [data-on-eks](https://awslabs.github.io/data-on-eks/docs/datastacks/databases/clickhouse-on-eks/infra) 提供了另一个 ClickHouse-on-EKS 参考实现。两者**同源(都基于 Altinity operator)、异路**:它是"功能全开的数据平台样板",本方案是"为特定定位做减法的精简生产方案"。
-
-| 维度 | AWS data-on-eks(参考栈) | 本方案 | 实质 |
-|---|---|---|---|
-| 节点伸缩 | **Karpenter**(按需/Spot,pod 驱动) | cluster-autoscaler(蓝图自带,固定节点组) | 平台弹性 vs 依赖少、可评审 |
-| 应用交付 | **ArgoCD(GitOps)** 全家桶 | 裸 Terraform + kubectl | 平台工程 vs 心智负担低 |
-| 拓扑 | **3 分片 × 3 副本(9 Pod)** | **1 分片 × 3 副本(3 Pod)** | 展示分布式全貌 vs "先扩容、后分片" |
-| 机型 | Graviton m6g.8xlarge | Graviton i8g.4xlarge | 都 ARM,存储家族不同 |
-| 存储 | **EBS gp3 500Gi/副本** | **本地 NVMe ~3.75TB** | 稳妥恢复快 vs IO 上限高(靠副本+S3 兜底) |
-| Operator / Keeper | Altinity / 3 节点 | Altinity 0.27.1 / 3 节点 + PDB | 同源 |
-| 反亲和 / 备份 | 文档未体现 | 显式反亲和+zone spread+PDB / clickhouse-backup→S3 | 本方案更严格、补齐备份 |
-
-**三个关键分歧不是对错,是定位不同:**
-- **Karpenter/ArgoCD vs 固定节点组/Terraform**:前者面向"已有平台团队的数据平台",后者面向"要一套可控的 ClickHouse,而非一套平台"。
-- **3×3 vs 1×3**:前者演示分布式,后者遵循"scale-up first, shard last"(分片无自动 rebalance,先垂直做大 + `parallel_replicas`)。
-- **EBS vs 本地 NVMe**:前者稳妥,后者为压测/serving 加速追求 IO 上限,并配齐其前提(跨 AZ 反亲和 + S3 备份 + NVMe 挂载)。
-
-> 一句话:**data-on-eks 教你"分布式怎么搭";本方案主张"先别急着分布式",并把依赖收敛到最小。** 两者可互为参照——见下节"演进方向"。
-
-## 3.6 与 ClickHouse Cloud on AWS 的对比
-
-[ClickHouse Cloud on AWS](https://clickhouse.com/cloud)(AWS Marketplace 可采购)是原厂托管 SaaS,也是多数团队的稳妥首选。它与本方案是**两种架构范式**,不是"托管版 vs 弱化版"——真正的区别在架构哲学与运维模型,各有最佳场景。
-
-| 维度 | ClickHouse Cloud on AWS(原厂 SaaS) | 本方案(自管 EKS) | 实质 |
-|---|---|---|---|
-| 运维模型 | **全托管、轻运维**,原厂负责升级/伸缩/故障 | 自运维(operator 辅助),责任在自己 | ⭐ Cloud 的核心优势 |
-| 存储架构 | **存算分离**,数据在 S3,`SharedMergeTree` | 存算一体,本地 NVMe,`ReplicatedMergeTree` | 范式不同(见下) |
-| 弹性 | **计算独立伸缩、可 idle 近零、按用量计费** | 固定节点组(可演进到弹性) | ⭐ Cloud 优势 |
-| 副本协调 | 经 S3 + Keeper,**副本间不互传数据** | 副本间 fetch part(interserver) | 各有取舍 |
-| IO 路径 | 以 S3 为主(计算侧缓存机制官方未详述) | **本地 NVMe 直连**,低延迟高 IOPS | IO 敏感场景本方案理论占优 |
-| 定制深度 | 平台化,定制在托管边界内 | **内核参数/调度/存储类/拓扑完全可改** | ⭐ 本方案优势 |
-| 数据主权 | 标准版数据面在 CH 账号;另有 **BYOC**(数据面在你 VPC) | **完全在自己 AWS 账号内** | 各有选项 |
-| 成本结构 | 按用量 + 托管价值(省人力) | 基础设施成本 + 自运维人力 | 结构不同,不宜简单比高低 |
-| 采购/合规 | Marketplace 一键采购,原厂 SLA | 纳入自有 IaC/GitOps/合规审计流程 | 取决于组织要求 |
-
-**先明确肯定 ClickHouse Cloud 的优势(都是真实的):** 原厂托管的轻运维体验、`SharedMergeTree` 面向对象存储的工程优化(更高插入吞吐、更好的后台 merge、副本扩展无需互传数据)、计算的弹性伸缩与 idle、以及 AWS Marketplace 的采购便利与原厂 SLA。**对绝大多数希望"专注业务、少碰基础设施"的团队,它是更优解。**
-
-**本方案的差异化价值,在于覆盖托管边界之外的场景:**
-- **完全自持**:全部资源运行在自己的 AWS 账号内,满足强数据主权/合规审计诉求(BYOC 也能自持,但本方案的定制自由度更高)。
-- **深度定制**:内核参数、调度亲和、存储类、拓扑均可改到位——托管服务出于稳定性会限制这类底层旋钮。
-- **本地 NVMe 的 IO 特性**:存算一体 + 本地盘直连,在对**热数据低延迟扫描/点查**敏感的场景有架构层面的 IO 优势。
-- **纳入自有 IaC 体系**:整套是可评审的 Terraform + 声明式清单,天然融入既有 GitOps/CI/合规流程。
-
-> **严谨说明**:两者的 IO 路径不同(本地 NVMe 直连 vs S3+缓存),本方案在 IO 敏感负载上**理论**有延迟优势,但官方未提供与自管本地盘的量化对比,故本仓库**不声称"更快"**——请以自身负载在 [`docs/perf-testing-plan.md`](./docs/perf-testing-plan.md) 下实测为准。选型应回到需求:**要省心与弹性 → ClickHouse Cloud;要自持、定制与本地盘 IO → 本方案。**
-
-## 4. 架构一览
-
-```
-┌───────────────────────────── 新建 VPC (3 AZ) ─────────────────────────────┐
-│  EKS 集群                                                                  │
-│   ├─ system 节点组 (t3, gp3)     : operator / kube-prometheus-stack        │
-│   ├─ clickhouse 节点组 (i8g.4xlarge, 本地 NVMe, 3× 跨 AZ)                   │
-│   │     shard0-replica0 (a)   shard0-replica1 (b)   shard0-replica2 (c)    │
-│   │     —— 一 Pod 一节点,反亲和 + zone spread,CHI CRD 声明               │
-│   └─ system-keeper 节点组 (t3, gp3, 3× 跨 AZ)  : ClickHouse Keeper (CHK)   │
-└────────────────┬───────────────────────────────────┬──────────────────────┘
-                 │ IRSA                               │ 每日备份
-                 ▼                                    ▼
-        ClickHouse Service (ClusterIP)         S3 Bucket (加密/版本化/阻断公有)
+```text
+Kafka / Flink / Batch
+         |
+         | authoritative write
+         v
+Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
+唯一 SoT、完整历史、可重放
+         |
+         | incremental load / replay
+         v
++------------------------- Amazon EKS, 3 AZ -------------------------+
+| ClickHouse 1 shard x 3 replicas                                   |
+|   i8g.4xlarge + local NVMe, one Pod per node                      |
+|                                                                    |
+| ClickHouse Keeper 3 nodes + EBS                                   |
+| Altinity Operator + local-static-provisioner                      |
+| Prometheus + Grafana                                               |
++------------------------------+-------------------------------------+
+                               |
+                               | daily backup via IRSA
+                               v
+                    S3 backup bucket (not the SoT)
 ```
 
-- **分层解耦**:Terraform 管 AWS 基础设施 + Helm addons;Kubernetes 清单管 ClickHouse 业务拓扑(CHI/CHK)。改拓扑不动 Terraform。
-- **协调层**:ClickHouse Keeper(C++/NuRAFT,ZooKeeper 协议兼容),3 节点奇数 quorum,独立于数据节点。
+关键属性：
 
----
+| 维度 | 当前实现 |
+|---|---|
+| 数据角色 | 湖仓是唯一 SoT；ClickHouse 是最终一致、可重建的派生 OLAP 加速层 |
+| ClickHouse 拓扑 | 1 shard × 3 replicas，固定 3 个数据节点 |
+| 数据存储 | 每副本约 3.4 TiB 本地 NVMe，`ReplicatedMergeTree` |
+| 协调层 | 3 节点 Keeper，EBS `gp3-encrypted` |
+| 服务暴露 | `ClusterIP`，默认不公网暴露 |
+| 灾备 | ClickHouse 副本 + 每日 S3 备份；全量权威恢复源仍是上游湖仓 |
+| 镜像 | ClickHouse / Keeper `25.3` LTS |
 
-## 5. 适用边界(严谨说明)
+## 3. 数据流与 Kafka/Flink 边界
 
-本方案针对一个**明确定位**做了自洽取舍,范围内接近最优;超出范围时取舍会变,不应硬套:
+推荐的数据责任划分：
 
-- **✅ 适用**:ClickHouse 作为湖仓/数仓下游的轻量 OLAP / BI serving 加速层;读多写少;**上游有可重灌的数据源**(湖仓/数仓/Kafka),ClickHouse 里的数据可被重建。
-- **⚠️ 需重估**:
-  - 若 ClickHouse 是**唯一数据源(SoT)**、无上游可重灌 → 本地 NVMe 的"会丢"不再可接受,应回到 EBS + 备份为主。
-  - 若**极高吞吐实时摄入**(写重于读)→ 写放大成为主约束,副本/分片策略需重估。
-  - 若**超大规模、单查询需跨大量机器扇出** → 必须真正分片,1 分片 scale-up 顶不住;届时先用 `parallel_replicas` 推迟撞墙,再引入分片。
+1. Kafka/Flink 或批处理首先保证事件进入湖仓，湖仓保存完整、权威、可重放的数据。
+2. 同一作业或独立派生作业把数据写入 ClickHouse，维护 watermark、幂等键、schema 映射和失败重放。
+3. POC 期间可从同一标准化数据流双写 ClickHouse Cloud 与本项目部署的 OSS 集群。
+4. 使用固定时间窗口、行数/聚合校验、查询结果 diff 和延迟指标验证两端一致性。
+5. 切流后仍保留湖仓作为唯一 SoT；ClickHouse 集群可以从湖仓重新物化。
 
-> **⚠️ 关于 durability 的诚实澄清(定位 vs 当前实现)**:
-> 本方案在**理念上**把 ClickHouse 当作"可重建的 serving 层",真相源应在上游湖仓——但**本仓库当前并未接入上游 SoT**,只实现了 **clickhouse-backup 每日全量到 S3**。因此 S3 在这里的角色是**备份/灾备(backup/DR),不是 source of truth**。若你要真正的"可重建到任意时点"语义,需自行接上上游湖仓/Kafka 或 ClickHouse 的 `s3` disk(见 [§3.6](#36-与-clickhouse-cloud-on-aws-的对比) 对 ClickHouse Cloud 存算分离的对比)。
+可选摄入方式包括 Flink ClickHouse connector、Kafka engine + Materialized View、从 Iceberg/Parquet 批量 `INSERT SELECT`，或外部编排的增量回填。具体选择取决于交付语义和吞吐量，本仓库不替用户实现或承诺 exactly-once。
 
-### 恢复模型(RPO / RTO)
+## 4. 关键设计取舍
 
-本方案是**两级恢复**,两条路径的代价差一个数量级:
+### 4.1 EKS 与 EC2
 
-| 故障场景 | 恢复方式 | RPO | RTO |
-|---|---|---|---|
-| **部分丢失**(1–2 个副本 / 单节点) | 从存活副本重建(operator + Keeper 自动) | **0**(存活副本数据完整) | **分钟级**;服务不中断,读容量临时降约 1/3,源副本双重负载 |
-| **全部丢失**(3 副本全没 / 整 AZ 级) | 仅能从 S3 每日备份恢复 | **最多 24h**(每日备份粒度) | **分钟到小时级**——S3 恢复是**全量重建 MergeTree**(读 + 重排序 + 重压缩 + 重建稀疏索引),不是文件拷贝 |
+- 已有 Kubernetes 平台团队、需要 GitOps/统一可观测性和调度策略时，EKS 更适合。
+- 只运行单个 ClickHouse 集群且希望减少控制面复杂度时，EC2 通常更直接。
+- 本仓库选择 EKS，是为了复用 Altinity Operator 和现有平台能力，不代表 EKS 对所有场景都优于 EC2。
 
-> 降低 RPO:把 clickhouse-backup 从每日全量改为**全量 + 增量**(如每小时增量),可把 RPO 压到 24h 以下。这是配置项,未在默认清单里开启。
+### 4.2 一分片三副本
 
-**拓扑是固定 3 节点(重要)**:clickhouse 节点池 `max_size` 留了每 AZ 1 台的余量,但那是给**节点替换**用的——新起的 i8g 节点带的是**空的本地 NVMe**,必须完成一次副本全量重建才成为可用副本。因此**本拓扑实际是固定 3 数据节点,不是弹性 scale-out**;autoscaler 的作用是"换掉坏节点",不是"按负载加容量"。要加读容量,靠加副本(改 CHI `replicasCount` + AZ 数),不是靠 autoscaler。
+默认先垂直扩容，再考虑分片。增加 shard 不会自动搬迁历史数据；只有当单节点容量或单查询算力成为瓶颈时，才应设计真正的重分片流程。3 个副本用于跨 AZ 可用性和读扩展，不改变湖仓的 SoT 地位。
 
-同时,本方案**只产出 IaC,不代为执行 `terraform apply`**——真实资源创建、配额、凭证与费用(约 $120–160/天)由使用者掌控。
+### 4.3 本地 NVMe
 
----
+本地 NVMe 提供高 IO，但节点终止后数据永久丢失，local PV 也不会自动漂移。该取舍只在 ClickHouse 数据可从湖仓重建时成立。若 ClickHouse 是唯一数据源，应改用更持久的存储设计，并重新评估本仓库的恢复模型。
 
-## 6. 一句话总结
+### 4.4 S3 备份
 
-> **站在 Altinity 官方蓝图成熟的基础设施地基上,把它封闭、表达力不足的集群层,换成一套自管的、声明式的、面向生产的 ClickHouse 拓扑——用最小的重复劳动,换回对分片副本、本地 NVMe、调度亲和、备份与升级流程的完全控制。**
+`clickhouse-backup` 保存的是 ClickHouse 恢复点，用于缩短灾难恢复时间。备份桶不替代湖仓，默认 teardown 后继续保留，并从 Terraform state 移除。
+
+## 5. 与其他方案的关系
+
+- **ClickHouse Cloud on AWS**：原厂托管、轻运维、弹性更强，通常是没有自管硬需求时的优先选择。
+- **Altinity Terraform EKS Blueprint**：本项目复用其 VPC/EKS/节点组和 operator 基础设施层，但用自有 CHI/CHK 清单替换其封装的集群层。
+- **AWS data-on-eks**：更偏完整数据平台样板；本项目聚焦固定 1×3、专属节点、本地 NVMe 和较少依赖。
+
+设计依据、实测报告和历史材料的状态见 [文档索引](./docs/README.md)。
+
+## 6. 前置条件与成本
+
+需要：
+
+- Terraform `>= 1.5`
+- AWS CLI 和可用凭证
+- `kubectl`、Helm 3
+- EKS、VPC/EC2、IAM、S3 权限
+- 目标区域内至少 3 台 `i8g.4xlarge` 的配额和容量
+- 已存在的数据湖仓、schema 管理和可重放摄入链路
+
+该部署持续运行时成本显著，包括 3 台 i8g 数据节点、3 台 Keeper 节点、3 台 system 节点、1 台 benchmark 节点、NAT Gateway 和 EKS 控制面。价格随区域和时间变化，apply 前必须使用 AWS Pricing Calculator 和 Service Quotas 核实，不应把仓库中的历史估算当报价。
+
+## 7. 配置
+
+```bash
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+```
+
+至少检查：
+
+```hcl
+region             = "us-east-1"
+availability_zones = ["us-east-1b", "us-east-1c", "us-east-1d"]
+clickhouse_zones    = ["us-east-1b", "us-east-1c", "us-east-1d"]
+
+backup_bucket_name = ""
+public_access_cidrs = ["203.0.113.0/24"]
+```
+
+`availability_zones` 和 `clickhouse_zones` 必须是同一区域内三个真实、不同的 AZ。`public_access_cidrs` 默认值会开放 EKS 公网 API，生产环境必须收紧。
+
+资源值按 `i8g.4xlarge` 定尺。切换实例类型时必须同步调整 [ClickHouse manifest](./manifests/20-clickhouse-chi.yaml) 中的 CPU、内存和 PVC 容量。
+
+## 8. 部署
+
+部署前必须提供管理员密码：
+
+```bash
+CLICKHOUSE_ADMIN_PASSWORD='replace-with-a-strong-secret' ./scripts/deploy.sh
+```
+
+脚本会在创建基础设施前检查密码并计算 SHA-256，只把 hash 写入临时 manifest。Terraform 默认要求人工确认。CI 如需非交互执行，必须显式设置：
+
+```bash
+CLICKHOUSE_ADMIN_PASSWORD='...' AUTO_APPROVE=true ./scripts/deploy.sh
+```
+
+部署顺序：
+
+1. 创建 VPC、EKS、节点组、S3 备份桶和 IRSA。
+2. 安装 operator、监控和 local-static-provisioner。
+3. 用 DaemonSet 格式化并挂载 ClickHouse 节点的 instance-store NVMe。
+4. 按 namespace、备份配置、Keeper、ClickHouse、Grafana dashboard 的顺序应用 manifest。
+
+不要直接应用仓库中的 CHI；其中的 `REPLACE_WITH_ADMIN_SHA256` 必须由部署流程替换。
+
+## 9. 验证与访问
+
+```bash
+kubectl -n clickhouse get chi,chk,pods
+./scripts/smoke-test.sh
+```
+
+Smoke test 会验证 1×3 拓扑、ReplicatedMergeTree 写入、跨副本复制和 `system.replicas`。
+
+ClickHouse 默认仅在集群内可用。临时访问：
+
+```bash
+kubectl -n clickhouse port-forward svc/clickhouse-ch 8123:8123
+curl -u admin:yourpassword "http://localhost:8123/?query=SELECT+version()"
+```
+
+## 10. 监控
+
+```bash
+kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
+```
+
+重点监控副本延迟、replication queue、磁盘使用率、merge backlog、查询延迟、CPU、内存和网络。仓库中的 dashboard ConfigMap 是基础入口，生产使用前应按实际指标名称和告警阈值补齐。
+
+## 11. 备份与恢复
+
+每日 CronJob 在 `02:00 UTC` 调用 `clickhouse-backup`，将单分片的一个完整副本上传到版本化、加密并阻断公有访问的 S3 bucket。
+
+查看备份：
+
+```bash
+kubectl -n clickhouse get cronjob clickhouse-backup-daily
+kubectl -n clickhouse get jobs
+cd terraform && terraform output -raw backup_bucket
+```
+
+永久丢失本地 NVMe 节点时，Kubernetes 不会自动把 PVC 移到新节点。确认故障节点不会恢复且至少一个其他副本健康后执行：
+
+```bash
+CONFIRM_REPLICA_DATA_LOSS=yes \
+  ./scripts/recover-local-replica.sh chi-ch-main-0-1
+```
+
+脚本拒绝删除 Ready Pod，只处理 `local-storage` PVC，并在清理旧 Pod/PVC/PV 时短暂停止 operator，随后恢复 operator 并等待新副本。Pod Ready 后仍需检查 `system.replicas` 队列归零。
+
+全体 ClickHouse 副本丢失时，优先从上游湖仓按分区重建；S3 ClickHouse 备份是缩短 RTO 的辅助恢复点，而不是权威数据事实来源。
+
+## 12. 销毁
+
+```bash
+./scripts/teardown.sh
+```
+
+脚本先删除集群内资源，再销毁 EKS/VPC。S3 备份桶及其版本化、加密和公有访问阻断配置会被保留，并从 Terraform state 移除。脚本会打印准确桶名；确认备份不再需要后，必须人工删除全部对象版本和 bucket。
+
+## 13. 适用边界与文档规则
+
+当前非目标：
+
+- 不部署数据湖仓、Glue Catalog、Kafka/MSK 或 Flink。
+- 不实现 Cloud 与 OSS 双写、历史回填、CDC、去重或结果比对。
+- 不提供公网负载均衡、TLS、认证代理或多租户隔离。
+- 不提供自动分片、自动 local-PV 故障恢复或弹性 scale-out。
+- 不把 ClickHouse 或备份桶定义为唯一 SoT。
+
+`README.md` 与 `README.en.md` 是同步维护的中英文权威入口，章节编号和技术事实必须保持一致。`docs/` 下的调研、测试报告和历史实施计划属于支持材料，其权威级别和适用版本见 [docs/README.md](./docs/README.md)。

@@ -1,5 +1,7 @@
 # ClickHouse on EKS —— 生产最佳实践笔记（2026-07）
 
+**中文** · [English](./notes-ck-on-eks-best-practices-2026.en.md)
+
 > 缘起：从 awslabs data-on-eks 的 clickhouse-on-eks reference stack（Altinity Operator + Keeper + Karpenter + ArgoCD，示例 3×3）出发，逐层推演，落成一套自己的部署主张。
 > 参考页：https://awslabs.github.io/data-on-eks/docs/datastacks/databases/clickhouse-on-eks
 
@@ -7,7 +9,7 @@
 
 ## 0. 这套最佳实践的适用边界（先说清楚 scope）
 
-**这套主张是针对一个具体定位的：CK 作为"湖仓/数仓下游的、轻量 OLAP / BI serving 加速层"，不做主数仓、不当唯一 source of truth。**
+**这套主张是针对一个具体定位的：上游数据湖仓承接唯一权威 Source of Truth,CK 作为其下游派生、最终一致、可重建的 OLAP / BI serving 加速层。**
 
 在这个定位下，下面所有取舍都自洽且接近最优。但它不是"CK on EKS 唯一正确解"——以下情况取舍会变，别硬套：
 
@@ -157,7 +159,7 @@ CK 是少数在 ARM 上几乎无脑赢的负载：
 - **IO 撞墙（merge 堆积、扫描被盘拖慢）→ im4gn/i8g**，前置条件焊死：3 副本 + 严格跨 3 AZ + hostname 反亲和 + `karpenter.sh/do-not-disrupt` 防主动搬迁。
 - **两头兼顾 → 本地 NVMe 热数据 + S3 tiered/备份冷数据**（见 §7）。
 
-**⚠️ 只有在 §7 的 S3-as-SoT 前提下，本地 NVMe 的"会丢"才从缺点变成"无所谓"——两个话题在这里合流。**
+**⚠️ 只有在 §7 的上游湖仓 SoT 可重放前提下，本地 NVMe 的数据丢失才不会造成权威数据丢失;但 local PV 仍需人工释放和重建,不是"无所谓"。**
 
 ---
 
@@ -247,7 +249,7 @@ spec:
 
 ---
 
-## 7. 核心架构主张：湖仓/S3 当 SoT，CK 当可重建的派生 serving 层
+## 7. 核心架构主张：上游湖仓是唯一 SoT，CK 是可重建的派生 serving 层
 
 **这是把前面所有取舍串起来的关键定位。**
 
@@ -264,11 +266,11 @@ spec:
    └────────────────────────────────────────────────┘
 ```
 
-**心智转变：CK 从"有状态数据库"降级成"派生态物化缓存"。数据的家在 S3，CK 只是为查询优化过的一份拷贝。** 一旦接受这个定位，取舍全顺：
-- ✅ 本地 NVMe 的"会丢"不再是问题——丢了本来就能从 S3 重灌（§5 与此合流）。
+**心智转变：CK 从"权威数据库"变成"派生物化加速层"。数据的家在上游湖仓（通常基于 S3）,CK 只是为查询优化过的一份拷贝。仓库内 clickhouse-backup 的 S3 bucket 是辅助恢复点,不是湖仓。** 一旦接受这个定位，取舍全顺：
+- ✅ 本地 NVMe 丢失不会造成权威数据丢失——释放失效 local PV 后可从健康副本恢复,必要时从湖仓重灌（§5 与此合流）。
 - ✅ DDL 走 CICD 秒级重建 schema（DDL 是瞬时的）。`ORDER BY`/partition/codec/TTL 这些调优精华当代码版本化。
-- ✅ **两级恢复**：部分故障用副本兜（快路径），全挂用 S3 pipeline 兜（慢兜底）。
-- ✅ 副本数可按"读 QPS"定，不用按"怕丢数据"定（durability 交给 S3）。
+- ✅ **两级恢复**：部分故障从健康副本 fetch（快路径），全挂从上游湖仓重灌（权威慢路径）；ClickHouse S3 备份用于缩短 RTO。
+- ✅ 副本数可按"读 QPS + 在线可用性"定,权威 durability 由上游湖仓承担。
 - ✅ 甚至可做"按需起集群"：高峰起、闲时缩，数据反正在 S3。
 
 ### 从湖仓导入 CK 的摄入方式（按 SoT 形态选）
@@ -278,7 +280,7 @@ spec:
 | 持续新文件落 S3 | **`S3Queue` 引擎**（原生自动消费，类 Kafka 位点） | 准实时微批 |
 | 开放表格式 Iceberg/Delta/Hudi | `iceberg()`/`deltaLake()`/`hudi()` 表函数或引擎，直连 Glue/REST catalog | SoT 已是 lakehouse 表 |
 | 想声明式定时拉 | **Refreshable Materialized View**（定时从 s3()/iceberg() 刷新） | 让"从湖同步"变成 DDL 声明，不用外部 orchestrator |
-| 上游是流 | Kafka/MSK 引擎 | 流式 SoT |
+| 上游是流 | Kafka/MSK 引擎 | 流式派生摄入;长期权威历史仍落湖仓 |
 
 ⚠️ 成熟度：`S3Queue`、refreshable MV、Iceberg **写** 都是近一两年才转稳；读侧很稳，写/exactly-once 语义按集群版本查 changelog。
 
@@ -343,4 +345,4 @@ S3 重灌恢复（re-ingest）: 读 Parquet →【重新排序 + 重新压缩 + 
 
 ## 10. 一句话总纲
 
-**S3/湖仓当 SoT + CK 当可重建的物化 serving 层；1 shard × 3 replica 大 Graviton 节点起手，一 node 一 pod 吃满整机（request≈allocatable、CPU 不设 limit、内存 request==limit + ratio 0.9）；IO 撞墙上本地 NVMe（靠 S3 兜底 durability）；DDL as code 秒级建表；两级恢复——副本 fetch 走快路径（分钟级、拷现成 part），S3 重灌走慢兜底（小时级 DR、重建 MergeTree）。撞到"单查询只用一台算力 / 全量塞不下一台"才引入分片，之前先用 parallel_replicas 顶。**
+**上游湖仓承接唯一 SoT + CK 当可重建的物化 serving 层；1 shard × 3 replica 大 Graviton 节点起手，一 node 一 pod 吃满整机（request≈allocatable、CPU 不设 limit、内存 request==limit + ratio 0.9）；IO 撞墙上本地 NVMe；DDL as code；两级恢复——健康副本 fetch 走快路径,湖仓重灌走权威慢路径,ClickHouse S3 备份用于缩短 RTO。撞到"单查询只用一台算力 / 全量塞不下一台"才引入分片，之前先用 parallel_replicas 顶。**

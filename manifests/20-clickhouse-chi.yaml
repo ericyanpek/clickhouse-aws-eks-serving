@@ -33,13 +33,12 @@ spec:
     clusters:
       - name: main
         layout:
-          # 1 shard × 2 replicas (temporary — i8g capacity limited us to 2 AZs; target is 3).
-          # Each replica holds the full dataset; reads spread across both, HA tolerates 1 loss.
-          # To scale to 3 replicas later: add a 3rd AZ to clickhouse_zones (tfvars) + set replicasCount: 3.
+          # 1 shard × 3 replicas, one per AZ. Each replica holds the full dataset;
+          # reads spread across replicas and the cluster tolerates one replica loss.
           # Scale UP first (re-sharding has no auto-rebalance); add shards only when a single query
           # outgrows one node's CPU or the data outgrows one disk.
           shardsCount: 1
-          replicasCount: 2
+          replicasCount: 3
   templates:
     serviceTemplates:
       - name: ch-cluster-ip
@@ -135,16 +134,15 @@ spec:
             requests:
               storage: 3400Gi # matches i8g.4xlarge instance-store (~3.75TB); adjust per instance size
 ---
-# 1 shard × 2 replicas: keep at least 1 replica up during voluntary disruptions
-# (node drain, rolling restart) so reads stay served. With only 2 replicas, minAvailable
-# MUST be 1 — setting 2 would block every voluntary disruption. Bump to 2 when scaling to 3 replicas.
+# Keep at least 2 of the 3 replicas up during voluntary disruptions (node drain,
+# rolling restart) so the shard remains highly available.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: ch-pdb
   namespace: clickhouse
 spec:
-  minAvailable: 1
+  minAvailable: 2
   selector:
     matchLabels:
       clickhouse.altinity.com/chi: ch

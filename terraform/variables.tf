@@ -55,9 +55,14 @@ variable "clickhouse_instance_type" {
 # (1 node per AZ, pinned in eks.tf). Replica count in the CHI must match len(clickhouse_zones).
 
 variable "clickhouse_zones" {
-  description = "AZs for the ClickHouse data pool = number of replicas (1 node per AZ). Subset of availability_zones. Currently 2 AZs (1×2) due to i8g capacity; add a 3rd AZ here + bump CHI replicasCount to scale to 3 replicas later."
+  description = "Exactly 3 AZs for the fixed 1-shard x 3-replica ClickHouse data pool (1 node per AZ). These must also be present in availability_zones."
   type        = list(string)
-  default     = ["us-east-1a", "us-east-1b"]
+  default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
+
+  validation {
+    condition     = length(var.clickhouse_zones) == 3 && length(distinct(var.clickhouse_zones)) == 3
+    error_message = "This design requires exactly 3 distinct ClickHouse availability zones for its 1-shard x 3-replica topology."
+  }
 }
 
 variable "clickhouse_ami_type" {

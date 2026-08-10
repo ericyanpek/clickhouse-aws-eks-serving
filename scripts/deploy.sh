@@ -3,6 +3,19 @@ set -euo pipefail
 # Deploy ClickHouse on EKS. Run from repo root. Assumes AWS creds are configured.
 cd "$(dirname "$0")/.."
 
+# Validate secrets before Terraform can create any billable resources.
+if [ -z "${CLICKHOUSE_ADMIN_PASSWORD:-}" ]; then
+  echo "ERROR: set CLICKHOUSE_ADMIN_PASSWORD before deploy." >&2
+  exit 1
+fi
+ADMIN_SHA=$(printf '%s' "$CLICKHOUSE_ADMIN_PASSWORD" | sha256sum | awk '{print $1}')
+
+# Keep approval interactive for people. CI must explicitly opt in.
+TF_APPLY_ARGS=()
+if [ "${AUTO_APPROVE:-false}" = "true" ]; then
+  TF_APPLY_ARGS=(-input=false -auto-approve)
+fi
+
 cd terraform
 terraform init
 
@@ -14,7 +27,7 @@ terraform init
 #   Phase 2: full apply — now the cluster is ACTIVE, so helm/kubernetes resources install cleanly.
 # -target is a deliberate, documented use here (not a workaround for a broken graph).
 echo "==> [1/7] terraform apply — phase 1: AWS infra only (EKS/VPC/nodegroups/S3/IRSA)"
-terraform apply -input=false -auto-approve \
+terraform apply "${TF_APPLY_ARGS[@]}" \
   -target=module.eks \
   -target=aws_s3_bucket.backup \
   -target=aws_s3_bucket_versioning.backup \
@@ -26,7 +39,7 @@ terraform apply -input=false -auto-approve \
 echo "==> [2/7] terraform apply — phase 2: in-cluster helm/k8s resources (operator/monitoring/storage)"
 # Cluster is ACTIVE now; the kubernetes/helm providers can reach it. Full apply installs
 # the operator, kube-prometheus-stack, and the local-storage StorageClass + provisioner.
-terraform apply -input=false -auto-approve
+terraform apply "${TF_APPLY_ARGS[@]}"
 
 BUCKET=$(terraform output -raw backup_bucket)
 ROLE_ARN=$(terraform output -raw backup_role_arn)
@@ -47,13 +60,8 @@ cp manifests/*.yaml "$tmpdir/"
 sed -i.bak "s|REPLACE_WITH_BACKUP_ROLE_ARN|$ROLE_ARN|g" "$tmpdir/30-backup-cronjob.yaml"
 sed -i.bak "s|REPLACE_WITH_BUCKET|$BUCKET|g; s|S3_REGION: \"us-east-1\"|S3_REGION: \"$REGION\"|g" "$tmpdir/30-backup-cronjob.yaml"
 
-# Admin password: require CLICKHOUSE_ADMIN_PASSWORD in the environment, hash it, and
-# substitute into the CHI. Never stored in the repo (the manifest ships a placeholder).
-if [ -z "${CLICKHOUSE_ADMIN_PASSWORD:-}" ]; then
-  echo "ERROR: set CLICKHOUSE_ADMIN_PASSWORD env var before deploy (used to hash the admin password)." >&2
-  exit 1
-fi
-ADMIN_SHA=$(printf '%s' "$CLICKHOUSE_ADMIN_PASSWORD" | sha256sum | awk '{print $1}')
+# Substitute the password hash calculated before Terraform ran. The plaintext and
+# hash are never written to the repository.
 sed -i.bak "s|REPLACE_WITH_ADMIN_SHA256|$ADMIN_SHA|g" "$tmpdir/20-clickhouse-chi.yaml"
 
 # Fail-fast if any placeholder survived substitution (would silently break IRSA/backup/auth).

@@ -32,8 +32,8 @@ module "eks" {
       disk_size     = 50                      # root EBS; data lives on instance-store NVMe
       desired_size  = 1                       # PER AZ → len(clickhouse_zones) × 1 nodes (= CHI replicasCount)
       min_size      = 1
-      max_size      = 2                    # per-AZ headroom for node replacement; new i8g nodes = empty local NVMe, replica rebuild required
-      zones         = var.clickhouse_zones # 2 AZs now (1×2) due to i8g capacity; keeper/system stay on all 3 AZs
+      max_size      = 2                    # replacement compute only; empty local NVMe recovery requires scripts/recover-local-replica.sh
+      zones         = var.clickhouse_zones # fixed 1×3 topology: one ClickHouse replica in each AZ
       labels        = { "workload" = "clickhouse" }
       taints = [{
         key    = "dedicated"
@@ -82,7 +82,7 @@ module "eks" {
       desired_size  = 1
       min_size      = 1
       max_size      = 1
-      zones         = [var.availability_zones[0]] # single AZ (1a) — near a ClickHouse replica
+      zones         = [var.availability_zones[0]] # single AZ, near one ClickHouse replica
       labels        = { "workload" = "bench" }
       taints = [{
         key    = "dedicated"

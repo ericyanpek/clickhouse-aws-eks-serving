@@ -3,6 +3,7 @@ region = "us-east-1"
 # AZs chosen to AVOID us-east-1a: i8g.4xlarge had InsufficientInstanceCapacity there (2026-07).
 # 1 node per AZ × 3 AZs = 3 ClickHouse nodes (1 shard × 3 replicas). Keeper/system likewise 1/AZ.
 availability_zones = ["us-east-1b", "us-east-1c", "us-east-1d"]
+clickhouse_zones    = ["us-east-1b", "us-east-1c", "us-east-1d"]
 cluster_name       = "clickhouse-eks"
 cluster_version    = "1.34"
 

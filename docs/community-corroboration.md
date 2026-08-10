@@ -1,5 +1,7 @@
 # 社区与官方对本方案设计主张的印证
 
+**中文** · [English](./community-corroboration.en.md)
+
 > 调研日期:2026-07-05。目的:检验本方案的五条核心设计主张是否只是"一家之言",还是有社区/官方实践支撑。
 > 方法:检索 GitHub、公司工程博客、会议 talk、Hacker News、ClickHouse/Altinity 官方内容。每条结论均带可追溯 URL;找不到印证的地方如实标注。
 > 立场:诚实优先——包括标出本方案里"最有主见、非原厂默认"的选择。
@@ -13,8 +15,8 @@
 | 1 | 一分片占满一台大机、scale-up first、shard last | **强(原厂自己就这么说)** | ClickHouse "at Scale" |
 | 2 | 在 EKS / Kubernetes 上跑生产 ClickHouse | **强** | ClickHouse LogHouse(19 PiB,跑在 K8s) |
 | 3 | 大内存 / 一 Pod 一节点 / 不设 CPU limit / page-cache 感知 | **模型强,完整组合需自行组装** | Altinity "8 tricks" + oneuptime + Altinity 缓存指南 |
-| 4 | 本地 NVMe 代替 EBS,靠副本兜 durability | **实践强,但非原厂默认** | mrkrbrts.com;Altinity KB EC2 Storage |
-| 5 | ClickHouse 当可重建 serving 层,湖仓/S3 当真相源 | **强,已主流化** | ClickHouse "data lakehouse" Pattern 4;Tinybird |
+| 4 | 本地 NVMe 代替 EBS,副本保在线可用性、湖仓保权威 durability | **实践强,但非原厂默认** | mrkrbrts.com;Altinity KB EC2 Storage |
+| 5 | ClickHouse 当可重建 serving 层,上游湖仓当唯一真相源 | **强,已主流化** | ClickHouse "data lakehouse" Pattern 4;Tinybird |
 
 ---
 
@@ -53,18 +55,18 @@
 
 **诚实缺口**:没找到把"一 Pod 一节点 + 不设 CPU limit + 大内存 + page-cache"打包成单一 checklist 的权威文档。本方案是把这些散落实践系统化组装——这本身即增量价值。
 
-### 主张 4 —— 本地 NVMe 代替 EBS,靠副本兜 durability
+### 主张 4 —— 本地 NVMe 代替 EBS,副本保在线可用性、湖仓保权威 durability
 **印证:作为实践强;但有关于 OSS durability 语义的重要诚实 caveat。**
 
 - Mark Roberts, "How to run a cost-efficient ClickHouse cluster with separated storage & compute" —— https://mrkrbrts.com/blog/how-to-run-a-cost-efficient-clickhouse-cluster-with-separated-storage-and-compute —— 最贴合。主张临时本地 NVMe instance-store(r7gd 家族)作为 write-through 缓存,S3 durable 兜底,跑在 EKS + Altinity operator + local-volume-provisioner,省约 40%。直面临时性:"the elephant in the room is that these disks are ephemeral... how can we make this safe?" → S3 durability。
-- Altinity KB, "AWS EC2 Storage" —— https://kb.altinity.com/altinity-kb-setup-and-maintenance/aws-ec2-storage —— 重要 caveat:"ClickHouse doesn't have any native option to reuse the same data on durable network disk via several replicas. You either need to store the same data twice or build custom tooling." 即:靠副本兜 durability = 本地盘上 N 份完整拷贝。
+- Altinity KB, "AWS EC2 Storage" —— https://kb.altinity.com/altinity-kb-setup-and-maintenance/aws-ec2-storage —— 重要 caveat:"ClickHouse doesn't have any native option to reuse the same data on durable network disk via several replicas. You either need to store the same data twice or build custom tooling." 即:副本提供在线冗余需要本地盘上 N 份完整拷贝;权威 durability 仍由上游湖仓承担。
 - AWS 存储优化实例族 —— https://aws.amazon.com/ec2/instance-types/i3en —— 确认 i3/i3en/i4i/i4g 本地 NVMe 家族是专用目标;本方案 i8g/im4gn 与此家族一脉相承。
 - anthonynsimon, "1-Node ClickHouse in Production" —— https://anthonynsimon.com/blog/clickhouse-deployment —— 单节点 CH 跑本地 NVMe,"on plain EC2 and on Kubernetes"。
 - Severalnines, "ClickHouse Storage Architecture and Optimization" —— https://severalnines.com/blog/clickhouse-storage-architecture-and-optimization —— "SSD or NVMe disks as the preferred foundation for production"。
 
-**诚实 caveat**:ClickHouse 官方 sizing 指南推荐 provisioned-IOPS EBS 而非 instance-store。所以"本地盘代替 EBS"是成本导向实践者的刻意取舍,不是原厂默认;且 OSS 靠副本兜 durability 意味着 N 份完整本地拷贝。
+**诚实 caveat**:ClickHouse 官方 sizing 指南推荐 provisioned-IOPS EBS 而非 instance-store。所以"本地盘代替 EBS"是成本导向实践者的刻意取舍,不是原厂默认;且 OSS 用副本保持在线可用性意味着 N 份完整本地拷贝。
 
-### 主张 5 —— ClickHouse 当可重建 serving 层,湖仓/S3 当真相源
+### 主张 5 —— ClickHouse 当可重建 serving 层,上游湖仓当唯一真相源
 **印证:强,且日益主流。已被 ClickHouse Inc 和 Tinybird 明确记录为架构模式。**
 
 - ClickHouse Inc, "What is a data lakehouse?" —— https://clickhouse.com/resources/engineering/data-lakehouse —— Pattern 4 正是本主张:"Data is initially written to Iceberg or Delta Lake tables (the source of truth)... incrementally replicated to ClickHouse... Lakehouse maintains full history."
@@ -81,7 +83,7 @@
 
 1. **Mark Roberts —— "cost-efficient ClickHouse with separated storage & compute"**
    https://mrkrbrts.com/blog/how-to-run-a-cost-efficient-clickhouse-cluster-with-separated-storage-and-compute
-   命中 **2 + 4 + 5(隐含 3)**。EKS + Altinity operator + 临时本地 NVMe + S3 durable + 副本 HA。**最像"同一个想法"的人。** 唯一差别:他是 S3 主盘 + NVMe 缓存,本方案是 NVMe 主盘 + S3 兜底;精神一致。
+   命中 **2 + 4 + 5(隐含 3)**。EKS + Altinity operator + 临时本地 NVMe + S3 durable + 副本 HA。**最像"同一个想法"的人。** 关键差别:他是 S3 主盘 + NVMe 缓存;本项目把上游湖仓定义为唯一 SoT,ClickHouse 使用 NVMe 派生副本,独立 S3 backup bucket 只用于缩短恢复时间。
 
 2. **OpenMetal 案例 —— 裸机 + OpenStack + Ceph 的 ClickHouse 部署**
    https://openmetal.io/resources/case-studies/architecture-big-data-clickhouse-deployment
@@ -101,6 +103,6 @@
 
 - **主张 1、2、5 基本是主流/原厂认可。**
 - **主张 3 逐条有强支撑,但完整组合需自行组装**——本方案的系统化即增量价值。
-- **主张 4(本地盘代替 EBS)是最有主见的选择**——成本导向实践者力挺 + 一个强裸机生产案例(OpenMetal),但明确不是 ClickHouse Inc 的默认推荐,且 OSS 靠副本兜 durability 意味着 N 份完整本地拷贝。
+- **主张 4(本地盘代替 EBS)是最有主见的选择**——成本导向实践者力挺 + 一个强裸机生产案例(OpenMetal),但明确不是 ClickHouse Inc 的默认推荐;副本只负责在线冗余且需要 N 份完整本地拷贝,权威数据恢复仍依赖湖仓。
 
 **一句话**:本方案不是标新立异,而是把"原厂认可(1/2/5)+ 社区力挺但非默认(3/4)"的实践系统化组装成一套可评审 IaC。而且没有任何公开实践把这五条全部打包成 turnkey 的 EKS IaC——mrkrbrts 是博客、OpenMetal 是裸机案例、LogHouse 是原厂内部。**本仓库填的正是这个空位。**
