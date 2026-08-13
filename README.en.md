@@ -15,6 +15,9 @@ This project provides reviewable, executable Terraform + Kubernetes IaC that dep
 - Altinity ClickHouse Operator `0.27.1`.
 - Prometheus, Grafana, daily S3 backup, and IRSA permissions.
 - Scripts for NVMe initialization, deployment, validation, lost-node recovery, and ordered teardown.
+- An optional `r8g` + high-performance gp3 comparison stack, with scripts to reproduce the selection experiment on one cluster.
+
+The data volume medium is this project's primary tradeoff. After measurement the **recommendation is EBS gp3** (clear operational recovery advantages, negligible performance cost in mainstream scenarios), with local NVMe retained as a performance profile for storage-bound workloads. The repository's default deployment path, however, **is still local NVMe**. Rationale, costs, and how to switch are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme).
 
 Its value is not to replace ClickHouse Cloud. It is a self-managed reference implementation for cases where:
 
@@ -57,7 +60,7 @@ Key properties:
 |---|---|
 | Data role | Lakehouse is the sole SoT; ClickHouse is an eventually consistent, rebuildable OLAP acceleration layer |
 | ClickHouse topology | 1 shard × 3 replicas, fixed at 3 data nodes |
-| Data storage | Approximately 3.4 TiB local NVMe per replica, `ReplicatedMergeTree` |
+| Data storage | Default is approximately 3.4 TiB local NVMe per replica, `ReplicatedMergeTree`; measurements recommend gp3 instead, see [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) |
 | Coordination | 3-node Keeper on EBS `gp3-encrypted` |
 | Service exposure | `ClusterIP`, not publicly exposed by default |
 | Disaster recovery | ClickHouse replicas + daily S3 backup; the upstream lakehouse remains the authoritative full-recovery source |
@@ -87,24 +90,51 @@ Possible ingestion patterns include a Flink ClickHouse connector, Kafka engine +
 
 The default strategy is to scale up before sharding. Adding a shard does not automatically redistribute historical data. Introduce real sharding only when single-node capacity or single-query compute becomes the bottleneck, and design an explicit resharding process. Three replicas provide cross-AZ availability and read scaling; they do not change the lakehouse's SoT role.
 
-### 4.3 Local NVMe
+### 4.3 Data Volume Selection: EBS gp3 versus Local NVMe
 
-Local NVMe provides high IO, but its data is permanently lost when a node terminates, and a local PV does not automatically move. This tradeoff is valid only because ClickHouse data is rebuildable from the lakehouse. If ClickHouse is the only data source, use a more durable storage design and reassess this repository's recovery model.
+> **The repository still defaults to local NVMe.** `./scripts/deploy.sh` deploys the [production CHI](./manifests/20-clickhouse-chi.yaml) with `local-storage`. The **recommendation** below comes from the 2026-08-12/13 measurements; adopting it requires the manual storage-class switch described in 4.3.4 and is not yet the repository default.
 
-The repository also provides a disabled-by-default [parallel R8g + high-performance gp3 comparison](./docs/storage-comparison.en.md) that does not replace the existing cluster, plus an EBS-only mode that reuses historical NVMe results without creating i8g nodes. The [2026-08-11 EBS measurements](./docs/storage-comparison-results.en.md) found the small warm ClickBench workload effectively on par with NVMe and explicitly record the direct-I/O and active-parts comparability limits.
+#### 4.3.1 Measured Results
 
-The [2026-08-12 same-run selection experiment](./docs/storage-selection-report.en.md) deployed both media in parallel on one cluster, giving a fuller boundary:
+The [2026-08-12 same-run selection experiment](./docs/storage-selection-report.en.md) deployed both media in parallel on one EKS cluster, at the same version, topology, resource envelope, and load generator:
 
-| Scenario | Result |
-|---|---|
-| Warm ClickBench (working set fits in memory) | On par, +2.8% to +3.9% |
-| Direct I/O (page cache bypassed) | EBS +66% to +78% slower, up to 3x on individual queries |
-| `OPTIMIZE FINAL` merge convergence | **EBS +48% slower**; cumulative device I/O was nearly identical (about 1.0 TiB per node), so the entire difference is sustained throughput (217 vs 328 MiB/s) |
-| Monthly cost (1x2, excluding shared costs) | Local $2,004.29; EBS at 20k IOPS / 1,250 MiB/s $2,180.14, an 8.77% premium |
+| Scenario | Result | Winner |
+|---|---|---|
+| Warm ClickBench (working set fits in memory) | +2.8% to +3.9% | On par |
+| Direct I/O (page cache forcibly bypassed) | EBS 66-78% slower, up to 3x on individual queries | **Local** |
+| `OPTIMIZE FINAL` merge convergence | EBS 48% slower (4,916s vs 3,321s) | **Local** |
+| Permanent node loss recovery | EBS reattaches the volume in 111s with zero rebuild; local must reload about 130 GiB | **EBS** |
+| Monthly cost (1x2, excluding shared costs) | Local $2,004.29; EBS $2,180.14 | Local, by 8.77% |
 
-The conclusion is **EBS gp3 as the default production profile, with local NVMe as an explicit performance profile**. Local storage becomes decision-grade only when the workload has frequent page-cache-bypassing scans, strict direct-I/O tail-latency requirements, or background merges that must finish inside a fixed nightly window (EBS needs roughly 1.5x the maintenance window).
+The merge row deserves its mechanism spelled out: both media moved **nearly the same number of bytes** (about 1.0 TiB per node), and the entire difference is sustained throughput (217 vs 328 MiB/s). During the merge EBS sat at 102% device utilization with p95 at 1,130-1,193 MiB/s against a 1,250 MiB/s provisioned ceiling, while local NVMe peaked at 2,630-2,815 MiB/s and still stayed under 89% utilization. **That is a difference in capability headroom -- EBS's ceiling is purchased, instance storage's is given by the hardware.**
 
-The [2026-08-13 HA and recovery drill](./docs/ha-drill-report.en.md) validated the EBS profile's recovery behavior: pod deletion and graceful eviction caused **zero interruption**, and controlled permanent node loss cost **3 seconds** of service interruption with the pod back in 111 seconds and **zero data rebuild** -- the original volume reattached to a same-AZ replacement node. The local-NVMe profile's HA was not tested and must not be inferred from this.
+#### 4.3.2 Why EBS Is the Default Recommendation
+
+Under this project's premise (the lakehouse is the SoT and ClickHouse is a rebuildable acceleration layer), EBS wins on operations rather than performance:
+
+- **Node replacement needs no data reload.** Measured in the [2026-08-13 HA drill](./docs/ha-drill-report.en.md): stopping a data node let the original volume reattach to a same-AZ replacement within 111 seconds with **zero data rebuild** and only 3 seconds of service interruption. The same failure on local storage requires [`recover-local-replica.sh`](./scripts/recover-local-replica.sh) to reload roughly 130 GiB from a healthy replica or the lakehouse, making RTO a function of data volume.
+- **Routine operations cause no interruption.** Pod deletion and `kubectl drain` both produced zero failed queries in the drill, which makes node rolling upgrades, AMI rotation, and autoscaler scale-down low-risk.
+- **Capacity is decoupled from the instance.** Volume size is no longer bounded by the instance-store capacity of a given instance type, can be grown independently, and IOPS/throughput can be changed online without rebuilding the node.
+- **The performance cost is negligible in mainstream scenarios.** Warm queries are on par; EBS only falls behind materially on storage-bound work.
+
+The price is **8.77% more per month** and **maintenance windows sized at roughly 1.5x** (merges are 48% slower). For a rebuildable acceleration layer, trading 8.77% to eliminate "reload 130 GiB whenever a node dies" is usually worth it.
+
+#### 4.3.3 When Local NVMe Is Still the Right Choice
+
+Local storage's performance advantage becomes decision-grade if any of the following holds:
+
+- The query working set **substantially exceeds memory**, with frequent page-cache-bypassing scans (EBS is 66-78% slower on direct I/O).
+- There is a **strict direct-I/O tail-latency** SLA.
+- Background merges must finish inside a **fixed nightly window**, where a 48% difference would overrun it.
+- Throughput must be **sustained beyond the instance EBS channel**. Note that `r8g.4xlarge` is a burstable size: 1,250 MB/s is available only 30 minutes per 24 hours before falling back to a 625 MB/s baseline. If sustained load genuinely needs high throughput, the correct move is `r8g.8xlarge`, where baseline equals maximum, not more volume provisioning.
+
+Choosing local storage means accepting that data is permanently lost when a node terminates, that a local PV does not automatically move, and that recovery is manually triggered. **This tradeoff is valid only because ClickHouse data is rebuildable from the lakehouse**; if ClickHouse is the only data source, this repository's recovery model does not apply.
+
+#### 4.3.4 How to Switch
+
+The repository provides a disabled-by-default [parallel R8g + high-performance gp3 comparison](./docs/storage-comparison.en.md) that does not replace the existing cluster, so the comparison above can be reproduced against your own data and queries before committing to a medium. Historical material also includes the [2026-08-11 EBS-only measurements](./docs/storage-comparison-results.en.md).
+
+Switching to EBS requires changing three things together: the CHI's `storageClassName` (`local-storage` to a gp3 class), the instance type (`i8g` to `r8g`), and the node group's subnet binding -- **a gp3 volume is AZ-scoped, so each node group must be pinned to a single subnet**. Otherwise a replacement node may land in a different AZ, fail to attach the original volume, and the recovery advantage in 4.3.2 does not hold.
 
 ### 4.4 S3 Backup
 
@@ -114,7 +144,9 @@ The [2026-08-13 HA and recovery drill](./docs/ha-drill-report.en.md) validated t
 
 - **ClickHouse Cloud on AWS:** vendor-managed, operationally lighter, and more elastic. It is usually the first choice when self-management is not a hard requirement.
 - **Altinity Terraform EKS Blueprint:** this project reuses its VPC/EKS/node-group and operator infrastructure, but replaces its encapsulated cluster layer with owned CHI/CHK manifests.
-- **AWS data-on-eks:** a broader data-platform reference stack; this project focuses on a fixed 1×3 topology, dedicated nodes, local NVMe, and fewer dependencies.
+- **AWS data-on-eks:** a broader data-platform reference stack; this project focuses on a fixed 1×3 topology, dedicated nodes, a selectable storage medium, and fewer dependencies.
+
+One way this project differentiates from the above is that storage-medium selection is treated as a **reproducible measurement** rather than a judgment call: both media are deployed in parallel on one cluster, producing five classes of evidence -- query, merge, device-level I/O, recovery RTO, and cost -- with explicit notes on which conclusions do not hold.
 
 See the [documentation index](./docs/README.en.md) for the status of design evidence, performance results, and historical records.
 
@@ -126,10 +158,12 @@ Required:
 - AWS CLI with working credentials
 - `kubectl` and Helm 3
 - Permissions for EKS, VPC/EC2, IAM, and S3
-- Quota and capacity for at least 3 `i8g.4xlarge` instances in the target region
+- Quota and capacity for at least 3 `i8g.4xlarge` instances in the target region; if switching to gp3 per [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme), 3 `r8g.4xlarge` instances plus the corresponding gp3 capacity and IOPS quota instead
 - An existing lakehouse, schema management, and replayable ingestion path
 
-This deployment is expensive while continuously running. It includes 3 i8g data nodes, 3 Keeper nodes, 3 system nodes, 1 benchmark node, NAT Gateway, and the EKS control plane. Pricing varies by region and date. Verify with AWS Pricing Calculator and Service Quotas before apply; historical estimates in this repository are not quotes.
+> **Capacity risk (encountered in practice):** during the 2026-08-12 experiment neither `us-east-1b` nor `us-east-1c` could supply the required `i8g.4xlarge` capacity, which forced both replicas into a single AZ and invalidated that run's cross-AZ and HA conclusions. Newer storage-optimized families like `i8g` can be supply-constrained in some AZs. Before planning a cross-AZ topology, confirm real capacity with Service Quotas and an actual `run-instances` probe rather than assuming quota equals availability.
+
+This deployment is expensive while continuously running. It includes 3 data nodes, 3 Keeper nodes, 3 system nodes, 1 benchmark node, NAT Gateway, and the EKS control plane. With gp3 you must also budget per-replica volume capacity plus any IOPS and throughput above the free tier. Pricing varies by region and date. Verify with AWS Pricing Calculator and Service Quotas before apply; historical estimates in this repository are not quotes.
 
 ## 7. Configuration
 

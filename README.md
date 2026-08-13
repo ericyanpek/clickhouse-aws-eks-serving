@@ -15,6 +15,9 @@
 - Altinity ClickHouse Operator `0.27.1`。
 - Prometheus、Grafana、每日 S3 备份和 IRSA 权限。
 - NVMe 初始化、部署、验证、节点丢失恢复和有序销毁脚本。
+- 可选的 `r8g` + 高性能 gp3 存储对比方案，以及在同一集群内复现选型实验的脚本。
+
+数据卷介质是本项目最主要的取舍点。实测后的**推荐是 EBS gp3**（运维恢复优势明显、性能代价在主流场景内可忽略），本地 NVMe 保留为存储密集场景的性能 profile；但仓库默认部署路径**仍是本地 NVMe**。依据、代价与切换方式见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme)。
 
 它的核心价值不是替代 ClickHouse Cloud，而是为以下场景提供自管参考实现：
 
@@ -57,7 +60,7 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 |---|---|
 | 数据角色 | 湖仓是唯一 SoT；ClickHouse 是最终一致、可重建的派生 OLAP 加速层 |
 | ClickHouse 拓扑 | 1 shard × 3 replicas，固定 3 个数据节点 |
-| 数据存储 | 每副本约 3.4 TiB 本地 NVMe，`ReplicatedMergeTree` |
+| 数据存储 | 默认每副本约 3.4 TiB 本地 NVMe，`ReplicatedMergeTree`；实测后推荐改用 gp3，见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme) |
 | 协调层 | 3 节点 Keeper，EBS `gp3-encrypted` |
 | 服务暴露 | `ClusterIP`，默认不公网暴露 |
 | 灾备 | ClickHouse 副本 + 每日 S3 备份；全量权威恢复源仍是上游湖仓 |
@@ -87,24 +90,51 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 
 默认先垂直扩容，再考虑分片。增加 shard 不会自动搬迁历史数据；只有当单节点容量或单查询算力成为瓶颈时，才应设计真正的重分片流程。3 个副本用于跨 AZ 可用性和读扩展，不改变湖仓的 SoT 地位。
 
-### 4.3 本地 NVMe
+### 4.3 数据卷选型：EBS gp3 与本地 NVMe
 
-本地 NVMe 提供高 IO，但节点终止后数据永久丢失，local PV 也不会自动漂移。该取舍只在 ClickHouse 数据可从湖仓重建时成立。若 ClickHouse 是唯一数据源，应改用更持久的存储设计，并重新评估本仓库的恢复模型。
+> **仓库当前默认仍是本地 NVMe。** `./scripts/deploy.sh` 部署的 [生产 CHI](./manifests/20-clickhouse-chi.yaml) 使用 `local-storage`。下述**推荐**来自 2026-08-12/13 的实测，采纳它需要按 4.3.4 手工切换存储类，尚未成为仓库默认值。
 
-仓库同时提供默认关闭、不会替换现有集群的 [R8g + 高性能 gp3 并行对比方案](./docs/storage-comparison.md)，也支持不创建 i8g 的 EBS-only 模式复用历史 NVMe 结果。2026-08-11 的 [EBS 实测](./docs/storage-comparison-results.md) 显示小型 warm ClickBench 与 NVMe 基本同档，并明确记录了 direct-I/O 和 active-parts 可比性边界。
+#### 4.3.1 实测结论
 
-2026-08-12 的 [同轮存储选型实验](./docs/storage-selection-report.md) 在同一集群内并行部署两种介质，得到更完整的边界：
+2026-08-12 的 [同轮存储选型实验](./docs/storage-selection-report.md) 在同一 EKS 集群内并行部署两种介质，同版本、同拓扑、同资源配额、同一压测客户端：
 
-| 场景 | 结果 |
-|---|---|
-| warm ClickBench（工作集入内存） | 两者同档，差异 +2.8%–+3.9% |
-| direct I/O（绕过 page cache） | EBS 慢 +66%–78%，个别查询 3 倍 |
-| `OPTIMIZE FINAL` merge 收敛 | **EBS 慢 +48%**；两侧累计设备 I/O 近乎相同（每节点约 1.0 TiB），差异全在持续吞吐（217 vs 328 MiB/s） |
-| 月成本（1×2，不含共享成本） | 本地盘 $2,004.29；EBS 20k IOPS / 1,250 MiB/s 档 $2,180.14，溢价 8.77% |
+| 场景 | 结果 | 谁更好 |
+|---|---|---|
+| warm ClickBench（工作集入内存） | 差异 +2.8%–3.9% | 同档 |
+| direct I/O（强制绕过 page cache） | EBS 慢 66%–78%，个别查询 3 倍 | **本地盘** |
+| `OPTIMIZE FINAL` merge 收敛 | EBS 慢 48%（4,916s vs 3,321s） | **本地盘** |
+| 节点永久丢失恢复 | EBS 111 秒重挂原卷、零重建；本地盘需重灌约 130 GiB | **EBS** |
+| 月成本（1×2，不含共享成本） | 本地盘 $2,004.29；EBS $2,180.14 | 本地盘便宜 8.77% |
 
-结论是**默认生产选 EBS gp3，本地 NVMe 作为明确的性能 profile**。若存在频繁绕过 page cache 的大扫描、严格 direct-I/O 尾延迟要求，或后台 merge 必须在固定夜间窗口内完成（EBS 需按 1.5 倍规划维护窗口），本地盘的优势才具备决策意义。
+merge 那一行的机制值得单独说明：两种介质**累计搬运的字节数几乎相同**（每节点约 1.0 TiB），差异完全来自持续吞吐（217 vs 328 MiB/s）。EBS 在 merge 期间设备利用率已达 102%、p95 顶到 1,130–1,193 MiB/s（预置上限 1,250）；本地 NVMe 峰值可达 2,630–2,815 MiB/s 而利用率仍不足 89%。**这是能力余量的差距——EBS 的上界是买来的，实例存储的上界是硬件给的。**
 
-2026-08-13 的 [HA 与恢复演练](./docs/ha-drill-report.md) 验证了 EBS profile 的恢复行为：Pod 删除与优雅驱逐**零中断**；受控节点永久丢失的服务中断为 **3 秒**、Pod 恢复 111 秒、**数据零重建**（原卷重新挂载至同 AZ 替换节点）。本地 NVMe profile 的 HA 未测，不得由此推断。
+#### 4.3.2 为什么默认推荐 EBS
+
+在本项目的架构前提下（湖仓是 SoT，ClickHouse 是可重建加速层），EBS 的优势集中在运维而非性能：
+
+- **节点替换不需要重灌数据。** [2026-08-13 HA 演练](./docs/ha-drill-report.md) 实测：停掉一个数据节点，原卷 111 秒内重新挂载到同 AZ 替换节点，**数据零重建**，服务中断仅 3 秒。本地盘同场景必须触发 [`recover-local-replica.sh`](./scripts/recover-local-replica.sh) 从健康副本或湖仓重灌约 130 GiB，RTO 由数据量决定。
+- **常规运维动作零中断。** Pod 删除、`kubectl drain` 优雅驱逐在演练中均为零失败查询。节点滚动升级、AMI 轮换、autoscaler 缩容因此都是低风险操作。
+- **容量与实例解耦。** 存储大小不再受实例规格的 instance-store 容量约束，可独立扩容，也可在线调整 IOPS/吞吐而不重建节点。
+- **性能代价在主流场景内可忽略。** warm 查询同档；只有在存储密集场景才显著落后。
+
+代价是**每月贵 8.77%**，以及**维护窗口需按 1.5 倍规划**（merge 慢 48%）。对于一个可重建的加速层，用 8.77% 换掉"节点挂了要重灌 130 GiB"这个运维负担，通常是划算的。
+
+#### 4.3.3 什么时候仍应选本地 NVMe
+
+以下任一条成立时，本地盘的性能优势具备决策意义：
+
+- 查询工作集**显著超出内存**，存在频繁绕过 page cache 的大扫描（direct I/O 场景 EBS 慢 66%–78%）。
+- 有**严格的 direct-I/O 尾延迟** SLA。
+- 后台 merge 必须在**固定夜间窗口**内完成，48% 的差距会导致窗口溢出。
+- 需要**持续超过实例 EBS 通道**的吞吐。注意 `r8g.4xlarge` 是突发型规格：1,250 MB/s 每 24 小时只能维持 30 分钟，之后回落到 625 MB/s 基线。若持续负载确实需要高吞吐，正确做法是升到基线等于最大值的 `r8g.8xlarge`，而不是给卷加预置。
+
+选择本地盘就必须接受：节点终止即数据永久丢失、local PV 不会自动漂移、恢复需人工触发。**该取舍只在 ClickHouse 数据可从湖仓重建时成立**；若 ClickHouse 是唯一数据源，本仓库的恢复模型不适用。
+
+#### 4.3.4 如何切换
+
+仓库提供默认关闭、不替换现有集群的 [R8g + 高性能 gp3 并行对比方案](./docs/storage-comparison.md)，可用于在自己的数据和查询上复现上述对比，再决定采用哪种介质。历史材料另有 2026-08-11 的 [EBS-only 实测](./docs/storage-comparison-results.md)。
+
+切换到 EBS 需要同时调整：CHI 的 `storageClassName`（`local-storage` → gp3 类）、实例类型（`i8g` → `r8g`）、以及节点组的子网绑定——**gp3 卷是 AZ 绑定资源，节点组必须绑定单一子网**，否则替换节点可能落到其他 AZ 而无法挂载原卷，4.3.2 的恢复优势将不成立。
 
 ### 4.4 S3 备份
 
@@ -114,9 +144,9 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 
 - **ClickHouse Cloud on AWS**：原厂托管、轻运维、弹性更强，通常是没有自管硬需求时的优先选择。
 - **Altinity Terraform EKS Blueprint**：本项目复用其 VPC/EKS/节点组和 operator 基础设施层，但用自有 CHI/CHK 清单替换其封装的集群层。
-- **AWS data-on-eks**：更偏完整数据平台样板；本项目聚焦固定 1×3、专属节点、本地 NVMe 和较少依赖。
+- **AWS data-on-eks**：更偏完整数据平台样板；本项目聚焦固定 1×3、专属节点、可选存储介质和较少依赖。
 
-设计依据、实测报告和历史材料的状态见 [文档索引](./docs/README.md)。
+本项目相对上述方案的差异化价值之一，是把存储介质选型做成了**可复现的实测**而不是经验判断：同一集群内并行部署两种介质，产出查询、merge、设备级 I/O、恢复 RTO 和成本五类证据，并明确标注哪些结论不成立。设计依据、实测报告和历史材料的状态见 [文档索引](./docs/README.md)。
 
 ## 6. 前置条件与成本
 
@@ -126,10 +156,12 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 - AWS CLI 和可用凭证
 - `kubectl`、Helm 3
 - EKS、VPC/EC2、IAM、S3 权限
-- 目标区域内至少 3 台 `i8g.4xlarge` 的配额和容量
+- 目标区域内至少 3 台 `i8g.4xlarge` 的配额和容量；若按 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme) 改用 gp3，则改为 3 台 `r8g.4xlarge` 加对应的 gp3 容量与 IOPS 配额
 - 已存在的数据湖仓、schema 管理和可重放摄入链路
 
-该部署持续运行时成本显著，包括 3 台 i8g 数据节点、3 台 Keeper 节点、3 台 system 节点、1 台 benchmark 节点、NAT Gateway 和 EKS 控制面。价格随区域和时间变化，apply 前必须使用 AWS Pricing Calculator 和 Service Quotas 核实，不应把仓库中的历史估算当报价。
+> **容量风险（实测遇到过）：** 2026-08-12 的实验中 `us-east-1b` 和 `us-east-1c` 都无法提供所需的 `i8g.4xlarge`，被迫把两个副本放进同一个 AZ，导致该轮的跨 AZ 与 HA 结论失效。`i8g` 这类较新的存储优化机型在部分 AZ 供给紧张，规划跨 AZ 拓扑前应先用 Service Quotas 和实际 `run-instances` 试探确认容量，而不是假设配额等于可得。
+
+该部署持续运行时成本显著，包括 3 台数据节点、3 台 Keeper 节点、3 台 system 节点、1 台 benchmark 节点、NAT Gateway 和 EKS 控制面。选用 gp3 时还需计入每副本的卷容量、超出免费额度的 IOPS 与吞吐费用。价格随区域和时间变化，apply 前必须使用 AWS Pricing Calculator 和 Service Quotas 核实，不应把仓库中的历史估算当报价。
 
 ## 7. 配置
 
