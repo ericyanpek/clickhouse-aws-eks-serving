@@ -1,0 +1,125 @@
+# Benchmark-only local-NVMe CHI. It is independent from the production-oriented
+# `ch` manifest so the storage selection test can use the same 1x2 topology as
+# the EBS comparison cluster without changing the repository's 1x3 target.
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: ch-local
+  namespace: clickhouse
+spec:
+  defaults:
+    templates:
+      podTemplate: ch-local-pod
+      dataVolumeClaimTemplate: ch-local-data
+      serviceTemplate: ch-local-cluster-ip
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-keeper.clickhouse.svc.cluster.local
+          port: 2181
+    users:
+      admin/password_sha256_hex: "REPLACE_WITH_ADMIN_SHA256"
+      admin/networks/ip: "10.0.0.0/8"
+      admin/profile: default
+    settings:
+      max_server_memory_usage_to_ram_ratio: "0.9"
+    clusters:
+      - name: mainlocal
+        layout:
+          shardsCount: 1
+          replicasCount: REPLACE_WITH_LOCAL_REPLICA_COUNT
+  templates:
+    serviceTemplates:
+      - name: ch-local-cluster-ip
+        spec:
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 8123
+            - name: native
+              port: 9000
+    podTemplates:
+      - name: ch-local-pod
+        spec:
+          serviceAccountName: clickhouse-backup
+          nodeSelector:
+            workload: clickhouse-local-benchmark
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: clickhouse
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      clickhouse.altinity.com/app: chop
+                      clickhouse.altinity.com/chi: ch-local
+                  topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  clickhouse.altinity.com/app: chop
+                  clickhouse.altinity.com/chi: ch-local
+          containers:
+            - name: clickhouse
+              image: "clickhouse/clickhouse-server:25.3.14.14"
+              resources:
+                requests:
+                  cpu: "14"
+                  memory: "110Gi"
+                limits:
+                  memory: "110Gi"
+            - name: clickhouse-backup
+              image: "altinity/clickhouse-backup:2.6.0"
+              args: ["server"]
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              env:
+                - name: LOG_LEVEL
+                  value: "info"
+                - name: REMOTE_STORAGE
+                  value: "s3"
+                - name: S3_BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-backup-config
+                      key: S3_BUCKET
+                - name: S3_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-backup-config
+                      key: S3_REGION
+                - name: S3_PATH
+                  value: "backup-local-comparison"
+              ports:
+                - name: backup-rest
+                  containerPort: 7171
+    volumeClaimTemplates:
+      - name: ch-local-data
+        spec:
+          storageClassName: local-storage
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 3400Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ch-local-pdb
+  namespace: clickhouse
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      clickhouse.altinity.com/chi: ch-local

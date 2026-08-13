@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-comparison-client
+  namespace: clickhouse
+  labels:
+    app: storage-comparison-client
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    workload: bench
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: bench
+      effect: NoSchedule
+  containers:
+    - name: client
+      image: "clickhouse/clickhouse-server:25.3.14.14"
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      resources:
+        requests:
+          cpu: "6"
+          memory: "8Gi"
+        limits:
+          memory: "12Gi"

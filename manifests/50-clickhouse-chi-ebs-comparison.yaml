@@ -1,0 +1,129 @@
+# Optional side-by-side EBS comparison cluster.
+# This CHI does not replace `ch`; it runs as `ch-ebs` on a separate R8g node pool,
+# while reusing the existing Operator, Keeper quorum, backup IAM configuration,
+# monitoring stack, and benchmark node.
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: ch-ebs
+  namespace: clickhouse
+spec:
+  defaults:
+    templates:
+      podTemplate: ch-ebs-pod
+      dataVolumeClaimTemplate: ch-ebs-data
+      serviceTemplate: ch-ebs-cluster-ip
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-keeper.clickhouse.svc.cluster.local
+          port: 2181
+    users:
+      admin/password_sha256_hex: "REPLACE_WITH_ADMIN_SHA256"
+      admin/networks/ip: "10.0.0.0/8"
+      admin/profile: default
+    settings:
+      max_server_memory_usage_to_ram_ratio: "0.9"
+    clusters:
+      - name: mainebs
+        layout:
+          shardsCount: 1
+          replicasCount: REPLACE_WITH_EBS_REPLICA_COUNT
+  templates:
+    serviceTemplates:
+      - name: ch-ebs-cluster-ip
+        spec:
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 8123
+            - name: native
+              port: 9000
+    podTemplates:
+      - name: ch-ebs-pod
+        spec:
+          serviceAccountName: clickhouse-backup
+          nodeSelector:
+            workload: clickhouse-ebs
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              # The upstream EKS module applies this taint to every node pool
+              # whose name starts with "clickhouse".
+              value: clickhouse
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      clickhouse.altinity.com/app: chop
+                      clickhouse.altinity.com/chi: ch-ebs
+                  topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  clickhouse.altinity.com/app: chop
+                  clickhouse.altinity.com/chi: ch-ebs
+          containers:
+            - name: clickhouse
+              image: "clickhouse/clickhouse-server:25.3.14.14"
+              # Same CPU and memory envelope as the i8g.4xlarge baseline.
+              resources:
+                requests:
+                  cpu: "14"
+                  memory: "110Gi"
+                limits:
+                  memory: "110Gi"
+            - name: clickhouse-backup
+              image: "altinity/clickhouse-backup:2.6.0"
+              args: ["server"]
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              env:
+                - name: LOG_LEVEL
+                  value: "info"
+                - name: REMOTE_STORAGE
+                  value: "s3"
+                - name: S3_BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-backup-config
+                      key: S3_BUCKET
+                - name: S3_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: clickhouse-backup-config
+                      key: S3_REGION
+                - name: S3_PATH
+                  value: "backup-ebs-comparison"
+              ports:
+                - name: backup-rest
+                  containerPort: 7171
+    volumeClaimTemplates:
+      - name: ch-ebs-data
+        spec:
+          storageClassName: clickhouse-ebs-gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: REPLACE_WITH_EBS_VOLUME_SIZE_GIB
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ch-ebs-pdb
+  namespace: clickhouse
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      clickhouse.altinity.com/chi: ch-ebs

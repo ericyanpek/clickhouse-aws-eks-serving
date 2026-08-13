@@ -1,0 +1,223 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: merge-benchmark-script
+  namespace: clickhouse
+data:
+  run.sh: |
+    #!/usr/bin/env bash
+    # Deterministic FINAL-merge benchmark, run entirely in-cluster so it survives
+    # loss of the operator's SSM tunnel. Results go to stdout in RESULT blocks;
+    # retrieve with `kubectl -n clickhouse logs job/merge-benchmark`.
+    #
+    # Running in-cluster is what makes this reusable for the P7/P8 HA experiments
+    # (pod deletion, node loss): those also need a load generator that outlives a
+    # disconnect and a convergence check that does not trust a DDL return value.
+    # TODO(P7/P8): normalize PDBs and obtain a symmetric AZ topology first; the
+    # 2026-08-12 run had both local nodes in us-east-1a while EBS spanned 1a+1b,
+    # so HA results would not be apple-to-apple.
+    set -uo pipefail
+
+    DATABASE=${DATABASE:-storage_selection_merge_20260813}
+    SOURCE_TABLE=${SOURCE_TABLE:-storage_selection_merge_20260812.hits}
+    SCALE=${SCALE:-10}
+    BENCH_SECONDS=${BENCH_SECONDS:-300}
+    WARMUP_SECONDS=${WARMUP_SECONDS:-15}
+    CONVERGE_TIMEOUT=${CONVERGE_TIMEOUT:-14400}
+    DATASET_URL=${DATASET_URL:-https://datasets.clickhouse.com/hits_compatible/hits.parquet}
+    EXPECTED_REPLICAS=${EXPECTED_REPLICAS:-2}
+
+    PASSWORD=$(tr -d '\r\n' </secrets/password)
+
+    LOCAL_HOST=clickhouse-ch-local.clickhouse.svc.cluster.local
+    EBS_HOST=clickhouse-ch-ebs.clickhouse.svc.cluster.local
+    LOCAL_CLUSTER=mainlocal
+    EBS_CLUSTER=mainebs
+
+    profiles=(local_nvme ebs_gp3)
+    hosts=("$LOCAL_HOST" "$EBS_HOST")
+    clusters=("$LOCAL_CLUSTER" "$EBS_CLUSTER")
+
+    ch() {
+      local host=$1
+      shift
+      clickhouse-client --host "$host" --port 9000 --user admin \
+        --password "$PASSWORD" "$@"
+    }
+
+    log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+    die() { log "FATAL: $*"; echo "RESULT_STATUS=failed"; exit 1; }
+
+    log "preflight"
+    for i in "${!profiles[@]}"; do
+      ch "${hosts[$i]}" --query 'SELECT 1' >/dev/null 2>&1 \
+        || die "cannot reach ${profiles[$i]} at ${hosts[$i]}"
+    done
+    ch "$LOCAL_HOST" --query "SELECT 1 FROM $SOURCE_TABLE LIMIT 1" >/dev/null 2>&1 \
+      || die "source table $SOURCE_TABLE missing; cannot clone schema"
+
+    # Reuse the prior run's column types verbatim so the retry is schema-identical.
+    for i in "${!profiles[@]}"; do
+      profile=${profiles[$i]}; host=${hosts[$i]}; cluster=${clusters[$i]}
+      log "[$profile] creating $DATABASE.hits"
+      ch "$host" --query \
+        "CREATE DATABASE IF NOT EXISTS $DATABASE ON CLUSTER $cluster" || die "create db"
+      ch "$host" --query "
+        CREATE TABLE IF NOT EXISTS $DATABASE.hits ON CLUSTER $cluster
+        AS $SOURCE_TABLE
+        ENGINE = ReplicatedMergeTree(
+          '/clickhouse/storage-comparison/$DATABASE/$profile/{shard}/hits', '{replica}')
+        PARTITION BY toYYYYMM(EventDate)
+        ORDER BY (CounterID, EventDate, intHash32(UserID))
+        SAMPLE BY intHash32(UserID)
+        SETTINGS index_granularity = 8192" || die "create table"
+
+      rows=$(ch "$host" --query \
+        "SELECT count() FROM $DATABASE.hits" 2>/dev/null || echo x)
+      [ "$rows" = "0" ] || die "$DATABASE.hits is not empty (rows=$rows); refusing to reuse"
+    done
+
+    for i in "${!profiles[@]}"; do
+      profile=${profiles[$i]}; host=${hosts[$i]}; cluster=${clusters[$i]}
+
+      log "[$profile] STOP MERGES, then loading $SCALE copies to fragment parts"
+      ch "$host" --query \
+        "SYSTEM STOP MERGES ON CLUSTER $cluster $DATABASE.hits" || die "stop merges"
+
+      for copy in $(seq 0 $((SCALE - 1))); do
+        w=$((copy * 100000000)); u=$((copy * 1000000000000))
+        t0=$SECONDS
+        ch "$host" --database "$DATABASE" --query "
+          INSERT INTO hits
+          SELECT * REPLACE(
+            WatchID + $w AS WatchID,
+            UserID + $u AS UserID,
+            FUniqID + $u AS FUniqID,
+            toDate(EventDate) AS EventDate,
+            toDateTime(EventTime) AS EventTime,
+            toDateTime(ClientEventTime) AS ClientEventTime,
+            toDateTime(LocalEventTime) AS LocalEventTime
+          )
+          FROM url('$DATASET_URL', 'Parquet')
+          SETTINGS schema_inference_make_columns_nullable=0,
+                   max_insert_threads=14,
+                   input_format_parquet_max_block_size=65536" \
+          || die "insert copy $copy"
+        log "[$profile] copy $copy loaded in $((SECONDS - t0))s"
+      done
+
+      log "[$profile] parts before merge"
+      echo "RESULT_PARTS_BEFORE_$profile<<"
+      ch "$host" --query "
+        SELECT hostName(), count() AS active_parts, sum(rows), sum(bytes_on_disk)
+        FROM clusterAllReplicas('$cluster', system.parts)
+        WHERE active AND database='$DATABASE' AND table='hits'
+        GROUP BY hostName() ORDER BY hostName() FORMAT TSVWithNames"
+      echo ">>"
+
+      log "[$profile] starting ${BENCH_SECONDS}s concurrent full scan (c=4)"
+      printf '%s\n' \
+        'SELECT RegionID, count() FROM hits GROUP BY RegionID ORDER BY count() DESC LIMIT 10' \
+        | clickhouse-benchmark --host "$host" --port 9000 --user admin \
+            --password "$PASSWORD" --database "$DATABASE" \
+            --concurrency 4 --timelimit "$BENCH_SECONDS" --continue_on_errors \
+            >"/tmp/qps-$profile.txt" 2>&1 &
+      bench_pid=$!
+      sleep "$WARMUP_SECONDS"
+
+      log "[$profile] START MERGES + OPTIMIZE FINAL"
+      started=$SECONDS
+      ch "$host" --receive_timeout 7200 --query \
+        "SYSTEM START MERGES ON CLUSTER $cluster $DATABASE.hits" || die "start merges"
+      ch "$host" --receive_timeout 7200 --distributed_ddl_task_timeout 7200 \
+        --query "OPTIMIZE TABLE $DATABASE.hits ON CLUSTER $cluster FINAL"
+      initiator_seconds=$((SECONDS - started))
+      log "[$profile] initiator returned after ${initiator_seconds}s"
+
+      # The prior run trusted this return value. It is only a lower bound: the DDL
+      # can return while a non-initiating replica still holds unmerged parts. Poll
+      # until every replica reports a single active part.
+      converged_seconds=
+      while [ $((SECONDS - started)) -lt "$CONVERGE_TIMEOUT" ]; do
+        state=$(ch "$host" --query "
+          SELECT countIf(active_parts = 1), count()
+          FROM (
+            SELECT hostName() AS h, count() AS active_parts
+            FROM clusterAllReplicas('$cluster', system.parts)
+            WHERE active AND database='$DATABASE' AND table='hits'
+            GROUP BY h
+          ) FORMAT TSVRaw" 2>/dev/null)
+        converged=$(echo "$state" | cut -f1)
+        seen=$(echo "$state" | cut -f2)
+        if [ "${converged:-0}" = "$EXPECTED_REPLICAS" ] \
+           && [ "${seen:-0}" = "$EXPECTED_REPLICAS" ]; then
+          converged_seconds=$((SECONDS - started))
+          log "[$profile] all $EXPECTED_REPLICAS replicas converged to 1 part at ${converged_seconds}s"
+          break
+        fi
+        sleep 30
+      done
+      [ -n "$converged_seconds" ] || log "[$profile] WARNING: convergence timeout, reporting unconverged"
+
+      wait "$bench_pid" 2>/dev/null
+
+      echo "RESULT_MERGE_$profile initiator_seconds=$initiator_seconds converged_seconds=${converged_seconds:-unconverged}"
+      echo "RESULT_PARTS_AFTER_$profile<<"
+      ch "$host" --query "
+        SELECT hostName(), count() AS active_parts, sum(rows), sum(bytes_on_disk)
+        FROM clusterAllReplicas('$cluster', system.parts)
+        WHERE active AND database='$DATABASE' AND table='hits'
+        GROUP BY hostName() ORDER BY hostName() FORMAT TSVWithNames"
+      echo ">>"
+      echo "RESULT_QPS_$profile<<"
+      cat "/tmp/qps-$profile.txt"
+      echo ">>"
+    done
+
+    log "complete"
+    echo "RESULT_STATUS=ok"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: merge-benchmark
+  namespace: clickhouse
+spec:
+  # A silent restart would corrupt a multi-hour measurement.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: merge-benchmark
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        workload: bench
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: bench
+          effect: NoSchedule
+      volumes:
+        - name: script
+          configMap:
+            name: merge-benchmark-script
+        - name: secrets
+          secret:
+            secretName: merge-benchmark-admin
+      containers:
+        - name: runner
+          image: "clickhouse/clickhouse-server:25.3.14.14"
+          command: ["/bin/bash", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: "6"
+              memory: "8Gi"
+            limits:
+              memory: "12Gi"
