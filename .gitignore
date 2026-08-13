@@ -23,3 +23,9 @@ terraform.rc
 
 # user-specific values (copy from .example)
 terraform/terraform.tfvars
+
+# Generated benchmark output
+results/
+
+# Session handoff notes: live cluster identifiers and short-lived state
+HANDOFF-*.md
