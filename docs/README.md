@@ -23,11 +23,12 @@
 | [`perf-test-report.md`](./perf-test-report.md) | [`perf-test-report.en.md`](./perf-test-report.en.md) | **历史 1×2 实测结果**，不得当作当前 1×3 实测 |
 | [`storage-comparison.md`](./storage-comparison.md) | [`storage-comparison.en.md`](./storage-comparison.en.md) | 可选 R8g + 高性能 gp3 与现有 i8g + local NVMe 的并行 A/B 方案 |
 | [`storage-comparison-results.md`](./storage-comparison-results.md) | [`storage-comparison-results.en.md`](./storage-comparison-results.en.md) | **2026-08-11 历史 1×2 EBS-only 实测**，包含 Apple-to-Apple 边界与 CloudWatch 证据 |
-| [`storage-selection-report.md`](./storage-selection-report.md) | [`storage-selection-report.en.md`](./storage-selection-report.en.md) | **2026-08-12 同轮本地 NVMe 与 EBS 选型实验**；查询、CloudWatch、merge 计时与 merge 窗口设备级 I/O 结果已记录，HA 待补齐 |
+| [`storage-selection-report.md`](./storage-selection-report.md) | [`storage-selection-report.en.md`](./storage-selection-report.en.md) | **2026-08-12 同轮本地 NVMe 与 EBS 选型实验**；查询、CloudWatch、merge 计时与 merge 窗口设备级 I/O 结果已记录，EBS profile 的 HA 演练见 HA 报告 |
+| [`ha-drill-report.md`](./ha-drill-report.md) | [`ha-drill-report.en.md`](./ha-drill-report.en.md) | **2026-08-13 EBS profile HA 与恢复演练**；Pod 删除、优雅驱逐、节点永久丢失的实测 RTO，并记录 PDB 重叠导致 Pod 不可驱逐的缺陷。不覆盖本地 NVMe profile |
 | [`superpowers/specs/2026-07-03-clickhouse-on-eks-design.md`](./superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) | [`superpowers/specs/2026-07-03-clickhouse-on-eks-design.en.md`](./superpowers/specs/2026-07-03-clickhouse-on-eks-design.en.md) | 当前设计背景；实现与根 README 优先 |
 | [`superpowers/plans/2026-07-03-clickhouse-on-eks.md`](./superpowers/plans/2026-07-03-clickhouse-on-eks.md) | [`superpowers/plans/2026-07-03-clickhouse-on-eks.en.md`](./superpowers/plans/2026-07-03-clickhouse-on-eks.en.md) | **历史实施记录**，包含已废弃的 2×2/i4i 步骤，不是操作手册 |
 
-`perf-results/clickbench-43queries.csv`、`perf-results/ebs-gp3-clickbench-43queries.csv`、`perf-results/ebs-gp3-qps-summary.csv` 和 `perf-results/storage-selection-20260812-summary.csv` 只有语言无关的字段名与数值，保留单份。带中文分组标题的 [`perf-results/qps-by-query-type.txt`](./perf-results/qps-by-query-type.txt) 已配套提供 [`英文版`](./perf-results/qps-by-query-type.en.txt)。
+`perf-results/clickbench-43queries.csv`、`perf-results/ebs-gp3-clickbench-43queries.csv`、`perf-results/ebs-gp3-qps-summary.csv` 、`perf-results/storage-selection-20260812-summary.csv` 和 `perf-results/ha-ebs-20260813-summary.csv` 只有语言无关的字段名与数值，保留单份。带中文分组标题的 [`perf-results/qps-by-query-type.txt`](./perf-results/qps-by-query-type.txt) 已配套提供 [`英文版`](./perf-results/qps-by-query-type.en.txt)。
 
 ## 项目不变量
 
