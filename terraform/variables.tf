@@ -32,6 +32,18 @@ variable "aws_profile" {
   default     = null
 }
 
+variable "kube_api_endpoint_override" {
+  description = "Optional Kubernetes API endpoint override, used for a local SSM private-endpoint tunnel. Empty preserves the normal EKS endpoint."
+  type        = string
+  default     = ""
+}
+
+variable "kube_api_tls_server_name" {
+  description = "TLS server name for kube_api_endpoint_override. Required when tunneling to an EKS endpoint through localhost."
+  type        = string
+  default     = ""
+}
+
 variable "cluster_version" {
   description = "EKS Kubernetes version"
   type        = string
