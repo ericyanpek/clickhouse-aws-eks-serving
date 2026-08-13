@@ -21,10 +21,13 @@ The two root READMEs must retain the same section numbering, commands, versions,
 | [`notes-ck-on-eks-best-practices-2026.md`](./notes-ck-on-eks-best-practices-2026.md) | [`notes-ck-on-eks-best-practices-2026.en.md`](./notes-ck-on-eks-best-practices-2026.en.md) | Architecture reasoning that defines the lakehouse as the sole SoT |
 | [`perf-testing-plan.md`](./perf-testing-plan.md) | [`perf-testing-plan.en.md`](./perf-testing-plan.en.md) | Test plan for the current 1×3 target |
 | [`perf-test-report.md`](./perf-test-report.md) | [`perf-test-report.en.md`](./perf-test-report.en.md) | **Historical 1×2 measurements**, not current 1×3 results |
+| [`storage-comparison.md`](./storage-comparison.md) | [`storage-comparison.en.md`](./storage-comparison.en.md) | Optional parallel R8g + high-performance gp3 versus existing i8g + local-NVMe A/B design |
+| [`storage-comparison-results.md`](./storage-comparison-results.md) | [`storage-comparison-results.en.md`](./storage-comparison-results.en.md) | **Historical 1×2 EBS-only measurements from 2026-08-11**, including Apple-to-Apple limits and CloudWatch evidence |
+| [`storage-selection-report.md`](./storage-selection-report.md) | [`storage-selection-report.en.md`](./storage-selection-report.en.md) | **Same-run local-NVMe versus EBS selection experiment from 2026-08-12**; query, CloudWatch, merge-timing, and merge-window device-level I/O results are recorded, with HA still pending |
 | [`superpowers/specs/2026-07-03-clickhouse-on-eks-design.md`](./superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) | [`superpowers/specs/2026-07-03-clickhouse-on-eks-design.en.md`](./superpowers/specs/2026-07-03-clickhouse-on-eks-design.en.md) | Current design background; implementation and the root READMEs take precedence |
 | [`superpowers/plans/2026-07-03-clickhouse-on-eks.md`](./superpowers/plans/2026-07-03-clickhouse-on-eks.md) | [`superpowers/plans/2026-07-03-clickhouse-on-eks.en.md`](./superpowers/plans/2026-07-03-clickhouse-on-eks.en.md) | **Historical implementation record** containing obsolete 2×2/i4i steps; not an operations guide |
 
-`perf-results/clickbench-43queries.csv` contains only language-neutral field names and values, so it remains a single file. [`perf-results/qps-by-query-type.txt`](./perf-results/qps-by-query-type.txt), whose group labels are Chinese, has a matching [`English version`](./perf-results/qps-by-query-type.en.txt).
+`perf-results/clickbench-43queries.csv`, `perf-results/ebs-gp3-clickbench-43queries.csv`, `perf-results/ebs-gp3-qps-summary.csv`, and `perf-results/storage-selection-20260812-summary.csv` contain only language-neutral field names and values, so each remains a single file. [`perf-results/qps-by-query-type.txt`](./perf-results/qps-by-query-type.txt), whose group labels are Chinese, has a matching [`English version`](./perf-results/qps-by-query-type.en.txt).
 
 ## Project Invariants
 

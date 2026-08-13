@@ -91,6 +91,8 @@ The default strategy is to scale up before sharding. Adding a shard does not aut
 
 Local NVMe provides high IO, but its data is permanently lost when a node terminates, and a local PV does not automatically move. This tradeoff is valid only because ClickHouse data is rebuildable from the lakehouse. If ClickHouse is the only data source, use a more durable storage design and reassess this repository's recovery model.
 
+The repository also provides a disabled-by-default [parallel R8g + high-performance gp3 comparison](./docs/storage-comparison.en.md) that does not replace the existing cluster, plus an EBS-only mode that reuses historical NVMe results without creating i8g nodes. The [2026-08-11 EBS measurements](./docs/storage-comparison-results.en.md) found the small warm ClickBench workload effectively on par with NVMe and explicitly record the direct-I/O and active-parts comparability limits.
+
 ### 4.4 S3 Backup
 
 `clickhouse-backup` stores ClickHouse recovery points to reduce disaster-recovery time. The backup bucket does not replace the lakehouse. Teardown retains it by default and removes it from Terraform state.

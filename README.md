@@ -91,6 +91,8 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 
 本地 NVMe 提供高 IO，但节点终止后数据永久丢失，local PV 也不会自动漂移。该取舍只在 ClickHouse 数据可从湖仓重建时成立。若 ClickHouse 是唯一数据源，应改用更持久的存储设计，并重新评估本仓库的恢复模型。
 
+仓库同时提供默认关闭、不会替换现有集群的 [R8g + 高性能 gp3 并行对比方案](./docs/storage-comparison.md)，也支持不创建 i8g 的 EBS-only 模式复用历史 NVMe 结果。2026-08-11 的 [EBS 实测](./docs/storage-comparison-results.md) 显示小型 warm ClickBench 与 NVMe 基本同档，并明确记录了 direct-I/O 和 active-parts 可比性边界。
+
 ### 4.4 S3 备份
 
 `clickhouse-backup` 保存的是 ClickHouse 恢复点，用于缩短灾难恢复时间。备份桶不替代湖仓，默认 teardown 后继续保留，并从 Terraform state 移除。

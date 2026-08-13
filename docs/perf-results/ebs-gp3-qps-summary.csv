@@ -1,0 +1,9 @@
+query_class,concurrency,nvme_qps,ebs_qps,nvme_rows_per_query,ebs_rows_per_query,comparable
+point,8,2774.391,2416.823,15783,15217,yes
+filtered_aggregate,8,369.720,1032.252,8530531,743073,no
+connection,8,5851.224,5268.330,1,1,yes
+full_scan,8,47.900,50.651,99997497,99997497,yes
+full_scan,1,22.5,22.195,99997497,99997497,yes
+full_scan,2,44.8,44.258,99997497,99997497,yes
+full_scan,4,50.5,45.673,99997497,99997497,yes
+full_scan,16,52.0,48.199,99997497,99997497,yes
