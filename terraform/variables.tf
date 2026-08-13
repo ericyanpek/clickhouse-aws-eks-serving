@@ -62,6 +62,50 @@ variable "clickhouse_instance_type" {
   default     = "i8g.4xlarge"
 }
 
+variable "enable_local_nvme" {
+  description = "Create the existing local-NVMe ClickHouse node pool. Defaults to true; set false only for an EBS-only benchmark that reuses historical NVMe results."
+  type        = bool
+  default     = true
+}
+
+variable "enable_local_nvme_comparison" {
+  description = "Append a benchmark-only local-NVMe node pool without changing the existing production-oriented local-NVMe pool or shifting current node-group indexes."
+  type        = bool
+  default     = false
+}
+
+variable "local_nvme_comparison_zones" {
+  description = "One to three distinct AZs for the benchmark-only local-NVMe profile. A single AZ is a performance-only fallback and must not be presented as an HA result."
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b"]
+
+  validation {
+    condition = (
+      length(var.local_nvme_comparison_zones) >= 1 &&
+      length(var.local_nvme_comparison_zones) <= 3 &&
+      length(distinct(var.local_nvme_comparison_zones)) == length(var.local_nvme_comparison_zones)
+    )
+    error_message = "local_nvme_comparison_zones must contain one to three distinct availability zones."
+  }
+}
+
+variable "local_nvme_comparison_nodes_per_zone" {
+  description = "Benchmark-only local-NVMe nodes per selected AZ. Use 1 for cross-AZ comparison; 2 in one AZ is a performance-only capacity fallback."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = contains([1, 2], var.local_nvme_comparison_nodes_per_zone)
+    error_message = "local_nvme_comparison_nodes_per_zone must be 1 or 2."
+  }
+}
+
+variable "local_nvme_comparison_instance_type" {
+  description = "Instance type for the benchmark-only local-NVMe profile."
+  type        = string
+  default     = "i8g.4xlarge"
+}
+
 # NOTE: ClickHouse node count is NOT set as a count var. The blueprint creates one node group
 # per (pool × AZ) and applies desired_size PER AZ, so ClickHouse node count = len(clickhouse_zones)
 # (1 node per AZ, pinned in eks.tf). Replica count in the CHI must match len(clickhouse_zones).
@@ -81,6 +125,71 @@ variable "clickhouse_ami_type" {
   description = "EKS AMI type for the ClickHouse node pool. Must be ARM64 for i8g/Graviton (AL2023_ARM_64_STANDARD); switch to AL2023_x86_64_STANDARD only if using an x86 instance family."
   type        = string
   default     = "AL2023_ARM_64_STANDARD"
+}
+
+variable "enable_ebs_comparison" {
+  description = "Add a separate R8g ClickHouse node pool and tuned gp3 StorageClass for comparison. The existing local-NVMe cluster remains unchanged when enable_local_nvme is true."
+  type        = bool
+  default     = false
+}
+
+variable "ebs_comparison_zones" {
+  description = "Two or three distinct AZs for the optional EBS profile. Use two to reproduce the historical 1x2 NVMe test basis; the default remains 1x3."
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
+
+  validation {
+    condition = (
+      length(var.ebs_comparison_zones) >= 2 &&
+      length(var.ebs_comparison_zones) <= 3 &&
+      length(distinct(var.ebs_comparison_zones)) == length(var.ebs_comparison_zones)
+    )
+    error_message = "ebs_comparison_zones must contain two or three distinct availability zones."
+  }
+}
+
+variable "ebs_comparison_instance_type" {
+  description = "Instance type for the optional EBS comparison pool. r8g.4xlarge matches i8g.4xlarge at 16 vCPU and 128 GiB without paying for unused instance-store capacity."
+  type        = string
+  default     = "r8g.4xlarge"
+}
+
+variable "ebs_comparison_volume_size_gib" {
+  description = "Size in GiB of each ClickHouse EBS data volume in the comparison cluster."
+  type        = number
+  default     = 3400
+
+  validation {
+    condition     = var.ebs_comparison_volume_size_gib >= 100
+    error_message = "ebs_comparison_volume_size_gib must be at least 100 GiB."
+  }
+
+  validation {
+    condition     = var.ebs_comparison_volume_size_gib <= 16384
+    error_message = "ebs_comparison_volume_size_gib must not exceed the gp3 maximum of 16384 GiB."
+  }
+}
+
+variable "ebs_comparison_iops" {
+  description = "Provisioned gp3 IOPS per comparison volume. 40000 matches the r8g.4xlarge aggregate instance limit in us-east-1 as observed on 2026-08-11."
+  type        = number
+  default     = 40000
+
+  validation {
+    condition     = var.ebs_comparison_iops >= 3000 && var.ebs_comparison_iops <= 80000
+    error_message = "ebs_comparison_iops must be between 3000 and the current gp3 maximum of 80000."
+  }
+}
+
+variable "ebs_comparison_throughput_mibps" {
+  description = "Provisioned gp3 throughput in MiB/s per comparison volume. 1250 matches the r8g.4xlarge aggregate EBS throughput limit."
+  type        = number
+  default     = 1250
+
+  validation {
+    condition     = var.ebs_comparison_throughput_mibps >= 125 && var.ebs_comparison_throughput_mibps <= 2000
+    error_message = "ebs_comparison_throughput_mibps must be between 125 and the current gp3 maximum of 2000 MiB/s."
+  }
 }
 
 variable "bench_instance_type" {

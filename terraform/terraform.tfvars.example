@@ -13,6 +13,22 @@ cluster_version    = "1.34"
 # Node COUNT is derived from AZ count (see eks.tf), not a variable.
 clickhouse_instance_type = "i8g.4xlarge"
 clickhouse_ami_type      = "AL2023_ARM_64_STANDARD"
+enable_local_nvme        = true
+
+# Benchmark-only local-NVMe pool. This is appended after existing node groups so
+# enabling it for an A/B test does not replace a running EBS-only environment.
+enable_local_nvme_comparison        = false
+local_nvme_comparison_zones         = ["us-east-1a", "us-east-1b"]
+local_nvme_comparison_instance_type = "i8g.4xlarge"
+
+# Optional side-by-side EBS comparison. false preserves the existing architecture exactly.
+# When enabled, this ADDS 3 x r8g.4xlarge nodes and 3 x 3400 GiB gp3 volumes.
+enable_ebs_comparison           = false
+ebs_comparison_zones            = ["us-east-1a", "us-east-1b", "us-east-1c"]
+ebs_comparison_instance_type    = "r8g.4xlarge"
+ebs_comparison_volume_size_gib  = 3400
+ebs_comparison_iops             = 40000
+ebs_comparison_throughput_mibps = 1250
 
 # Pinned component versions (see docs/clickhouse-on-eks-research.md)
 operator_version = "0.27.1"

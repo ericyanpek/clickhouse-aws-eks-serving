@@ -31,7 +31,7 @@ spec:
     spec:
       # Only on ClickHouse nodes; tolerate their dedicated taint.
       nodeSelector:
-        workload: clickhouse
+        storage: local-nvme
       tolerations:
         - key: dedicated
           operator: Equal

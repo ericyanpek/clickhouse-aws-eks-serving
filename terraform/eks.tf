@@ -24,7 +24,7 @@ module "eks" {
   # yields 3×3 = 9 nodes. To get "1 node per AZ" set desired=min=max=1 with 3 zones.
   # Also: ami_type MUST be set explicitly — the blueprint default is AL2_x86_64, which EKS
   # rejects on k8s >= 1.33 ("AMI Type AL2_x86_64 is only supported for 1.32 or earlier").
-  node_pools = [
+  node_pools = concat(var.enable_local_nvme ? [
     {
       name          = "clickhouse"
       instance_type = var.clickhouse_instance_type
@@ -34,13 +34,17 @@ module "eks" {
       min_size      = 1
       max_size      = 2                    # replacement compute only; empty local NVMe recovery requires scripts/recover-local-replica.sh
       zones         = var.clickhouse_zones # fixed 1×3 topology: one ClickHouse replica in each AZ
-      labels        = { "workload" = "clickhouse" }
+      labels = {
+        "workload" = "clickhouse"
+        "storage"  = "local-nvme"
+      }
       taints = [{
         key    = "dedicated"
         value  = "clickhouse"
         effect = "NO_SCHEDULE"
       }]
-    },
+    }
+    ] : [], [
     {
       name          = "system"
       instance_type = "t3.large"
@@ -90,5 +94,43 @@ module "eks" {
         effect = "NO_SCHEDULE"
       }]
     }
-  ]
+    ], var.enable_ebs_comparison ? [
+    {
+      # Optional side-by-side storage comparison pool. This does not replace or resize
+      # the existing local-NVMe pool; enabling it adds one R8g node per selected AZ.
+      name          = "clickhouse-ebs"
+      instance_type = var.ebs_comparison_instance_type
+      ami_type      = "AL2023_ARM_64_STANDARD"
+      disk_size     = 50
+      desired_size  = 1
+      min_size      = 1
+      max_size      = 2
+      zones         = var.ebs_comparison_zones
+      labels        = { "workload" = "clickhouse-ebs" }
+      # The upstream module automatically adds dedicated=clickhouse:NoSchedule
+      # to every pool whose name starts with "clickhouse".
+      taints = []
+    }
+    ] : [], var.enable_local_nvme_comparison ? [
+    {
+      # Benchmark-only local-NVMe pool. This is appended after all existing pools
+      # so enabling it does not shift the upstream module's index-based node-group
+      # keys and replace already-running system, Keeper, benchmark, or EBS nodes.
+      name          = "clickhouse-local-benchmark"
+      instance_type = var.local_nvme_comparison_instance_type
+      ami_type      = var.clickhouse_ami_type
+      disk_size     = 50
+      desired_size  = var.local_nvme_comparison_nodes_per_zone
+      min_size      = var.local_nvme_comparison_nodes_per_zone
+      max_size      = var.local_nvme_comparison_nodes_per_zone + 1
+      zones         = var.local_nvme_comparison_zones
+      labels = {
+        "workload" = "clickhouse-local-benchmark"
+        "storage"  = "local-nvme"
+      }
+      # The upstream module automatically adds dedicated=clickhouse:NoSchedule
+      # because this pool name starts with "clickhouse".
+      taints = []
+    }
+  ] : [])
 }

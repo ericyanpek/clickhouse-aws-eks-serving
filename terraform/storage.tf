@@ -36,7 +36,7 @@ resource "helm_release" "local_static_provisioner" {
       mountDir            = "/mnt/disks"
       blockCleanerCommand = ["/scripts/shred.sh", "2"]
     }]
-    nodeSelector = { workload = "clickhouse" }
+    nodeSelector = { storage = "local-nvme" }
     tolerations = [{
       key      = "dedicated"
       operator = "Equal"
@@ -44,4 +44,37 @@ resource "helm_release" "local_static_provisioner" {
       effect   = "NoSchedule"
     }]
   })]
+}
+
+# Optional EBS comparison class. It is deliberately separate from the blueprint's
+# default gp3-encrypted class, which leaves gp3 at its 3000 IOPS / 125 MiB/s defaults.
+# The selected defaults match the aggregate EBS ceiling of r8g.4xlarge so the first
+# comparison measures EBS architecture rather than an artificially under-provisioned volume.
+resource "kubernetes_storage_class" "clickhouse_ebs_comparison" {
+  count = var.enable_ebs_comparison ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.ebs_comparison_throughput_mibps <= var.ebs_comparison_iops * 0.25
+      error_message = "gp3 throughput in MiB/s must not exceed 0.25 times the provisioned IOPS."
+    }
+  }
+
+  metadata {
+    name = "clickhouse-ebs-gp3"
+  }
+
+  storage_provisioner = "ebs.csi.aws.com"
+
+  parameters = {
+    encrypted  = "true"
+    fsType     = "ext4"
+    type       = "gp3"
+    iops       = tostring(var.ebs_comparison_iops)
+    throughput = tostring(var.ebs_comparison_throughput_mibps)
+  }
+
+  reclaim_policy         = "Delete"
+  volume_binding_mode    = "WaitForFirstConsumer"
+  allow_volume_expansion = true
 }
