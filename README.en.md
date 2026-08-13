@@ -93,6 +93,19 @@ Local NVMe provides high IO, but its data is permanently lost when a node termin
 
 The repository also provides a disabled-by-default [parallel R8g + high-performance gp3 comparison](./docs/storage-comparison.en.md) that does not replace the existing cluster, plus an EBS-only mode that reuses historical NVMe results without creating i8g nodes. The [2026-08-11 EBS measurements](./docs/storage-comparison-results.en.md) found the small warm ClickBench workload effectively on par with NVMe and explicitly record the direct-I/O and active-parts comparability limits.
 
+The [2026-08-12 same-run selection experiment](./docs/storage-selection-report.en.md) deployed both media in parallel on one cluster, giving a fuller boundary:
+
+| Scenario | Result |
+|---|---|
+| Warm ClickBench (working set fits in memory) | On par, +2.8% to +3.9% |
+| Direct I/O (page cache bypassed) | EBS +66% to +78% slower, up to 3x on individual queries |
+| `OPTIMIZE FINAL` merge convergence | **EBS +48% slower**; cumulative device I/O was nearly identical (about 1.0 TiB per node), so the entire difference is sustained throughput (217 vs 328 MiB/s) |
+| Monthly cost (1x2, excluding shared costs) | Local $2,004.29; EBS at 20k IOPS / 1,250 MiB/s $2,180.14, an 8.77% premium |
+
+The conclusion is **EBS gp3 as the default production profile, with local NVMe as an explicit performance profile**. Local storage becomes decision-grade only when the workload has frequent page-cache-bypassing scans, strict direct-I/O tail-latency requirements, or background merges that must finish inside a fixed nightly window (EBS needs roughly 1.5x the maintenance window).
+
+The [2026-08-13 HA and recovery drill](./docs/ha-drill-report.en.md) validated the EBS profile's recovery behavior: pod deletion and graceful eviction caused **zero interruption**, and controlled permanent node loss cost **3 seconds** of service interruption with the pod back in 111 seconds and **zero data rebuild** -- the original volume reattached to a same-AZ replacement node. The local-NVMe profile's HA was not tested and must not be inferred from this.
+
 ### 4.4 S3 Backup
 
 `clickhouse-backup` stores ClickHouse recovery points to reduce disaster-recovery time. The backup bucket does not replace the lakehouse. Teardown retains it by default and removes it from Terraform state.
@@ -206,6 +219,10 @@ CONFIRM_REPLICA_DATA_LOSS=yes \
 ```
 
 The script refuses to delete a Ready Pod, handles only a `local-storage` PVC, briefly pauses the operator while removing the old Pod/PVC/PV, restores the operator, and waits for the replacement replica. After the Pod is Ready, verify that `system.replicas` queues have drained.
+
+This reload flow is not needed with EBS data volumes. In the [2026-08-13 drill](./docs/ha-drill-report.en.md), stopping a data node let the original volume reattach to a **same-AZ** replacement node within 111 seconds, with zero data rebuild and 3 seconds of service interruption. This depends on each node group being pinned to a single subnet: a gp3 volume is AZ-scoped, so if a node group spanned several subnets the replacement node could land in another AZ and fail to attach. The result comes from a controlled instance stop and does not cover AZ-level failure or loss of the volume itself; if the volume is lost, the recovery path is the same as local storage.
+
+**PDB caveat:** do not hand-write a PodDisruptionBudget for ClickHouse pods. The Altinity operator already creates one per cluster (`maxUnavailable: 1`), and adding another that selects the same pods makes them **permanently unevictable** -- the eviction API refuses any pod covered by more than one PDB, which blocks `kubectl drain`, node rolling upgrades, and autoscaler scale-down indefinitely. This defect was found and fixed during the 2026-08-13 drill.
 
 If every ClickHouse replica is lost, rebuild by partition from the upstream lakehouse first. The ClickHouse S3 backup is an auxiliary recovery point for reducing RTO, not the authoritative data source.
 

@@ -93,6 +93,19 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 
 仓库同时提供默认关闭、不会替换现有集群的 [R8g + 高性能 gp3 并行对比方案](./docs/storage-comparison.md)，也支持不创建 i8g 的 EBS-only 模式复用历史 NVMe 结果。2026-08-11 的 [EBS 实测](./docs/storage-comparison-results.md) 显示小型 warm ClickBench 与 NVMe 基本同档，并明确记录了 direct-I/O 和 active-parts 可比性边界。
 
+2026-08-12 的 [同轮存储选型实验](./docs/storage-selection-report.md) 在同一集群内并行部署两种介质，得到更完整的边界：
+
+| 场景 | 结果 |
+|---|---|
+| warm ClickBench（工作集入内存） | 两者同档，差异 +2.8%–+3.9% |
+| direct I/O（绕过 page cache） | EBS 慢 +66%–78%，个别查询 3 倍 |
+| `OPTIMIZE FINAL` merge 收敛 | **EBS 慢 +48%**；两侧累计设备 I/O 近乎相同（每节点约 1.0 TiB），差异全在持续吞吐（217 vs 328 MiB/s） |
+| 月成本（1×2，不含共享成本） | 本地盘 $2,004.29；EBS 20k IOPS / 1,250 MiB/s 档 $2,180.14，溢价 8.77% |
+
+结论是**默认生产选 EBS gp3，本地 NVMe 作为明确的性能 profile**。若存在频繁绕过 page cache 的大扫描、严格 direct-I/O 尾延迟要求，或后台 merge 必须在固定夜间窗口内完成（EBS 需按 1.5 倍规划维护窗口），本地盘的优势才具备决策意义。
+
+2026-08-13 的 [HA 与恢复演练](./docs/ha-drill-report.md) 验证了 EBS profile 的恢复行为：Pod 删除与优雅驱逐**零中断**；受控节点永久丢失的服务中断为 **3 秒**、Pod 恢复 111 秒、**数据零重建**（原卷重新挂载至同 AZ 替换节点）。本地 NVMe profile 的 HA 未测，不得由此推断。
+
 ### 4.4 S3 备份
 
 `clickhouse-backup` 保存的是 ClickHouse 恢复点，用于缩短灾难恢复时间。备份桶不替代湖仓，默认 teardown 后继续保留，并从 Terraform state 移除。
@@ -206,6 +219,10 @@ CONFIRM_REPLICA_DATA_LOSS=yes \
 ```
 
 脚本拒绝删除 Ready Pod，只处理 `local-storage` PVC，并在清理旧 Pod/PVC/PV 时短暂停止 operator，随后恢复 operator 并等待新副本。Pod Ready 后仍需检查 `system.replicas` 队列归零。
+
+改用 EBS 数据卷时不需要这个重灌流程：[2026-08-13 演练](./docs/ha-drill-report.md) 实测停止一个数据节点后，原卷在 111 秒内重新挂载到**同 AZ** 替换节点，数据零重建、服务中断 3 秒。前提是节点组绑定单一子网——gp3 卷是 AZ 绑定资源，若节点组跨多个子网，替换节点可能落到其他 AZ 而无法挂载。该结论来自受控的实例停止，未覆盖 AZ 级故障或卷本身损坏；卷损坏时恢复路径与本地盘相同。
+
+**PDB 注意事项：** 不要为 ClickHouse Pod 手写 PodDisruptionBudget。Altinity operator 已为每个 cluster 自动创建（`maxUnavailable: 1`），额外添加选中同一批 Pod 的 PDB 会让它们**永久不可驱逐**——eviction API 拒绝被多个 PDB 覆盖的 Pod，导致 `kubectl drain`、节点滚动升级和 autoscaler 缩容全部无限期阻塞。该缺陷已于 2026-08-13 演练中发现并修复。
 
 全体 ClickHouse 副本丢失时，优先从上游湖仓按分区重建；S3 ClickHouse 备份是缩短 RTO 的辅助恢复点，而不是权威数据事实来源。
 
