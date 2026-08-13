@@ -116,14 +116,10 @@ spec:
           resources:
             requests:
               storage: REPLACE_WITH_EBS_VOLUME_SIZE_GIB
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: ch-ebs-pdb
-  namespace: clickhouse
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      clickhouse.altinity.com/chi: ch-ebs
+# No PodDisruptionBudget here on purpose. The Altinity operator already creates
+# one per cluster (chi-<chi>-<cluster>, maxUnavailable: 1). A second PDB whose
+# selector also matches these pods makes them permanently unevictable: the
+# eviction API refuses any pod covered by more than one PDB, so `kubectl drain`
+# fails with "This pod has more than one PodDisruptionBudget" and node rotation
+# blocks indefinitely. Verified during the 2026-08-13 P7b drill -- drain failed
+# with two PDBs present and completed in 7s once this one was removed.

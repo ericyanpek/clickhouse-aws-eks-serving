@@ -37,7 +37,6 @@ fi
 
 echo "==> deleting EBS-only ClickHouse, Keeper, and PVCs"
 kubectl -n clickhouse delete chi ch-ebs --ignore-not-found --wait=true
-kubectl -n clickhouse delete pdb ch-ebs-pdb --ignore-not-found
 kubectl -n clickhouse delete pod storage-comparison-client --ignore-not-found
 kubectl -n clickhouse delete chk keeper --ignore-not-found --wait=true
 kubectl -n clickhouse delete pvc --all --ignore-not-found --wait=true

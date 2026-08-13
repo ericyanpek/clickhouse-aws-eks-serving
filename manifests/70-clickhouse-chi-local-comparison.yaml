@@ -112,14 +112,8 @@ spec:
           resources:
             requests:
               storage: 3400Gi
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: ch-local-pdb
-  namespace: clickhouse
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      clickhouse.altinity.com/chi: ch-local
+# No PodDisruptionBudget here on purpose. The Altinity operator already creates
+# one per cluster (chi-<chi>-<cluster>, maxUnavailable: 1). A second PDB whose
+# selector also matches these pods makes them permanently unevictable: the
+# eviction API refuses any pod covered by more than one PDB, so `kubectl drain`
+# fails and node rotation blocks indefinitely. See the 2026-08-13 P7b drill.

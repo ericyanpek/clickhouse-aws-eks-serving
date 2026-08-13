@@ -133,16 +133,13 @@ spec:
           resources:
             requests:
               storage: 3400Gi # matches i8g.4xlarge instance-store (~3.75TB); adjust per instance size
----
-# Keep at least 2 of the 3 replicas up during voluntary disruptions (node drain,
-# rolling restart) so the shard remains highly available.
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: ch-pdb
-  namespace: clickhouse
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      clickhouse.altinity.com/chi: ch
+# No PodDisruptionBudget here on purpose, even though 1x3 could tolerate
+# minAvailable: 2. The Altinity operator already creates one per cluster
+# (chi-<chi>-<cluster>, maxUnavailable: 1), which gives the same guarantee of
+# one replica down at a time. Adding a second PDB whose selector also matches
+# these pods makes them permanently unevictable: the eviction API refuses any
+# pod covered by more than one PDB, so `kubectl drain` fails with "This pod has
+# more than one PodDisruptionBudget" and node rotation blocks indefinitely.
+# Verified on the 1x2 comparison clusters during the 2026-08-13 P7b drill --
+# drain failed with two PDBs present and completed in 7s once the hand-written
+# one was removed.

@@ -37,7 +37,6 @@ fi
 
 echo "==> deleting only the optional ch-ebs workload"
 kubectl -n clickhouse delete chi ch-ebs --ignore-not-found --wait=true
-kubectl -n clickhouse delete pdb ch-ebs-pdb --ignore-not-found
 kubectl -n clickhouse delete pod storage-comparison-client --ignore-not-found
 # Stateful workload deletion can retain claims depending on operator policy.
 # Delete only claims labelled for ch-ebs so their Delete-reclaim EBS PVs are released.
