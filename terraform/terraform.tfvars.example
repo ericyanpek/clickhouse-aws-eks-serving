@@ -27,7 +27,7 @@ enable_ebs_comparison           = false
 ebs_comparison_zones            = ["us-east-1a", "us-east-1b", "us-east-1c"]
 ebs_comparison_instance_type    = "r8g.4xlarge"
 ebs_comparison_volume_size_gib  = 3400
-ebs_comparison_iops             = 40000
+ebs_comparison_iops             = 20000
 ebs_comparison_throughput_mibps = 1250
 
 # Pinned component versions (see docs/clickhouse-on-eks-research.md)

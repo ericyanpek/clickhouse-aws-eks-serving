@@ -44,3 +44,6 @@ cloudwatch_ebs,volume_a_peak_queue_length,count,,11.729492,,118_one_minute_sampl
 cloudwatch_ebs,volume_b_average_queue_length,count,,1.324161,,118_one_minute_samples
 cloudwatch_ebs,volume_b_peak_queue_length,count,,9.161133,,118_one_minute_samples
 cost_1x2,on_demand_compute_and_data_volume,USD_per_month,2004.29,2380.14,18.752286,excludes_common_and_shared_costs
+cost_1x2,on_demand_compute_and_data_volume_20k_iops,USD_per_month,2004.29,2180.14,8.774378,tier_applied_20260813_iops_only
+cost_1x2,provisioned_iops_per_volume,IOPS,,20000,,reduced_from_40000_on_20260813
+cost_1x2,provisioned_throughput_per_volume,MiB_per_second,,1250,,held_unchanged_merge_p95_reaches_1193

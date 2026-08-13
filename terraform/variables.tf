@@ -171,9 +171,15 @@ variable "ebs_comparison_volume_size_gib" {
 }
 
 variable "ebs_comparison_iops" {
-  description = "Provisioned gp3 IOPS per comparison volume. 40000 matches the r8g.4xlarge aggregate instance limit in us-east-1 as observed on 2026-08-11."
+  # 20000 matches the r8g.4xlarge SUSTAINED EBS baseline. 40000 is that instance's
+  # BURST ceiling, reachable only for 30 minutes per 24 hours, so provisioning it
+  # buys capability the instance cannot sustain. Measured 2026-08-12: peak 14,993
+  # and 9,701 IOPS under read-heavy ClickBench, and only 1,415/1,428 during a
+  # merge. At the observed 120-157 KiB per I/O, saturating 1,250 MiB/s needs about
+  # 8,200 IOPS, so this workload is throughput-bound, not IOPS-bound.
+  description = "Provisioned gp3 IOPS per comparison volume. 20000 matches the r8g.4xlarge sustained EBS baseline; its 40000 burst ceiling is only available 30 minutes per 24 hours."
   type        = number
-  default     = 40000
+  default     = 20000
 
   validation {
     condition     = var.ebs_comparison_iops >= 3000 && var.ebs_comparison_iops <= 80000
@@ -182,7 +188,13 @@ variable "ebs_comparison_iops" {
 }
 
 variable "ebs_comparison_throughput_mibps" {
-  description = "Provisioned gp3 throughput in MiB/s per comparison volume. 1250 matches the r8g.4xlarge aggregate EBS throughput limit."
+  # Hold at 1250 and do NOT reduce this. The instance channel is 625 MB/s
+  # sustained (= 596.05 MiB/s) and 1250 MB/s burst (= 1192.09 MiB/s) -- note AWS
+  # states instance throughput in decimal MB/s while gp3 is provisioned in MiB/s.
+  # Merge-window device counters from 2026-08-12 put EBS p95 at 1,130-1,193 MiB/s
+  # with peak utilization at 102%, so dropping to 1000 MiB/s would clip sustained
+  # merge throughput and further extend a merge already 48% slower than local NVMe.
+  description = "Provisioned gp3 throughput in MiB/s per comparison volume. Hold at 1250: measured merge p95 reaches 1,130-1,193 MiB/s, so reducing this clips merge throughput."
   type        = number
   default     = 1250
 
