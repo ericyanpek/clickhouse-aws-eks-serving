@@ -1,8 +1,8 @@
 apiVersion: "clickhouse.altinity.com/v1"
 kind: "ClickHouseInstallation"
 metadata:
-  name: ch
-  namespace: clickhouse
+  name: __CLUSTER__
+  namespace: __NAMESPACE__
 spec:
   defaults:
     templates:
@@ -12,8 +12,11 @@ spec:
   configuration:
     zookeeper:
       nodes:
-        - host: keeper-keeper.clickhouse.svc.cluster.local
+        - host: keeper-__CLUSTER__-keeper.__NAMESPACE__.svc.cluster.local
           port: 2181
+      # Per-cluster coordination root: clusters must never share ZooKeeper paths,
+      # even if they were ever pointed at the same Keeper ensemble.
+      root: /clickhouse/__CLUSTER__
     users:
       # SECURITY: password_sha256_hex must be a valid 64-char hex — an empty string is REJECTED
       # by ClickHouse (CANNOT_LOAD_CONFIG, exit 91). Generate before apply and substitute the
@@ -37,8 +40,8 @@ spec:
           # reads spread across replicas and the cluster tolerates one replica loss.
           # Scale UP first (re-sharding has no auto-rebalance); add shards only when a single query
           # outgrows one node's CPU or the data outgrows one disk.
-          shardsCount: 1
-          replicasCount: 3
+          shardsCount: __SHARDS__
+          replicasCount: __REPLICAS__
   templates:
     serviceTemplates:
       - name: ch-cluster-ip
@@ -57,6 +60,7 @@ spec:
           serviceAccountName: clickhouse-backup
           nodeSelector:
             workload: clickhouse
+            ck-cluster: __CLUSTER__
           tolerations:
             - key: dedicated
               operator: Equal
@@ -68,7 +72,7 @@ spec:
                 - labelSelector:
                     matchLabels:
                       clickhouse.altinity.com/app: chop
-                      clickhouse.altinity.com/chi: ch
+                      clickhouse.altinity.com/chi: __CLUSTER__
                   topologyKey: kubernetes.io/hostname
           topologySpreadConstraints:
             - maxSkew: 1
@@ -77,10 +81,10 @@ spec:
               labelSelector:
                 matchLabels:
                   clickhouse.altinity.com/app: chop
-                  clickhouse.altinity.com/chi: ch
+                  clickhouse.altinity.com/chi: __CLUSTER__
           containers:
             - name: clickhouse
-              image: "clickhouse/clickhouse-server:25.3"
+              image: "__CLICKHOUSE_IMAGE__"
               # Resource model for a DEDICATED node (one pod per i8g.4xlarge: 16 vCPU / 128 GiB).
               # - CPU: high request, NO limit. A CPU limit = CFS quota that throttles ClickHouse's
               #   parallel scan/merge threads at peak; on a dedicated node there is nothing to
@@ -91,10 +95,10 @@ spec:
               #   max_server_memory_usage_to_ram_ratio 0.9 above.
               resources:
                 requests:
-                  cpu: "14"
-                  memory: "110Gi"
+                  cpu: "__CPU_REQUEST__"
+                  memory: "__MEMORY_REQUEST__"
                 limits:
-                  memory: "110Gi"
+                  memory: "__MEMORY_REQUEST__"
             - name: clickhouse-backup
               image: "altinity/clickhouse-backup:2.6.0"
               args: ["server"]
@@ -121,18 +125,23 @@ spec:
                       name: clickhouse-backup-config
                       key: S3_REGION
                 - name: S3_PATH
-                  value: "backup"
+                  # Must match the cluster's own S3 prefix: the backup IAM role is
+                  # scoped to s3://<bucket>/<cluster>/*, so any other path is denied.
+                  value: "__CLUSTER__"
               ports:
                 - name: backup-rest
                   containerPort: 7171
     volumeClaimTemplates:
       - name: ch-data
         spec:
-          storageClassName: local-storage
+          # Rendered by scripts/deploy.sh from the Terraform storage_profile:
+          # ck-<cluster>-gp3 for the ebs profile (default), local-storage for local-nvme.
+          # Do not apply this template directly.
+          storageClassName: __STORAGE_CLASS__
           accessModes: [ReadWriteOnce]
           resources:
             requests:
-              storage: 3400Gi # matches i8g.4xlarge instance-store (~3.75TB); adjust per instance size
+              storage: __DATA_VOLUME_SIZE__Gi # sized to the i8g.4xlarge instance store (~3.75TB) so both profiles hold the same data; adjust per instance size
 # No PodDisruptionBudget here on purpose, even though 1x3 could tolerate
 # minAvailable: 2. The Altinity operator already creates one per cluster
 # (chi-<chi>-<cluster>, maxUnavailable: 1), which gives the same guarantee of
