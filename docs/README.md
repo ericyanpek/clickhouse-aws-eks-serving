@@ -21,7 +21,6 @@
 | [`notes-ck-on-eks-best-practices-2026.md`](./notes-ck-on-eks-best-practices-2026.md) | [`notes-ck-on-eks-best-practices-2026.en.md`](./notes-ck-on-eks-best-practices-2026.en.md) | 架构推演，明确湖仓为唯一 SoT |
 | [`perf-testing-plan.md`](./perf-testing-plan.md) | [`perf-testing-plan.en.md`](./perf-testing-plan.en.md) | 当前 1×3 目标的测试计划 |
 | [`perf-test-report.md`](./perf-test-report.md) | [`perf-test-report.en.md`](./perf-test-report.en.md) | **历史 1×2 实测结果**，不得当作当前 1×3 实测 |
-| [`storage-comparison.md`](./storage-comparison.md) | [`storage-comparison.en.md`](./storage-comparison.en.md) | 可选 R8g + 高性能 gp3 与现有 i8g + local NVMe 的并行 A/B 方案 |
 | [`storage-comparison-results.md`](./storage-comparison-results.md) | [`storage-comparison-results.en.md`](./storage-comparison-results.en.md) | **2026-08-11 历史 1×2 EBS-only 实测**，包含 Apple-to-Apple 边界与 CloudWatch 证据 |
 | [`storage-selection-report.md`](./storage-selection-report.md) | [`storage-selection-report.en.md`](./storage-selection-report.en.md) | **2026-08-12 同轮本地 NVMe 与 EBS 选型实验**；查询、CloudWatch、merge 计时与 merge 窗口设备级 I/O 结果已记录，EBS profile 的 HA 演练见 HA 报告 |
 | [`ha-drill-report.md`](./ha-drill-report.md) | [`ha-drill-report.en.md`](./ha-drill-report.en.md) | **2026-08-13 EBS profile HA 与恢复演练**；Pod 删除、优雅驱逐、节点永久丢失的实测 RTO，并记录 PDB 重叠导致 Pod 不可驱逐的缺陷。不覆盖本地 NVMe profile |

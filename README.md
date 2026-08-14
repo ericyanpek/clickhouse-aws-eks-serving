@@ -132,7 +132,7 @@ merge 那一行的机制值得单独说明：两种介质**累计搬运的字节
 
 #### 4.3.4 如何切换
 
-仓库提供默认关闭、不替换现有集群的 [R8g + 高性能 gp3 并行对比方案](./docs/storage-comparison.md)，可用于在自己的数据和查询上复现上述对比，再决定采用哪种介质。历史材料另有 2026-08-11 的 [EBS-only 实测](./docs/storage-comparison-results.md)。
+要在自己的数据和查询上复现上述对比，在 `clickhouse_clusters` 中同时声明两个集群（一个 `storage_profile = "ebs"`、一个 `"local-nvme"`），两者共用同一 EKS、监控和压测节点。历史材料另有 2026-08-11 的 [EBS-only 实测](./docs/storage-comparison-results.md)。
 
 切换到 EBS 需要同时调整：CHI 的 `storageClassName`（`local-storage` → gp3 类）、实例类型（`i8g` → `r8g`）、以及节点组的子网绑定——**gp3 卷是 AZ 绑定资源，节点组必须绑定单一子网**，否则替换节点可能落到其他 AZ 而无法挂载原卷，4.3.2 的恢复优势将不成立。
 

@@ -132,7 +132,7 @@ Choosing local storage means accepting that data is permanently lost when a node
 
 #### 4.3.4 How to Switch
 
-The repository provides a disabled-by-default [parallel R8g + high-performance gp3 comparison](./docs/storage-comparison.en.md) that does not replace the existing cluster, so the comparison above can be reproduced against your own data and queries before committing to a medium. Historical material also includes the [2026-08-11 EBS-only measurements](./docs/storage-comparison-results.en.md).
+To reproduce the comparison against your own data and queries, declare two clusters in `clickhouse_clusters` at once -- one with `storage_profile = "ebs"` and one with `local-nvme` -- which share the same EKS, monitoring, and load-generation node. Historical material also includes the [2026-08-11 EBS-only measurements](./docs/storage-comparison-results.en.md).
 
 Switching to EBS requires changing three things together: the CHI's `storageClassName` (`local-storage` to a gp3 class), the instance type (`i8g` to `r8g`), and the node group's subnet binding -- **a gp3 volume is AZ-scoped, so each node group must be pinned to a single subnet**. Otherwise a replacement node may land in a different AZ, fail to attach the original volume, and the recovery advantage in 4.3.2 does not hold.
 
