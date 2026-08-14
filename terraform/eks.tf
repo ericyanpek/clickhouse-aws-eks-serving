@@ -7,8 +7,11 @@ locals {
         cluster       = name
         az            = az
         instance_type = c.instance_type != "" ? c.instance_type : (c.storage_profile == "ebs" ? "r8g.4xlarge" : "i8g.4xlarge")
-        # Nodes per AZ = replicas / AZ count (validation guarantees even division)
-        nodes_per_az = c.replicas / length(c.zones)
+        # The CHI provisions shards x replicas pods, and pod anti-affinity is
+        # required on kubernetes.io/hostname, so every pod needs its own node.
+        # Omitting shards here would strand (shards-1) x replicas pods Pending
+        # forever. Validation guarantees this divides evenly.
+        nodes_per_az = (c.shards * c.replicas) / length(c.zones)
         storage      = c.storage_profile == "ebs" ? "ebs-gp3" : "local-nvme"
       }
     }

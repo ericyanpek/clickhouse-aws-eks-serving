@@ -88,9 +88,30 @@ variable "clickhouse_clusters" {
   }
 
   validation {
-    # 一个副本一个节点，每个 AZ 一个节点组，所以副本数必须能被 AZ 数整除。
-    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas % length(v.zones) == 0])
-    error_message = "replicas 必须是 zones 数量的整数倍（每 AZ 承载相同数量的副本）。"
+    # One pod per node and one node group per AZ, so total pods must divide evenly
+    # across AZs. shards is included because the CHI provisions shards x replicas
+    # pods while the node groups must supply a node for each of them.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : (v.shards * v.replicas) % length(v.zones) == 0])
+    error_message = "shards x replicas must be a multiple of the number of zones (each AZ carries an equal share)."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas >= 1 && v.shards >= 1])
+    error_message = "shards and replicas must both be at least 1."
+  }
+
+  validation {
+    # Keeper places one member per AZ, so an even AZ count yields an even Raft
+    # ensemble, which tolerates no failures at all.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(v.zones) % 2 == 1])
+    error_message = "zones must contain an odd number of AZs so the Keeper ensemble forms a real quorum."
+  }
+
+  validation {
+    # A duplicate AZ would otherwise surface as "Two different items produced the
+    # key" from deep inside a for expression, pointing at nothing the user typed.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(distinct(v.zones)) == length(v.zones)])
+    error_message = "zones must not contain duplicate availability zones."
   }
 
   validation {
@@ -114,8 +135,11 @@ locals {
         cluster       = name
         az            = az
         instance_type = c.instance_type != "" ? c.instance_type : (c.storage_profile == "ebs" ? "r8g.4xlarge" : "i8g.4xlarge")
-        # 每 AZ 的节点数 = 副本数 / AZ 数（validation 已保证整除）
-        nodes_per_az = c.replicas / length(c.zones)
+        # The CHI provisions shards x replicas pods, and pod anti-affinity is
+        # required on kubernetes.io/hostname, so every pod needs its own node.
+        # Omitting shards here would strand (shards-1) x replicas pods Pending
+        # forever. Validation guarantees this divides evenly.
+        nodes_per_az = (c.shards * c.replicas) / length(c.zones)
         storage      = c.storage_profile == "ebs" ? "ebs-gp3" : "local-nvme"
       }
     }

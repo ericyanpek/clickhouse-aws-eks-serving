@@ -99,9 +99,30 @@ variable "clickhouse_clusters" {
   }
 
   validation {
-    # One replica per node and one node group per AZ, so replicas must divide evenly across AZs.
-    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas % length(v.zones) == 0])
-    error_message = "replicas must be a multiple of the number of zones (each AZ carries an equal share)."
+    # One pod per node and one node group per AZ, so total pods must divide evenly
+    # across AZs. shards is included because the CHI provisions shards x replicas
+    # pods while the node groups must supply a node for each of them.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : (v.shards * v.replicas) % length(v.zones) == 0])
+    error_message = "shards x replicas must be a multiple of the number of zones (each AZ carries an equal share)."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas >= 1 && v.shards >= 1])
+    error_message = "shards and replicas must both be at least 1."
+  }
+
+  validation {
+    # Keeper places one member per AZ, so an even AZ count yields an even Raft
+    # ensemble, which tolerates no failures at all.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(v.zones) % 2 == 1])
+    error_message = "zones must contain an odd number of AZs so the Keeper ensemble forms a real quorum."
+  }
+
+  validation {
+    # A duplicate AZ would otherwise surface as "Two different items produced the
+    # key" from deep inside a for expression, pointing at nothing the user typed.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(distinct(v.zones)) == length(v.zones)])
+    error_message = "zones must not contain duplicate availability zones."
   }
 
   validation {
