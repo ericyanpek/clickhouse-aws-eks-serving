@@ -59,33 +59,12 @@ module "eks" {
   # yields 3×3 = 9 nodes. To get "1 node per AZ" set desired=min=max=1 with 3 zones.
   # Also: ami_type MUST be set explicitly — the blueprint default is AL2_x86_64, which EKS
   # rejects on k8s >= 1.33 ("AMI Type AL2_x86_64 is only supported for 1.32 or earlier").
-  node_pools = concat(var.enable_local_nvme ? [
-    {
-      name          = "clickhouse"
-      instance_type = local.clickhouse_instance_type
-      ami_type      = var.clickhouse_ami_type # ARM64 for i8g/r8g Graviton
-      disk_size     = 50                      # root EBS; data lives on the gp3 data volume or instance-store NVMe
-      desired_size  = 1                       # PER AZ → len(clickhouse_zones) × 1 nodes (= CHI replicasCount)
-      # On the ebs profile a replacement node reattaches the existing gp3 volume, so
-      # max_size=2 is enough for a rolling replacement. On local-nvme the replacement
-      # node starts with an empty disk and needs scripts/recover-local-replica.sh.
-      min_size = 1
-      max_size = 2
-      # One node group per zone, so each is pinned to a single subnet. That is what
-      # lets a replacement node land in the same AZ as an existing gp3 volume; a
-      # multi-subnet group could place it elsewhere and fail to attach.
-      zones = var.clickhouse_zones # fixed 1×3 topology: one ClickHouse replica in each AZ
-      labels = {
-        "workload" = "clickhouse"
-        "storage"  = local.storage_profile_is_ebs ? "ebs-gp3" : "local-nvme"
-      }
-      taints = [{
-        key    = "dedicated"
-        value  = "clickhouse"
-        effect = "NO_SCHEDULE"
-      }]
-    }
-    ] : [], [
+  #
+  # Only shared pools whose count is independent of cluster configuration remain here,
+  # so this list has constant length and the upstream index-derived node group names
+  # can never shift. ClickHouse and Keeper node groups are self-managed (see
+  # nodegroups.tf) to get map-keyed stability.
+  node_pools = [
     {
       name          = "system"
       instance_type = "t3.large"
@@ -96,24 +75,6 @@ module "eks" {
       max_size      = 2
       zones         = var.availability_zones
       labels        = { "workload" = "system" }
-    },
-    {
-      name          = "system-keeper"
-      instance_type = "m7g.large" # Graviton, NON-burstable: Keeper is on the write/DDL
-      # critical path; a burstable t3 would stall the whole
-      # cluster when CPU credits exhaust under load.
-      ami_type     = "AL2023_ARM_64_STANDARD" # ARM64 to match m7g (Graviton)
-      disk_size    = 20
-      desired_size = 1 # PER AZ → 3 zones × 1 = 3 Keeper nodes (odd quorum across AZs)
-      min_size     = 1
-      max_size     = 1
-      zones        = var.availability_zones
-      labels       = { "workload" = "keeper" }
-      taints = [{
-        key    = "dedicated"
-        value  = "keeper"
-        effect = "NO_SCHEDULE"
-      }]
     },
     {
       # Dedicated, non-burstable load-generation node. Runs clickhouse-benchmark pods
@@ -134,44 +95,6 @@ module "eks" {
         value  = "bench"
         effect = "NO_SCHEDULE"
       }]
-    }
-    ], var.enable_ebs_comparison ? [
-    {
-      # Optional side-by-side storage comparison pool. This does not replace or resize
-      # the existing local-NVMe pool; enabling it adds one R8g node per selected AZ.
-      name          = "clickhouse-ebs"
-      instance_type = var.ebs_comparison_instance_type
-      ami_type      = "AL2023_ARM_64_STANDARD"
-      disk_size     = 50
-      desired_size  = 1
-      min_size      = 1
-      max_size      = 2
-      zones         = var.ebs_comparison_zones
-      labels        = { "workload" = "clickhouse-ebs" }
-      # The upstream module automatically adds dedicated=clickhouse:NoSchedule
-      # to every pool whose name starts with "clickhouse".
-      taints = []
-    }
-    ] : [], var.enable_local_nvme_comparison ? [
-    {
-      # Benchmark-only local-NVMe pool. This is appended after all existing pools
-      # so enabling it does not shift the upstream module's index-based node-group
-      # keys and replace already-running system, Keeper, benchmark, or EBS nodes.
-      name          = "clickhouse-local-benchmark"
-      instance_type = var.local_nvme_comparison_instance_type
-      ami_type      = var.clickhouse_ami_type
-      disk_size     = 50
-      desired_size  = var.local_nvme_comparison_nodes_per_zone
-      min_size      = var.local_nvme_comparison_nodes_per_zone
-      max_size      = var.local_nvme_comparison_nodes_per_zone + 1
-      zones         = var.local_nvme_comparison_zones
-      labels = {
-        "workload" = "clickhouse-local-benchmark"
-        "storage"  = "local-nvme"
-      }
-      # The upstream module automatically adds dedicated=clickhouse:NoSchedule
-      # because this pool name starts with "clickhouse".
-      taints = []
-    }
-  ] : [])
+    },
+  ]
 }
