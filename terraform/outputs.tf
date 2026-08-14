@@ -13,9 +13,9 @@ output "backup_bucket" {
   value = aws_s3_bucket.backup.id
 }
 
-output "backup_role_arn" {
-  description = "Annotate the clickhouse-backup ServiceAccount with this role ARN"
-  value       = aws_iam_role.backup.arn
+output "backup_role_arns" {
+  description = "Per-cluster backup IRSA role ARNs, for deploy.sh to render the ServiceAccount annotation."
+  value       = { for k, r in aws_iam_role.backup : k => r.arn }
 }
 
 output "clickhouse_namespace" {
