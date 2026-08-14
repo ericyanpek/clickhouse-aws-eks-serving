@@ -2,7 +2,7 @@
 
 [中文](./storage-comparison.md) · **English**
 
-> Status: the infrastructure and test automation are implemented. A 1×2 EBS-only run completed on 2026-08-11; see [`storage-comparison-results.en.md`](./storage-comparison-results.en.md). Test resources are destroyed after preserving the results; this document continues to describe the repeatable parallel design.
+> Status: **historical document.** The dedicated deployment scripts described here (`deploy-ebs-comparison.sh` and friends) were removed as part of the multi-cluster refactor. Under the new `clickhouse_clusters` map the same parallel comparison is expressed by declaring two clusters in the map (one with `storage_profile = "ebs"`, one with `local-nvme`) and running `./scripts/deploy.sh`, so the dedicated scripts are no longer needed. The 1×2 EBS-only results from 2026-08-11 are in [`storage-comparison-results.en.md`](./storage-comparison-results.en.md) and the same-run selection results from 2026-08-12 are in [`storage-selection-report.en.md`](./storage-selection-report.en.md). This document is kept to record the method and boundaries used at the time.
 >
 > Goal: retain the existing `i8g.4xlarge + local NVMe` cluster unchanged and add an independent `r8g.4xlarge + gp3` cluster on the same EKS, Operator, Keeper, monitoring stack, and benchmark node. Compare them with the same ClickHouse version, topology, resource limits, dataset, and queries.
 

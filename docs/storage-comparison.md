@@ -2,7 +2,7 @@
 
 **中文** · [English](./storage-comparison.en.md)
 
-> 状态：基础设施和测试自动化已实现；2026-08-11 已完成 1×2 EBS-only 实测，结果见 [`storage-comparison-results.md`](./storage-comparison-results.md)。测试资源在结果保存后销毁，本文仍描述可重复部署的并行方案。
+> 状态：**历史文档。** 本文描述的专用部署脚本（`deploy-ebs-comparison.sh` 等）已随多集群改造删除——在新的 `clickhouse_clusters` map 下，同样的并行对比只需在 map 里声明两个集群（一个 `storage_profile = "ebs"`、一个 `local-nvme`）再跑 `./scripts/deploy.sh`，不再需要专用脚本。2026-08-11 的 1×2 EBS-only 实测结果见 [`storage-comparison-results.md`](./storage-comparison-results.md)，2026-08-12 的同轮选型实测见 [`storage-selection-report.md`](./storage-selection-report.md)。本文保留用于记录当时的方法与边界。
 >
 > 目标：保留现有 `i8g.4xlarge + local NVMe` 集群不变，在同一 EKS、Operator、Keeper、监控和压测节点上增加独立的 `r8g.4xlarge + gp3` 集群，以相同 ClickHouse 版本、拓扑、资源限制、数据集和查询比较存储性能与恢复模型。
 
