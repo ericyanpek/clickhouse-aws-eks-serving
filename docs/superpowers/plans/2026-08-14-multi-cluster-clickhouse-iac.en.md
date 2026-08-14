@@ -981,6 +981,10 @@ delete_cluster_in_k8s() {
   local ns=$1
   kubectl get namespace "$ns" >/dev/null 2>&1 || { echo "    namespace $ns absent, skipping"; return 0; }
 
+  # Capture volume IDs first: after the PV objects are gone they are unfindable.
+  local vol_ids
+  vol_ids=$(collect_volume_ids "$ns")
+
   echo "    deleting CHI in $ns (lets the operator and CSI driver release volumes)"
   kubectl -n "$ns" delete chi --all --ignore-not-found --timeout=600s || true
   # 等 Pod 真正退出，卷才会被 detach
@@ -994,10 +998,62 @@ delete_cluster_in_k8s() {
 
   echo "    deleting namespace $ns"
   kubectl delete namespace "$ns" --ignore-not-found --timeout=300s || true
+
+  # Retain means these are still billed until explicitly deleted.
+  delete_volumes "$ns" "$vol_ids"
 }
 
 # 在拆控制面之前确认卷已回收。控制面一消失，CSI 驱动随之消失，就再也没有东西
 # 能执行删卷动作，卷会永久留在账单上。
+# reclaim_policy on the gp3 classes is Retain, so deleting a PVC leaves the PV and
+# the underlying EBS volume in place, still billed. Nothing else reclaims them:
+# the volumes are created by the CSI driver, not Terraform, so they are absent
+# from state and survive `terraform destroy` and even the EKS cluster itself.
+# The default config is 3 x 3400 GiB, so leaking them costs well over $1,000 a
+# month for volumes attached to nothing.
+#
+# The volume IDs must be read BEFORE the namespace and PV objects are deleted --
+# afterwards the only way to find them is a tag sweep, which is kept below as a
+# fallback rather than the primary path.
+collect_volume_ids() {
+  local ns=$1
+  kubectl get pv -o json 2>/dev/null | python3 -c '
+import json,sys
+ns=sys.argv[1]
+for pv in json.load(sys.stdin).get("items",[]):
+    ref=(pv.get("spec",{}).get("claimRef") or {})
+    if ref.get("namespace")!=ns: continue
+    h=(pv.get("spec",{}).get("csi") or {}).get("volumeHandle")
+    if h and h.startswith("vol-"): print(h)
+' "$ns"
+}
+
+delete_volumes() {
+  local ns=$1 ids=$2 region=${AWS_REGION:-us-east-1} v
+  for v in $ids; do
+    echo "    deleting EBS volume $v (Retain left it behind)"
+    # A volume still attaching needs a moment; retry briefly rather than leaking it.
+    for _ in 1 2 3 4 5 6; do
+      aws ec2 delete-volume --volume-id "$v" --region "$region" 2>/dev/null && break
+      sleep 10
+    done
+  done
+
+  # Belt and braces: catch anything whose PV object was already gone.
+  local swept
+  swept=$(aws ec2 describe-volumes --region "$region" \
+    --filters "Name=tag:kubernetes.io/created-for/pvc/namespace,Values=$ns" "Name=status,Values=available" \
+    --query 'Volumes[].VolumeId' --output text 2>/dev/null | tr '\t' '\n' | grep -c . || true)
+  if [ "${swept:-0}" -gt 0 ]; then
+    echo "    tag sweep found $swept additional volume(s) for $ns"
+    aws ec2 describe-volumes --region "$region" \
+      --filters "Name=tag:kubernetes.io/created-for/pvc/namespace,Values=$ns" "Name=status,Values=available" \
+      --query 'Volumes[].VolumeId' --output text | tr '\t' '\n' | while read -r v; do
+      [ -n "$v" ] && aws ec2 delete-volume --volume-id "$v" --region "$region" 2>/dev/null || true
+    done
+  fi
+}
+
 verify_volumes_released() {
   local ns=$1 left
   left=$(aws ec2 describe-volumes --region "${AWS_REGION:-us-east-1}" \
