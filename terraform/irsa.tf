@@ -44,6 +44,17 @@ resource "aws_iam_role" "backup" {
 
   name               = "${var.cluster_name}-ck-${each.key}-backup"
   assume_role_policy = data.aws_iam_policy_document.backup_assume[each.key].json
+
+  lifecycle {
+    precondition {
+      # IAM caps role names at 64 characters. A variable validation block may only
+      # reference its own variable, so the combined cluster_name + key length is
+      # asserted here instead. Failing at plan beats a mid-apply IAM rejection that
+      # would leave some clusters' roles created and others not.
+      condition     = length("${var.cluster_name}-ck-${each.key}-backup") <= 64
+      error_message = "IAM role name ${var.cluster_name}-ck-${each.key}-backup exceeds 64 characters. Shorten cluster_name or the cluster key."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "backup_s3" {

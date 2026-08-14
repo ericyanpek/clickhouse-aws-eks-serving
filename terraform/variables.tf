@@ -21,8 +21,8 @@ variable "cluster_name" {
   default     = "clickhouse-eks"
 
   validation {
-    condition     = can(regex("^[a-z0-9-]{1,46}$", var.cluster_name))
-    error_message = "cluster_name must be lowercase letters, numbers, and hyphens, max 46 chars (feeds both the S3 backup bucket name and the '<name>-clickhouse-backup' IAM role, which has a 64-char limit)."
+    condition     = can(regex("^[a-z0-9-]{1,40}$", var.cluster_name))
+    error_message = "cluster_name must be lowercase letters, numbers, and hyphens, max 40 chars. It feeds the S3 backup bucket name and the per-cluster '<name>-ck-<cluster>-backup' IAM role, which has a 64-char limit."
   }
 }
 
@@ -141,6 +141,15 @@ variable "clickhouse_clusters" {
       can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.keeper_instance_type))
     ])
     error_message = "instance_type and keeper_instance_type must be Graviton families (r8g/r7g/i8g/i7g/m8g/m7g/c8g/c7g), because node groups use an ARM64 AMI."
+  }
+
+  validation {
+    # Cluster keys feed the IAM role name "<cluster_name>-ck-<key>-backup", capped by
+    # IAM at 64 characters. A validation block may only reference its own variable, so
+    # the combined length is asserted as a precondition in irsa.tf; this bounds the
+    # key's own contribution so that cluster_name keeps its documented 40-char budget.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(k) <= 20])
+    error_message = "Cluster keys must be 20 characters or fewer: they feed the IAM role name '<cluster_name>-ck-<key>-backup', which IAM caps at 64 characters."
   }
 }
 
