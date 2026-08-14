@@ -1,3 +1,35 @@
+locals {
+  # One node group per (cluster, AZ). Keys are strings, so adding or removing a
+  # cluster does not shift any other cluster's address.
+  ck_node_groups = merge([
+    for name, c in var.clickhouse_clusters : {
+      for az in c.zones : "${name}-${az}" => {
+        cluster       = name
+        az            = az
+        instance_type = c.instance_type != "" ? c.instance_type : (c.storage_profile == "ebs" ? "r8g.4xlarge" : "i8g.4xlarge")
+        # Nodes per AZ = replicas / AZ count (validation guarantees even division)
+        nodes_per_az = c.replicas / length(c.zones)
+        storage      = c.storage_profile == "ebs" ? "ebs-gp3" : "local-nvme"
+      }
+    }
+  ]...)
+
+  kp_node_groups = merge([
+    for name, c in var.clickhouse_clusters : {
+      for az in c.zones : "${name}-${az}" => {
+        cluster       = name
+        az            = az
+        instance_type = c.keeper_instance_type
+      }
+    }
+  ]...)
+
+  # gp3 StorageClasses are only needed when at least one ebs cluster exists
+  ebs_clusters = { for k, v in var.clickhouse_clusters : k => v if v.storage_profile == "ebs" }
+  # local-storage class and provisioner are only needed for local-nvme clusters
+  has_local_nvme = anytrue([for v in var.clickhouse_clusters : v.storage_profile == "local-nvme"])
+}
+
 module "eks" {
   source = "github.com/Altinity/terraform-aws-eks-clickhouse//eks?ref=v0.5.7"
 
@@ -27,16 +59,22 @@ module "eks" {
   node_pools = concat(var.enable_local_nvme ? [
     {
       name          = "clickhouse"
-      instance_type = var.clickhouse_instance_type
-      ami_type      = var.clickhouse_ami_type # ARM64 for i8g/Graviton
-      disk_size     = 50                      # root EBS; data lives on instance-store NVMe
+      instance_type = local.clickhouse_instance_type
+      ami_type      = var.clickhouse_ami_type # ARM64 for i8g/r8g Graviton
+      disk_size     = 50                      # root EBS; data lives on the gp3 data volume or instance-store NVMe
       desired_size  = 1                       # PER AZ → len(clickhouse_zones) × 1 nodes (= CHI replicasCount)
-      min_size      = 1
-      max_size      = 2                    # replacement compute only; empty local NVMe recovery requires scripts/recover-local-replica.sh
-      zones         = var.clickhouse_zones # fixed 1×3 topology: one ClickHouse replica in each AZ
+      # On the ebs profile a replacement node reattaches the existing gp3 volume, so
+      # max_size=2 is enough for a rolling replacement. On local-nvme the replacement
+      # node starts with an empty disk and needs scripts/recover-local-replica.sh.
+      min_size = 1
+      max_size = 2
+      # One node group per zone, so each is pinned to a single subnet. That is what
+      # lets a replacement node land in the same AZ as an existing gp3 volume; a
+      # multi-subnet group could place it elsewhere and fail to attach.
+      zones = var.clickhouse_zones # fixed 1×3 topology: one ClickHouse replica in each AZ
       labels = {
         "workload" = "clickhouse"
-        "storage"  = "local-nvme"
+        "storage"  = local.storage_profile_is_ebs ? "ebs-gp3" : "local-nvme"
       }
       taints = [{
         key    = "dedicated"

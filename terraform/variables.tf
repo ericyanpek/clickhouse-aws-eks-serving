@@ -56,14 +56,63 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
-variable "clickhouse_instance_type" {
-  description = "Instance type for ClickHouse nodes — ARM/Graviton local-NVMe family (i8g/im4gn/i4g). Default i8g.4xlarge (16 vCPU / 128 GiB / ~3.75TB NVMe). If you change the size, also re-tune the CHI container resources + data volume size in manifests/20-clickhouse-chi.yaml (they are hand-sized to this instance)."
-  type        = string
-  default     = "i8g.4xlarge"
+variable "clickhouse_clusters" {
+  # The map key is the cluster identifier and doubles as the node-group for_each key.
+  # Because keys are strings rather than list indexes, adding or removing a cluster
+  # cannot change another cluster's Terraform addresses -- that is the core of this design.
+  # Keys must be lowercase alphanumeric with hyphens: they become part of namespace,
+  # CHI, and StorageClass names.
+  description = "ClickHouse clusters to bring up. Defaults to a single ebs cluster; add a key to add a cluster."
+  type = map(object({
+    storage_profile      = optional(string, "ebs")
+    shards               = optional(number, 1)
+    replicas             = optional(number, 3)
+    zones                = optional(list(string), ["us-east-1b", "us-east-1c", "us-east-1d"])
+    instance_type        = optional(string, "")
+    gp3_iops             = optional(number, 20000)
+    gp3_throughput_mibps = optional(number, 1250)
+    data_volume_size_gib = optional(number, 3400)
+    clickhouse_image     = optional(string, "clickhouse/clickhouse-server:25.3")
+    keeper_image         = optional(string, "clickhouse/clickhouse-keeper:25.3")
+    cpu_request          = optional(string, "14")
+    memory_request       = optional(string, "110Gi")
+    keeper_instance_type = optional(string, "m7g.large")
+    enable_backup        = optional(bool, true)
+  }))
+
+  default = {
+    ebs = {
+      storage_profile = "ebs"
+      shards          = 1
+      replicas        = 3
+    }
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.clickhouse_clusters : can(regex("^[a-z0-9-]+$", k))])
+    error_message = "Cluster keys may contain only lowercase letters, digits, and hyphens."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.clickhouse_clusters : contains(["ebs", "local-nvme"], v.storage_profile)])
+    error_message = "storage_profile must be \"ebs\" or \"local-nvme\"."
+  }
+
+  validation {
+    # One replica per node and one node group per AZ, so replicas must divide evenly across AZs.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas % length(v.zones) == 0])
+    error_message = "replicas must be a multiple of the number of zones (each AZ carries an equal share)."
+  }
+
+  validation {
+    # gp3 hard limit: throughput may not exceed 0.25x provisioned IOPS.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.gp3_throughput_mibps <= v.gp3_iops * 0.25])
+    error_message = "gp3 throughput in MiB/s must not exceed 0.25 times the provisioned IOPS."
+  }
 }
 
 variable "enable_local_nvme" {
-  description = "Create the existing local-NVMe ClickHouse node pool. Defaults to true; set false only for an EBS-only benchmark that reuses historical NVMe results."
+  description = "Create the production ClickHouse node pool. Defaults to true; set false only for an EBS-only benchmark that reuses historical NVMe results. The pool's instance type and storage follow storage_profile."
   type        = bool
   default     = true
 }
