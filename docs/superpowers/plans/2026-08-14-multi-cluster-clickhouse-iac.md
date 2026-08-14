@@ -48,25 +48,27 @@
 
 ```hcl
 variable "clickhouse_clusters" {
-  # map 的 key 是集群标识符，同时也是节点组 for_each 的 key。因为 key 是字符串而非
-  # 列表序号，增删任一集群都不会改变其他集群的 Terraform 地址——这是本设计的核心。
-  # key 必须是小写字母、数字和连字符：它会进入 namespace、CHI 名和 StorageClass 名。
-  description = "按需拉起的 ClickHouse 集群。默认只含 ebs 一个；追加集群只需增加一个 key。"
+  # The map key is the cluster identifier and doubles as the node-group for_each key.
+  # Because keys are strings rather than list indexes, adding or removing a cluster
+  # cannot change another cluster's Terraform addresses -- that is the core of this design.
+  # Keys must be lowercase alphanumeric with hyphens: they become part of namespace,
+  # CHI, and StorageClass names.
+  description = "ClickHouse clusters to bring up. Defaults to a single ebs cluster; add a key to add a cluster."
   type = map(object({
-    storage_profile        = optional(string, "ebs")
-    shards                 = optional(number, 1)
-    replicas               = optional(number, 3)
-    zones                  = optional(list(string), ["us-east-1a", "us-east-1b", "us-east-1c"])
-    instance_type          = optional(string, "")
-    gp3_iops               = optional(number, 20000)
-    gp3_throughput_mibps   = optional(number, 1250)
-    data_volume_size_gib   = optional(number, 3400)
-    clickhouse_image       = optional(string, "clickhouse/clickhouse-server:25.3")
-    keeper_image           = optional(string, "clickhouse/clickhouse-keeper:25.3")
-    cpu_request            = optional(string, "14")
-    memory_request         = optional(string, "110Gi")
-    keeper_instance_type   = optional(string, "m7g.large")
-    enable_backup          = optional(bool, true)
+    storage_profile      = optional(string, "ebs")
+    shards               = optional(number, 1)
+    replicas             = optional(number, 3)
+    zones                = optional(list(string), ["us-east-1a", "us-east-1b", "us-east-1c"])
+    instance_type        = optional(string, "")
+    gp3_iops             = optional(number, 20000)
+    gp3_throughput_mibps = optional(number, 1250)
+    data_volume_size_gib = optional(number, 3400)
+    clickhouse_image     = optional(string, "clickhouse/clickhouse-server:25.3")
+    keeper_image         = optional(string, "clickhouse/clickhouse-keeper:25.3")
+    cpu_request          = optional(string, "14")
+    memory_request       = optional(string, "110Gi")
+    keeper_instance_type = optional(string, "m7g.large")
+    enable_backup        = optional(bool, true)
   }))
 
   default = {
@@ -79,12 +81,12 @@ variable "clickhouse_clusters" {
 
   validation {
     condition     = alltrue([for k, v in var.clickhouse_clusters : can(regex("^[a-z0-9-]+$", k))])
-    error_message = "集群 key 只能包含小写字母、数字和连字符。"
+    error_message = "Cluster keys may contain only lowercase letters, digits, and hyphens."
   }
 
   validation {
     condition     = alltrue([for k, v in var.clickhouse_clusters : contains(["ebs", "local-nvme"], v.storage_profile)])
-    error_message = "storage_profile 必须是 \"ebs\" 或 \"local-nvme\"。"
+    error_message = "storage_profile must be \"ebs\" or \"local-nvme\"."
   }
 
   validation {
@@ -115,12 +117,23 @@ variable "clickhouse_clusters" {
   }
 
   validation {
-    # gp3 硬限制：吞吐不得超过预置 IOPS 的 0.25 倍。
+    # gp3 hard limit: throughput may not exceed 0.25x provisioned IOPS.
     condition     = alltrue([for k, v in var.clickhouse_clusters : v.gp3_throughput_mibps <= v.gp3_iops * 0.25])
-    error_message = "gp3 吞吐（MiB/s）不得超过预置 IOPS 的 0.25 倍。"
+    error_message = "gp3 throughput in MiB/s must not exceed 0.25 times the provisioned IOPS."
   }
-}
-```
+
+  validation {
+    # Only Graviton families are supported: node groups use an ARM64 AMI. An x86
+    # instance type would otherwise pair with an ARM AMI and fail mid-apply with an
+    # EKS API error that names nothing the user wrote.
+    condition = alltrue([
+      for k, v in var.clickhouse_clusters :
+      can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.instance_type != "" ? v.instance_type : "r8g.4xlarge")) &&
+      can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.keeper_instance_type))
+    ])
+    error_message = "instance_type and keeper_instance_type must be Graviton families (r8g/r7g/i8g/i7g/m8g/m7g/c8g/c7g), because node groups use an ARM64 AMI."
+  }
+}```
 
 - [ ] **Step 3: 替换 eks.tf 的 locals**
 
@@ -286,9 +299,25 @@ data "aws_iam_role" "node" {
 data "aws_subnets" "private_by_az" {
   for_each = toset(var.availability_zones)
 
+  # Scoped to this cluster's VPC on purpose. Filtering by name tag alone would also
+  # match an identically named subnet in another VPC in the same account, and the
+  # extra ID would silently widen the node group across AZs -- defeating the very
+  # pinning this lookup exists to guarantee.
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_eks_cluster.this.vpc_config[0].vpc_id]
+  }
+
   filter {
     name   = "tag:Name"
     values = ["${var.cluster_name}-vpc-private-${each.key}"]
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = length(self.ids) == 1
+      error_message = "Expected exactly one private subnet named ${var.cluster_name}-vpc-private-${each.key}, found ${length(self.ids)}. Node groups must be pinned to a single subnet so an AZ-scoped gp3 volume can be reattached."
+    }
   }
 
   depends_on = [module.eks]

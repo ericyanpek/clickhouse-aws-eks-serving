@@ -10,12 +10,31 @@ data "aws_iam_role" "node" {
 # One private subnet per AZ. Single-subnet pinning is what allows a gp3 volume to
 # be reattached: the volume is AZ-scoped, so if a node group spanned several
 # subnets a replacement node could land in a different AZ and fail to attach.
+#
+# Scoped to this cluster's VPC on purpose. Filtering by name tag alone would also
+# match an identically named subnet in another VPC in the same account, and the
+# extra ID would silently widen the node group across AZs -- defeating the very
+# pinning this lookup exists to guarantee. The precondition then turns both the
+# zero-match and multi-match cases into a plan-time error naming the AZ, instead
+# of an opaque "subnet_ids required" from the EKS API at apply time.
 data "aws_subnets" "private_by_az" {
   for_each = toset(var.availability_zones)
 
   filter {
+    name   = "vpc-id"
+    values = [data.aws_eks_cluster.this.vpc_config[0].vpc_id]
+  }
+
+  filter {
     name   = "tag:Name"
     values = ["${var.cluster_name}-vpc-private-${each.key}"]
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = length(self.ids) == 1
+      error_message = "Expected exactly one private subnet named ${var.cluster_name}-vpc-private-${each.key}, found ${length(self.ids)}. Node groups must be pinned to a single subnet so an AZ-scoped gp3 volume can be reattached."
+    }
   }
 
   depends_on = [module.eks]

@@ -130,6 +130,18 @@ variable "clickhouse_clusters" {
     condition     = alltrue([for k, v in var.clickhouse_clusters : v.gp3_throughput_mibps <= v.gp3_iops * 0.25])
     error_message = "gp3 throughput in MiB/s must not exceed 0.25 times the provisioned IOPS."
   }
+
+  validation {
+    # Only Graviton families are supported: node groups use an ARM64 AMI. An x86
+    # instance type would otherwise pair with an ARM AMI and fail mid-apply with an
+    # EKS API error that names nothing the user wrote.
+    condition = alltrue([
+      for k, v in var.clickhouse_clusters :
+      can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.instance_type != "" ? v.instance_type : "r8g.4xlarge")) &&
+      can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.keeper_instance_type))
+    ])
+    error_message = "instance_type and keeper_instance_type must be Graviton families (r8g/r7g/i8g/i7g/m8g/m7g/c8g/c7g), because node groups use an ARM64 AMI."
+  }
 }
 
 variable "bench_instance_type" {
