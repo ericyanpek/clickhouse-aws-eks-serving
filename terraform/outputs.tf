@@ -25,3 +25,28 @@ output "clickhouse_namespace" {
 output "region" {
   value = var.region
 }
+
+output "clickhouse_cluster_names" {
+  description = "Configured ClickHouse cluster keys, for deploy.sh to iterate."
+  value       = keys(var.clickhouse_clusters)
+}
+
+output "clickhouse_cluster_config" {
+  description = "Per-cluster render parameters, for deploy.sh to fill the manifest templates."
+  value = {
+    for k, v in var.clickhouse_clusters : k => {
+      storage_profile      = v.storage_profile
+      storage_class        = v.storage_profile == "ebs" ? "ck-${k}-gp3" : "local-storage"
+      shards               = v.shards
+      replicas             = v.replicas
+      zones                = v.zones
+      data_volume_size_gib = v.data_volume_size_gib
+      clickhouse_image     = v.clickhouse_image
+      keeper_image         = v.keeper_image
+      cpu_request          = v.cpu_request
+      memory_request       = v.memory_request
+      enable_backup        = v.enable_backup
+      namespace            = "ck-${k}"
+    }
+  }
+}
