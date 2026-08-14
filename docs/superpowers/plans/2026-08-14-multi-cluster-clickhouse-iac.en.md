@@ -133,7 +133,8 @@ variable "clickhouse_clusters" {
     ])
     error_message = "instance_type and keeper_instance_type must be Graviton families (r8g/r7g/i8g/i7g/m8g/m7g/c8g/c7g), because node groups use an ARM64 AMI."
   }
-}```
+}
+```
 
 - [ ] **Step 3: 替换 eks.tf 的 locals**
 
