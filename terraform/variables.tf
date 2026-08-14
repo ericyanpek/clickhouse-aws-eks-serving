@@ -67,7 +67,7 @@ variable "clickhouse_clusters" {
     storage_profile      = optional(string, "ebs")
     shards               = optional(number, 1)
     replicas             = optional(number, 3)
-    zones                = optional(list(string), ["us-east-1b", "us-east-1c", "us-east-1d"])
+    zones                = optional(list(string), ["us-east-1a", "us-east-1b", "us-east-1c"])
     instance_type        = optional(string, "")
     gp3_iops             = optional(number, 20000)
     gp3_throughput_mibps = optional(number, 1250)

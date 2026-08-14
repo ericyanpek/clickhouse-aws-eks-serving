@@ -56,7 +56,7 @@ variable "clickhouse_clusters" {
     storage_profile        = optional(string, "ebs")
     shards                 = optional(number, 1)
     replicas               = optional(number, 3)
-    zones                  = optional(list(string), ["us-east-1b", "us-east-1c", "us-east-1d"])
+    zones                  = optional(list(string), ["us-east-1a", "us-east-1b", "us-east-1c"])
     instance_type          = optional(string, "")
     gp3_iops               = optional(number, 20000)
     gp3_throughput_mibps   = optional(number, 1250)
@@ -151,7 +151,7 @@ cd terraform && terraform console <<'EOF'
 local.ck_node_groups
 EOF
 ```
-Expected: 三个 key（`ebs-us-east-1b`、`ebs-us-east-1c`、`ebs-us-east-1d`），每个 `nodes_per_az = 1`、`instance_type = "r8g.4xlarge"`、`storage = "ebs-gp3"`。
+Expected: 三个 key（`ebs-us-east-1a`、`ebs-us-east-1b`、`ebs-us-east-1c`），每个 `nodes_per_az = 1`、`instance_type = "r8g.4xlarge"`、`storage = "ebs-gp3"`。
 
 - [ ] **Step 6: 提交**
 
@@ -1097,7 +1097,7 @@ kubectl -n ck-ebs get chi,chk,pods
 kubectl get nodes -L ck-cluster,workload,storage
 aws eks list-nodegroups --cluster-name clickhouse-eks --region us-east-1 --output json
 ```
-Expected: `ck-ebs` 里 3 个 ClickHouse Pod 与 3 个 Keeper Pod 全部 Running；节点组名为 `ck-ebs-us-east-1b`、`kp-ebs-us-east-1b` 等形式（**不含** `node-group-N`）。
+Expected: `ck-ebs` 里 3 个 ClickHouse Pod 与 3 个 Keeper Pod 全部 Running；节点组名为 `ck-ebs-us-east-1a`、`kp-ebs-us-east-1a` 等形式（**不含** `node-group-N`）。
 
 - [ ] **Step 4: 追加第二个正式规格集群**
 
