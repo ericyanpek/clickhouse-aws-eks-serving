@@ -164,8 +164,10 @@ if [ -n "$ONLY_CLUSTER" ]; then
 
   echo "==> destroying Terraform resources for '$ONLY_CLUSTER' only"
   # Every per-cluster resource is for_each-keyed by the cluster key, so matching the
-  # index touches nothing else. Two key shapes exist: StorageClass and IAM resources
-  # are keyed by the bare cluster key, node groups by "<cluster>-<az>".
+  # index touches nothing else. Two key shapes exist: the StorageClass is keyed by the
+  # bare cluster key, node groups by "<cluster>-<az>". The IAM resources are handled
+  # after this block instead, because -target expands to their dependencies and would
+  # take other clusters' instances with them.
   #
   # The az suffix is matched as an AZ NAME (us-east-1a), not as a wildcard. A wildcard
   # suffix would make `--cluster ebs` also match aws_eks_node_group.clickhouse
@@ -176,7 +178,7 @@ if [ -n "$ONLY_CLUSTER" ]; then
   while IFS= read -r addr; do
     [ -n "$addr" ] && targets+=(-target="$addr")
   done < <(terraform -chdir=terraform state list 2>/dev/null |
-    grep -E "^((kubernetes_storage_class\.clickhouse_gp3|aws_iam_role\.backup|aws_iam_role_policy\.backup_s3)\[\"$ONLY_CLUSTER\"\]|aws_eks_node_group\.(clickhouse|keeper)\[\"$ONLY_CLUSTER-$az_re\"\])\$" || true)
+    grep -E "^(kubernetes_storage_class\.clickhouse_gp3\[\"$ONLY_CLUSTER\"\]|aws_eks_node_group\.(clickhouse|keeper)\[\"$ONLY_CLUSTER-$az_re\"\])\$" || true)
 
   if [ ${#targets[@]} -eq 0 ]; then
     echo "    no Terraform resources found for '$ONLY_CLUSTER'"
@@ -185,6 +187,30 @@ if [ -n "$ONLY_CLUSTER" ]; then
     # another cluster its nodes, and this list is the only place that is visible.
     printf '    target: %s\n' "${targets[@]#-target=}"
     terraform -chdir=terraform destroy -auto-approve "${targets[@]}"
+  fi
+
+  # The IAM resources are handled separately, NOT via -target, because -target pulls in
+  # a resource's dependencies: aws_iam_role_policy.backup_s3 reads a policy document
+  # that depends on the shared backup bucket, so targeting the "nvme" instance made
+  # Terraform destroy the whole backup_s3 family -- including the "ebs" instance
+  # belonging to a different, live cluster. Observed on 2026-08-17.
+  #
+  # Removing them from state first and deleting them through the AWS CLI keeps the
+  # blast radius to exactly this cluster. Terraform then no longer manages objects that
+  # no longer exist, and the next apply is a no-op for the surviving clusters.
+  for addr in "aws_iam_role_policy.backup_s3[\"$ONLY_CLUSTER\"]" "aws_iam_role.backup[\"$ONLY_CLUSTER\"]"; do
+    terraform -chdir=terraform state list 2>/dev/null | grep -qxF "$addr" || continue
+    echo "    releasing $addr from state (see comment: -target would take other clusters with it)"
+    terraform -chdir=terraform state rm "$addr" >/dev/null 2>&1 || true
+  done
+
+  role_name="${CLUSTER_NAME:-clickhouse-eks}-ck-$ONLY_CLUSTER-backup"
+  if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+    echo "    deleting IAM role $role_name"
+    # An inline policy must go before its role.
+    aws iam delete-role-policy --role-name "$role_name" --policy-name s3-access >/dev/null 2>&1 || true
+    aws iam delete-role --role-name "$role_name" >/dev/null 2>&1 ||
+      echo "WARNING: could not delete IAM role $role_name; remove it manually." >&2
   fi
   echo "==> cluster '$ONLY_CLUSTER' torn down."
   echo "    NEXT: remove the '$ONLY_CLUSTER' key from clickhouse_clusters in terraform.tfvars"

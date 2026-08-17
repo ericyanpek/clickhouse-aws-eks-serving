@@ -57,7 +57,20 @@ CLUSTERS=$(terraform output -json clickhouse_cluster_names |
   python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))')
 CLUSTER_CFG=$(terraform output -json clickhouse_cluster_config)
 BACKUP_ROLES=$(terraform output -json backup_role_arns)
-eval "$(terraform output -raw configure_kubectl)"
+# Normally point kubectl at the EKS endpoint. But some networks cannot reach the
+# cluster endpoint on 443 even with a correct public-access allowlist, in which case
+# the endpoint is reached through an SSM port-forward instead. Setting KUBECONFIG to
+# a tunnel kubeconfig (server https://127.0.0.1:<port>, tls-server-name set to the
+# real endpoint host) makes every kubectl call below work unchanged.
+#
+# GODEBUG=http2client=0 is required for kubectl over such a tunnel. Note it does NOT
+# help the Terraform kubernetes/helm providers: those configure HTTP/2 through
+# client-go's x/net/http2, which ignores that flag and reads DISABLE_HTTP2 instead.
+if [ -n "${KUBECONFIG:-}" ] && [ -f "${KUBECONFIG}" ]; then
+  echo "==> using existing KUBECONFIG=$KUBECONFIG (not overwriting it)"
+else
+  eval "$(terraform output -raw configure_kubectl)"
+fi
 cd ..
 
 [ -n "$CLUSTERS" ] || {
@@ -161,6 +174,19 @@ render_chi() {
 
   render "$out.pre" "$out" "$cluster" || return 1
   rm -f "$out.pre"
+}
+
+# `kubectl wait` on a label selector exits non-zero immediately if nothing matches,
+# so a resource the operator has not created yet reads as a hard failure. Poll until
+# at least one pod exists before handing over to `kubectl wait`.
+wait_keeper_pods_exist() {
+  local ns=$1 n attempt
+  for attempt in $(seq 1 60); do
+    n=$(kubectl -n "$ns" get pods -l app=clickhouse-keeper --no-headers 2>/dev/null | grep -c . || true)
+    [ "${n:-0}" -gt 0 ] && return 0
+    [ "$attempt" -eq 60 ] || sleep 5
+  done
+  return 1
 }
 
 # Count Ready nodes carrying a label set. Always prints a number, so a transient
@@ -326,6 +352,18 @@ for cluster in $CLUSTERS; do
 
   # 7. Keeper quorum before the CHI. Applying the CHI against a Keeper that has not
   #    formed a quorum makes the ClickHouse pods crash-loop on coordination errors.
+  #
+  #    `kubectl wait` on a label selector FAILS IMMEDIATELY when no pod matches yet,
+  #    reporting "no matching resources found" rather than waiting. The operator
+  #    creates the Keeper StatefulSet asynchronously, so the pods do not exist for
+  #    several seconds after the CHK is applied. Poll for their existence first, then
+  #    wait on readiness.
+  echo "    waiting for Keeper pods to be created in $ns"
+  wait_keeper_pods_exist "$ns" || {
+    echo "ERROR[$cluster]: the operator never created Keeper pods in $ns; check the CHK status." >&2
+    exit 1
+  }
+
   echo "    waiting for Keeper quorum in $ns"
   kubectl -n "$ns" wait --for=condition=Ready pod -l app=clickhouse-keeper --timeout=600s || {
     echo "ERROR[$cluster]: Keeper did not reach Ready; refusing to apply the CHI." >&2
@@ -333,6 +371,12 @@ for cluster in $CLUSTERS; do
   }
 
   kubectl apply -f "$dir/chi.yaml"
+  # TODO: same race as the Keeper wait below -- the operator creates replicas ONE AT A
+  # TIME, so `kubectl wait` returns as soon as the first pod is Ready while replicas 2
+  # and 3 do not exist yet, and the smoke test then runs against an incomplete cluster.
+  # Observed on both clusters during the 2026-08-17 end-to-end run. Fix by polling
+  # until the pod count reaches shards x replicas before waiting on readiness, the way
+  # wait_keeper_pods_exist does.
   echo "    waiting for ClickHouse pods in $ns"
   kubectl -n "$ns" wait --for=condition=Ready pod -l "clickhouse.altinity.com/chi=$cluster" --timeout=900s ||
     echo "WARNING[$cluster]: pods not all Ready within timeout; check kubectl -n $ns get pods" >&2

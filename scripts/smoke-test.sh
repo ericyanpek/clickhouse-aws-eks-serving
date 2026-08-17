@@ -21,6 +21,10 @@ POD=$(kubectl -n "$NS" get pods -l "clickhouse.altinity.com/chi=$CHI" \
 }
 echo "==> target: namespace=$NS chi=$CHI pod=$POD logical cluster=$LOGICAL_CLUSTER"
 
+# TODO: these connect as ClickHouse's default user, with no credentials, so the smoke
+# test never exercises the admin password. A botched REPLACE_WITH_ADMIN_SHA256
+# substitution would still pass. Pass --user admin --password from deploy.sh to close
+# that gap.
 run() { kubectl -n "$NS" exec "$POD" -c clickhouse -- clickhouse-client -q "$1"; }
 run_on() { kubectl -n "$NS" exec "$1" -c clickhouse -- clickhouse-client -q "$2"; }
 

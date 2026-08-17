@@ -12,7 +12,12 @@ spec:
   configuration:
     zookeeper:
       nodes:
-        - host: keeper-__CLUSTER__-keeper.__NAMESPACE__.svc.cluster.local
+        # The operator names the Keeper client Service "keeper-<chk cluster>-<chk name>".
+        # The CHK is named keeper-__CLUSTER__ and its internal cluster is "keeper", so
+        # the Service is keeper-keeper-__CLUSTER__ -- NOT keeper-__CLUSTER__-keeper.
+        # Getting this backwards leaves the operator retrying DNS forever and no
+        # ClickHouse StatefulSet is ever created.
+        - host: keeper-keeper-__CLUSTER__.__NAMESPACE__.svc.cluster.local
           port: 2181
       # Per-cluster coordination root: clusters must never share ZooKeeper paths,
       # even if they were ever pointed at the same Keeper ensemble.
