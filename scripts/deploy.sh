@@ -195,6 +195,20 @@ wait_pods_exist() {
   return 1
 }
 
+# The CHI status goes InProgress -> Completed. Completed is the operator's signal that
+# it has finished reconciling, which includes distributing remote_servers to every
+# replica -- the config system.clusters is read from.
+wait_chi_completed() {
+  local ns=$1 chi=$2 st attempt
+  for attempt in $(seq 1 60); do
+    st=$(kubectl -n "$ns" get chi "$chi" -o jsonpath='{.status.status}' 2>/dev/null || true)
+    [ "$st" = "Completed" ] && return 0
+    [ "$attempt" -eq 60 ] || sleep 5
+  done
+  echo "        CHI $chi still reports '${st:-unknown}' after 5 minutes" >&2
+  return 1
+}
+
 # Count Ready nodes carrying a label set. Always prints a number, so a transient
 # kubectl failure cannot make an arithmetic comparison explode.
 ready_nodes() {
@@ -388,6 +402,16 @@ for cluster in $CLUSTERS; do
   echo "    waiting for ClickHouse pods in $ns"
   kubectl -n "$ns" wait --for=condition=Ready pod -l "clickhouse.altinity.com/chi=$cluster" --timeout=900s ||
     echo "WARNING[$cluster]: pods not all Ready within timeout; check kubectl -n $ns get pods" >&2
+
+  # Pods being Ready is still not enough. system.clusters is read from the
+  # remote_servers config the operator distributes to every replica, and that lands
+  # AFTER the pods pass their readiness probe. Running the smoke test in between sees a
+  # one-row cluster and fails the topology assertion on a cluster that is actually fine.
+  # The CHI reporting Completed is the operator's own signal that reconciliation, config
+  # distribution included, has finished.
+  echo "    waiting for CHI '$cluster' to report Completed (config distribution)"
+  wait_chi_completed "$ns" "$cluster" ||
+    echo "WARNING[$cluster]: CHI did not reach Completed; the topology check may see a partial cluster" >&2
 
   # Pass the password so the smoke test authenticates as admin and therefore verifies
   # the credential this script rendered into the CHI.

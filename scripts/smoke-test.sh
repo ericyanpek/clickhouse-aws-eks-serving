@@ -40,8 +40,41 @@ fi
 run() { kubectl -n "$NS" exec "$POD" -c clickhouse -- clickhouse-client "${CH_AUTH[@]}" -q "$1"; }
 run_on() { kubectl -n "$NS" exec "$1" -c clickhouse -- clickhouse-client "${CH_AUTH[@]}" -q "$2"; }
 
-echo "==> cluster topology"
+# Topology is asserted FIRST and unconditionally.
+#
+# It has to come before any writes: with an incomplete cluster the inserts below still
+# succeed -- 1000 rows land wherever the cluster currently claims to be -- so every
+# later check passes and a half-configured cluster ships as healthy.
+#
+# The expected numbers come from the CHI itself rather than the caller. An env var the
+# caller may omit turns the strongest check in this script into a no-op precisely when
+# someone forgets to pass it, and a caller echoing back its own rendered value cannot
+# catch a template that rendered the wrong topology in the first place.
+#
+# system.clusters holds ONE ROW PER HOST, i.e. one per (shard, replica) pair, so the
+# expected count is shards x replicas.
+EXPECTED_SHARDS=$(kubectl -n "$NS" get chi "$CHI" -o jsonpath='{.spec.configuration.clusters[0].layout.shardsCount}' 2>/dev/null)
+EXPECTED_REPLICAS=$(kubectl -n "$NS" get chi "$CHI" -o jsonpath='{.spec.configuration.clusters[0].layout.replicasCount}' 2>/dev/null)
+if ! [ "${EXPECTED_SHARDS:-}" -ge 1 ] 2>/dev/null || ! [ "${EXPECTED_REPLICAS:-}" -ge 1 ] 2>/dev/null; then
+  echo "ERROR: could not read shardsCount/replicasCount from CHI '$CHI' in $NS." >&2
+  echo "       Refusing to run: without the declared topology this test cannot tell a" >&2
+  echo "       complete cluster from a half-configured one." >&2
+  exit 1
+fi
+EXPECTED_HOSTS=$((EXPECTED_SHARDS * EXPECTED_REPLICAS))
+
+echo "==> cluster topology (CHI declares ${EXPECTED_SHARDS}x${EXPECTED_REPLICAS} = $EXPECTED_HOSTS host(s))"
 run "SELECT cluster, shard_num, replica_num, host_name FROM system.clusters WHERE cluster='$LOGICAL_CLUSTER' ORDER BY shard_num, replica_num"
+
+ACTUAL_HOSTS=$(run "SELECT count() FROM system.clusters WHERE cluster='$LOGICAL_CLUSTER'" | tr -d '[:space:]')
+if [ "$ACTUAL_HOSTS" != "$EXPECTED_HOSTS" ]; then
+  echo "==> SMOKE TEST FAILED (system.clusters has $ACTUAL_HOSTS host row(s) for '$LOGICAL_CLUSTER', expected $EXPECTED_HOSTS)" >&2
+  echo "    A count below the expected value usually means remote_servers has not been" >&2
+  echo "    distributed to every replica yet, so the cluster is incomplete rather than" >&2
+  echo "    misconfigured. deploy.sh waits for the CHI to report Completed to avoid this." >&2
+  exit 1
+fi
+echo "==> topology verified: $ACTUAL_HOSTS host row(s) = ${EXPECTED_SHARDS}x${EXPECTED_REPLICAS}"
 
 echo "==> create replicated + distributed tables"
 run "CREATE TABLE IF NOT EXISTS default.t_local ON CLUSTER $LOGICAL_CLUSTER (id UInt64, v String)
@@ -49,18 +82,41 @@ run "CREATE TABLE IF NOT EXISTS default.t_local ON CLUSTER $LOGICAL_CLUSTER (id 
 run "CREATE TABLE IF NOT EXISTS default.t_dist ON CLUSTER $LOGICAL_CLUSTER AS default.t_local
      ENGINE=Distributed($LOGICAL_CLUSTER, default, t_local, rand())"
 
-echo "==> insert via distributed table"
-run "INSERT INTO default.t_dist SELECT number, toString(number) FROM numbers(1000)"
-sleep 3
+EXPECTED_ROWS=1000
+echo "==> insert via distributed table ($EXPECTED_ROWS rows)"
+run "INSERT INTO default.t_dist SELECT number, toString(number) FROM numbers($EXPECTED_ROWS)"
 
-# Replication is only observable with a second replica of the same shard. The operator
-# names it chi-<chi>-<cluster>-<shard>-<replica>, so shard 0's peer is ...-0-1.
-PEER="chi-$CHI-$LOGICAL_CLUSTER-0-1"
-if kubectl -n "$NS" get pod "$PEER" >/dev/null 2>&1; then
+# Replication is only observable with a second replica of the same shard.
+#
+# The pod name is chi-<chi>-<cluster>-<shard>-<replica>-<ordinal>, and the trailing
+# ordinal is easy to forget: "chi-ebs-main-0-1" looks right but matches nothing, so the
+# `get pod` below fails, the check is skipped, and the run still reports PASSED. That is
+# exactly what happened until 2026-08-17 -- the cross-replica check never once executed.
+# Selecting by label instead of constructing the name avoids re-deriving the convention.
+PEER=$(kubectl -n "$NS" get pods -l "clickhouse.altinity.com/chi=$CHI" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null |
+  grep -E "^chi-$CHI-$LOGICAL_CLUSTER-0-1-[0-9]+$" | head -1)
+if [ -n "$PEER" ]; then
   echo "==> verify replication (query the OTHER replica of shard 0: $PEER)"
-  run_on "$PEER" "SELECT count() FROM default.t_local"
+  # The result must be ASSERTED, not just printed. Reading 0 rows here means
+  # replication is broken, yet the run used to continue and pass: the distributed
+  # count below is served by the replica that already has the data.
+  #
+  # Replication is asynchronous, so poll rather than reading once.
+  PEER_ROWS=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    PEER_ROWS=$(run_on "$PEER" "SELECT count() FROM default.t_local" | tr -d '[:space:]')
+    [ "${PEER_ROWS:-0}" = "$EXPECTED_ROWS" ] && break
+    sleep 3
+  done
+  if [ "${PEER_ROWS:-0}" != "$EXPECTED_ROWS" ]; then
+    echo "==> SMOKE TEST FAILED (replica $PEER has ${PEER_ROWS:-0} row(s), expected $EXPECTED_ROWS)" >&2
+    echo "    The write reached one replica but did not replicate within 30s." >&2
+    exit 1
+  fi
+  echo "==> replication verified: $PEER has $PEER_ROWS row(s)"
 else
-  echo "==> single replica per shard ($PEER absent); skipping cross-replica check"
+  echo "==> single replica per shard 0 (no ...-0-1-N pod); skipping cross-replica check"
 fi
 
 # Total across all shards must still be 1000: with 1 shard the Distributed table is a
@@ -73,26 +129,11 @@ echo "==> replication health"
 run "SELECT database, table, is_readonly, absolute_delay FROM system.replicas WHERE table='t_local'"
 REPLICA_ROWS=$(run "SELECT count() FROM system.replicas WHERE table='t_local'" | tr -d '[:space:]')
 
-if [ "$DIST_COUNT" = "1000" ] && [ "$REPLICA_ROWS" -gt 0 ] 2>/dev/null; then
-  echo "==> data path OK (distributed count=1000, replicas registered=$REPLICA_ROWS)"
+if [ "$DIST_COUNT" = "$EXPECTED_ROWS" ] && [ "${REPLICA_ROWS:-0}" -gt 0 ] 2>/dev/null; then
+  echo "==> data path OK (distributed count=$DIST_COUNT, replicas registered=$REPLICA_ROWS)"
 else
-  echo "==> SMOKE TEST FAILED (distributed count=$DIST_COUNT expected 1000; replicas=$REPLICA_ROWS expected >0)" >&2
+  echo "==> SMOKE TEST FAILED (distributed count=$DIST_COUNT expected $EXPECTED_ROWS; replicas=$REPLICA_ROWS expected >0)" >&2
   exit 1
-fi
-
-# Optional topology assertion. system.clusters holds ONE ROW PER HOST, i.e. one row for
-# every (shard, replica) pair, so the expected count is shards x replicas -- not
-# replicas. Without this a template rendered with the wrong shardsCount/replicasCount
-# still passes every check above, because 1000 rows land wherever the cluster says.
-if [ -n "${EXPECTED_REPLICAS:-}" ]; then
-  EXPECTED_SHARDS=${EXPECTED_SHARDS:-1}
-  EXPECTED_HOSTS=$((EXPECTED_SHARDS * EXPECTED_REPLICAS))
-  ACTUAL=$(run "SELECT count() FROM system.clusters WHERE cluster='$LOGICAL_CLUSTER'" | tr -d '[:space:]')
-  if [ "$ACTUAL" != "$EXPECTED_HOSTS" ]; then
-    echo "==> SMOKE TEST FAILED (system.clusters has $ACTUAL host row(s) for '$LOGICAL_CLUSTER', expected $EXPECTED_HOSTS = ${EXPECTED_SHARDS} shard(s) x ${EXPECTED_REPLICAS} replica(s))" >&2
-    exit 1
-  fi
-  echo "==> topology verified: $ACTUAL host row(s) = ${EXPECTED_SHARDS}x${EXPECTED_REPLICAS}"
 fi
 
 echo "==> SMOKE TEST PASSED ($NS/$CHI)"
