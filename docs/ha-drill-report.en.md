@@ -129,7 +129,7 @@ Neither defect is limited to drills:
 
 In short, "highly available" was configured as "unmaintainable".
 
-**The same defect exists in the production 1×3 manifest** [`20-clickhouse-chi.yaml`](../manifests/20-clickhouse-chi.yaml). A 1×3 topology can arithmetically tolerate `minAvailable: 2`, so defect 2 does not apply there; but **defect 1 is independent of replica count**, and an overlapping PDB makes pods permanently unevictable on 1×3 just the same.
+**The same defect exists in the production 1×3 manifest** [`20-clickhouse-chi.yaml`](../manifests/templates/20-clickhouse-chi.yaml.tmpl). A 1×3 topology can arithmetically tolerate `minAvailable: 2`, so defect 2 does not apply there; but **defect 1 is independent of replica count**, and an overlapping PDB makes pods permanently unevictable on 1×3 just the same.
 
 ### 7.4 Fix
 

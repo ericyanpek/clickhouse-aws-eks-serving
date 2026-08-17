@@ -129,7 +129,7 @@ chi-ch-local-mainlocal   N/A             1                 1
 
 即把「高可用」配置成了「不可运维」。
 
-**该缺陷同样存在于生产 1×3 manifest** [`20-clickhouse-chi.yaml`](../manifests/20-clickhouse-chi.yaml)。1×3 拓扑在算术上能够承受 `minAvailable: 2`，因此缺陷二不适用；但**缺陷一与副本数无关**，重叠 PDB 在 1×3 上同样使 Pod 永久不可驱逐。
+**该缺陷同样存在于生产 1×3 manifest** [`20-clickhouse-chi.yaml`](../manifests/templates/20-clickhouse-chi.yaml.tmpl)。1×3 拓扑在算术上能够承受 `minAvailable: 2`，因此缺陷二不适用；但**缺陷一与副本数无关**，重叠 PDB 在 1×3 上同样使 Pod 永久不可驱逐。
 
 ### 7.4 修复
 

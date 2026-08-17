@@ -10,7 +10,7 @@
 
 The current IaC can only bring up **one** cluster with a fixed 1 shard × 3 replicas topology:
 
-- [`manifests/20-clickhouse-chi.yaml`](../../../manifests/20-clickhouse-chi.yaml) is static YAML with `shardsCount: 1` and `replicasCount: 3` hardcoded, along with fixed name and namespace.
+- [`manifests/templates/20-clickhouse-chi.yaml.tmpl`](../../../manifests/templates/20-clickhouse-chi.yaml.tmpl) is static YAML with `shardsCount: 1` and `replicasCount: 3` hardcoded, along with fixed name and namespace.
 - Node pools are managed by the upstream Altinity module, which keys node groups by **list index**.
 - IRSA, backup, and StorageClass all assume a single cluster in a single namespace.
 

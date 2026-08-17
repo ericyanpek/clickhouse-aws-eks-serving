@@ -10,7 +10,7 @@
 
 当前 IaC 只能拉起**一个**固定 1 shard × 3 replicas 的集群：
 
-- [`manifests/20-clickhouse-chi.yaml`](../../../manifests/20-clickhouse-chi.yaml) 是静态 YAML，`shardsCount: 1` 与 `replicasCount: 3` 写死，名称与 namespace 也是固定值。
+- [`manifests/templates/20-clickhouse-chi.yaml.tmpl`](../../../manifests/templates/20-clickhouse-chi.yaml.tmpl) 是静态 YAML，`shardsCount: 1` 与 `replicasCount: 3` 写死，名称与 namespace 也是固定值。
 - 节点池由上游 Altinity 模块管理，而该模块以**列表序号**为节点组的 key。
 - IRSA、备份、StorageClass 均假定单一集群、单一 namespace。
 

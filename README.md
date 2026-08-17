@@ -92,7 +92,7 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 
 ### 4.3 数据卷选型：EBS gp3 与本地 NVMe
 
-> **仓库当前默认仍是本地 NVMe。** `./scripts/deploy.sh` 部署的 [生产 CHI](./manifests/20-clickhouse-chi.yaml) 使用 `local-storage`。下述**推荐**来自 2026-08-12/13 的实测，采纳它需要按 4.3.4 手工切换存储类，尚未成为仓库默认值。
+> **仓库当前默认仍是本地 NVMe。** `./scripts/deploy.sh` 部署的 [生产 CHI](./manifests/templates/20-clickhouse-chi.yaml.tmpl) 使用 `local-storage`。下述**推荐**来自 2026-08-12/13 的实测，采纳它需要按 4.3.4 手工切换存储类，尚未成为仓库默认值。
 
 #### 4.3.1 实测结论
 
@@ -182,7 +182,7 @@ public_access_cidrs = ["203.0.113.0/24"]
 
 `availability_zones` 和 `clickhouse_zones` 必须是同一区域内三个真实、不同的 AZ。`public_access_cidrs` 默认值会开放 EKS 公网 API，生产环境必须收紧。
 
-资源值按 `i8g.4xlarge` 定尺。切换实例类型时必须同步调整 [ClickHouse manifest](./manifests/20-clickhouse-chi.yaml) 中的 CPU、内存和 PVC 容量。
+资源值按 `i8g.4xlarge` 定尺。切换实例类型时必须同步调整 [ClickHouse manifest](./manifests/templates/20-clickhouse-chi.yaml.tmpl) 中的 CPU、内存和 PVC 容量。
 
 ## 8. 部署
 

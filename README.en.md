@@ -92,7 +92,7 @@ The default strategy is to scale up before sharding. Adding a shard does not aut
 
 ### 4.3 Data Volume Selection: EBS gp3 versus Local NVMe
 
-> **The repository still defaults to local NVMe.** `./scripts/deploy.sh` deploys the [production CHI](./manifests/20-clickhouse-chi.yaml) with `local-storage`. The **recommendation** below comes from the 2026-08-12/13 measurements; adopting it requires the manual storage-class switch described in 4.3.4 and is not yet the repository default.
+> **The repository still defaults to local NVMe.** `./scripts/deploy.sh` deploys the [production CHI](./manifests/templates/20-clickhouse-chi.yaml.tmpl) with `local-storage`. The **recommendation** below comes from the 2026-08-12/13 measurements; adopting it requires the manual storage-class switch described in 4.3.4 and is not yet the repository default.
 
 #### 4.3.1 Measured Results
 
@@ -184,7 +184,7 @@ public_access_cidrs = ["203.0.113.0/24"]
 
 `availability_zones` and `clickhouse_zones` must contain three real, distinct AZs in the same region. The default `public_access_cidrs` exposes the EKS public API and must be restricted for production.
 
-Resources are sized for `i8g.4xlarge`. When changing instance type, also update CPU, memory, and PVC capacity in the [ClickHouse manifest](./manifests/20-clickhouse-chi.yaml).
+Resources are sized for `i8g.4xlarge`. When changing instance type, also update CPU, memory, and PVC capacity in the [ClickHouse manifest](./manifests/templates/20-clickhouse-chi.yaml.tmpl).
 
 ## 8. Deployment
 
