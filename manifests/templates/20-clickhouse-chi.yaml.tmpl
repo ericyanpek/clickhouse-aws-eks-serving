@@ -55,9 +55,12 @@ spec:
     podTemplates:
       - name: ch-pod
         spec:
-          # backup sidecar assumes the S3 IAM role via IRSA through this SA
-          # (created in 30-backup-cronjob.yaml — must be applied before this CHI).
-          serviceAccountName: clickhouse-backup
+          # Rendered only when the cluster has enable_backup = true. The backup sidecar
+          # assumes the S3 IAM role via IRSA through this SA, which the backup manifest
+          # creates and which must therefore be applied before this CHI. With backup
+          # disabled both this line and the sidecar are rendered away, because a pod
+          # referencing a missing ServiceAccount is rejected by admission.
+          __SERVICE_ACCOUNT_LINE__
           nodeSelector:
             workload: clickhouse
             ck-cluster: __CLUSTER__
@@ -99,38 +102,7 @@ spec:
                   memory: "__MEMORY_REQUEST__"
                 limits:
                   memory: "__MEMORY_REQUEST__"
-            - name: clickhouse-backup
-              image: "altinity/clickhouse-backup:2.6.0"
-              args: ["server"]
-              resources:
-                requests:
-                  cpu: "100m"
-                  memory: "256Mi"
-                limits:
-                  cpu: "500m"
-                  memory: "512Mi"
-              env:
-                - name: LOG_LEVEL
-                  value: "info"
-                - name: REMOTE_STORAGE
-                  value: "s3"
-                - name: S3_BUCKET
-                  valueFrom:
-                    configMapKeyRef:
-                      name: clickhouse-backup-config
-                      key: S3_BUCKET
-                - name: S3_REGION
-                  valueFrom:
-                    configMapKeyRef:
-                      name: clickhouse-backup-config
-                      key: S3_REGION
-                - name: S3_PATH
-                  # Must match the cluster's own S3 prefix: the backup IAM role is
-                  # scoped to s3://<bucket>/<cluster>/*, so any other path is denied.
-                  value: "__CLUSTER__"
-              ports:
-                - name: backup-rest
-                  containerPort: 7171
+            __BACKUP_SIDECAR__
     volumeClaimTemplates:
       - name: ch-data
         spec:

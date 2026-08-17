@@ -126,6 +126,43 @@ render() {
   sed "${sed_args[@]}" "$tmpl" >"$out"
 }
 
+# The CHI carries two backup-only pieces: a serviceAccountName and the sidecar
+# container. Both must disappear when a cluster has enable_backup = false, because
+# the ServiceAccount and ConfigMap they reference are created by the backup manifest
+# alone -- a pod naming a missing ServiceAccount is rejected by admission, so the
+# StatefulSet would never produce a single pod.
+#
+# The sidecar is substituted from a fragment file rather than inline: it is 32 lines
+# of indented YAML, and sed's `s` command cannot introduce newlines portably.
+render_chi() {
+  local out=$1 cluster=$2 want_backup=$3
+  local frag=manifests/templates/20-clickhouse-chi-backup-sidecar.yaml.frag
+
+  if [ "$want_backup" = "true" ]; then
+    [ -f "$frag" ] || {
+      echo "ERROR[$cluster]: backup sidecar fragment $frag is missing." >&2
+      return 1
+    }
+    # Splice the fragment in BEFORE substituting, so its own placeholders (the
+    # sidecar's S3_PATH is __CLUSTER__) get rendered along with the rest. Appending
+    # after substitution would ship a literal __CLUSTER__ as the S3 path, which the
+    # cluster-scoped backup IAM role then denies on every upload.
+    #
+    # `r` appends the file after the marker line and `d` removes the marker, so the
+    # fragment keeps exactly the indentation it was written with.
+    sed -e "/__BACKUP_SIDECAR__/r $frag" -e "/__BACKUP_SIDECAR__/d" \
+      -e "s|__SERVICE_ACCOUNT_LINE__|serviceAccountName: clickhouse-backup|" \
+      manifests/templates/20-clickhouse-chi.yaml.tmpl >"$out.pre"
+  else
+    # Drop the sidecar marker entirely, and the serviceAccountName line with it.
+    sed -e "/__BACKUP_SIDECAR__/d" -e "/__SERVICE_ACCOUNT_LINE__/d" \
+      manifests/templates/20-clickhouse-chi.yaml.tmpl >"$out.pre"
+  fi
+
+  render "$out.pre" "$out" "$cluster" || return 1
+  rm -f "$out.pre"
+}
+
 # Count Ready nodes carrying a label set. Always prints a number, so a transient
 # kubectl failure cannot make an arithmetic comparison explode.
 ready_nodes() {
@@ -241,15 +278,16 @@ for cluster in $CLUSTERS; do
   dir="$tmpdir/$cluster"
   mkdir -p "$dir"
 
+  backup_enabled=$(cfg_bool "$cluster" enable_backup)
+
   render manifests/templates/10-keeper-chk.yaml.tmpl "$dir/chk.yaml" "$cluster"
-  render manifests/templates/20-clickhouse-chi.yaml.tmpl "$dir/chi.yaml" "$cluster"
+  render_chi "$dir/chi.yaml" "$cluster" "$backup_enabled"
   rendered=("$dir/chk.yaml" "$dir/chi.yaml")
 
   # Second substitution pass, over the RENDERED files: secrets and account-specific
   # values never pass through the templates on disk.
   sed -i.bak "s|REPLACE_WITH_ADMIN_SHA256|$ADMIN_SHA|g" "$dir/chi.yaml"
 
-  backup_enabled=$(cfg_bool "$cluster" enable_backup)
   if [ "$backup_enabled" = "true" ]; then
     role_arn=$(backup_role_arn "$cluster")
     [ -n "$role_arn" ] || {
@@ -264,16 +302,9 @@ for cluster in $CLUSTERS; do
       "$dir/backup.yaml"
     rendered+=("$dir/backup.yaml")
   else
-    echo "    backup disabled for '$cluster'; skipping the backup ServiceAccount/ConfigMap/CronJob"
-    # KNOWN GAP: 20-clickhouse-chi.yaml.tmpl unconditionally sets
-    # serviceAccountName: clickhouse-backup and runs a sidecar that reads the
-    # clickhouse-backup-config ConfigMap. Both objects live in the backup manifest, so
-    # with enable_backup = false the StatefulSet cannot create pods (the ServiceAccount
-    # admission plugin rejects them) and the sidecar would hit CreateContainerConfigError.
-    # Warn rather than fail: the fix belongs in the template, not here.
-    echo "WARNING[$cluster]: enable_backup = false, but the CHI template still requires the" >&2
-    echo "         'clickhouse-backup' ServiceAccount and 'clickhouse-backup-config' ConfigMap." >&2
-    echo "         Pods will not start until the template is made backup-optional." >&2
+    # render_chi already dropped the serviceAccountName line and the sidecar, so the
+    # pod spec no longer references anything the backup manifest would have created.
+    echo "    backup disabled for '$cluster'; ServiceAccount, ConfigMap, CronJob and sidecar all omitted"
   fi
   rm -f "$dir"/*.bak
 
