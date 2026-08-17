@@ -163,18 +163,27 @@ if [ -n "$ONLY_CLUSTER" ]; then
   verify_volumes_released "$ns" || echo "WARNING: continuing despite unreleased volumes in $ns" >&2
 
   echo "==> destroying Terraform resources for '$ONLY_CLUSTER' only"
-  # Every per-cluster resource is for_each-keyed by the cluster key, so targeting
-  # addresses whose index starts with ["<key> touches nothing else. Discover them from
-  # state rather than listing addresses that may not exist (a missing -target fails).
+  # Every per-cluster resource is for_each-keyed by the cluster key, so matching the
+  # index touches nothing else. Two key shapes exist: StorageClass and IAM resources
+  # are keyed by the bare cluster key, node groups by "<cluster>-<az>".
+  #
+  # The az suffix is matched as an AZ NAME (us-east-1a), not as a wildcard. A wildcard
+  # suffix would make `--cluster ebs` also match aws_eks_node_group.clickhouse
+  # ["ebs-cold-us-east-1a"] and silently destroy a different, live cluster's nodes.
+  # Everything is fully anchored for the same reason.
+  az_re='[a-z]{2}-[a-z]+-[0-9]+[a-z]'
   targets=()
   while IFS= read -r addr; do
     [ -n "$addr" ] && targets+=(-target="$addr")
   done < <(terraform -chdir=terraform state list 2>/dev/null |
-    grep -E "^(aws_eks_node_group\.(clickhouse|keeper)|kubernetes_storage_class\.clickhouse_gp3|aws_iam_role\.backup|aws_iam_role_policy\.backup_s3)\[\"$ONLY_CLUSTER" || true)
+    grep -E "^((kubernetes_storage_class\.clickhouse_gp3|aws_iam_role\.backup|aws_iam_role_policy\.backup_s3)\[\"$ONLY_CLUSTER\"\]|aws_eks_node_group\.(clickhouse|keeper)\[\"$ONLY_CLUSTER-$az_re\"\])\$" || true)
 
   if [ ${#targets[@]} -eq 0 ]; then
     echo "    no Terraform resources found for '$ONLY_CLUSTER'"
   else
+    # Print the matched addresses before destroying: an over-broad match here costs
+    # another cluster its nodes, and this list is the only place that is visible.
+    printf '    target: %s\n' "${targets[@]#-target=}"
     terraform -chdir=terraform destroy -auto-approve "${targets[@]}"
   fi
   echo "==> cluster '$ONLY_CLUSTER' torn down."
