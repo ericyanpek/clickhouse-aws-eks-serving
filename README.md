@@ -215,12 +215,45 @@ CLICKHOUSE_ADMIN_PASSWORD='...' AUTO_APPROVE=true ./scripts/deploy.sh
 
 部署顺序：
 
-1. 创建 VPC、EKS、节点组、S3 备份桶和 IRSA。
-2. 安装 operator、监控和 local-static-provisioner。
-3. 用 DaemonSet 格式化并挂载 ClickHouse 节点的 instance-store NVMe。
-4. 按 namespace、备份配置、Keeper、ClickHouse、Grafana dashboard 的顺序应用 manifest。
+1. 两阶段 `terraform apply`：先只建 AWS 基础设施（VPC、EKS、节点组、S3、IRSA），再建集群内资源。分两步是因为 kubernetes/helm provider 需要一个已存在的 EKS API 端点。
+2. 安装 operator、监控，以及仅在存在 `local-nvme` 集群时才需要的 local-static-provisioner。
+3. 对 `clickhouse_clusters` 中的**每个集群**依次执行：7 项前置校验 → 渲染 CHK/CHI 模板 → 按序 apply（namespace → 备份 → Keeper → 等 quorum → CHI）→ 等待 Pod → smoke test。
+4. 最后应用一次共享的 Grafana dashboard。
 
-不要直接应用仓库中的 CHI；其中的 `REPLACE_WITH_ADMIN_SHA256` 必须由部署流程替换。
+前置校验会在 apply CHI **之前**拦住已知的失败模式：StorageClass 缺失或 `volumeBindingMode` 不对（会让 PVC 永久 Pending）、节点数不足 `shards × replicas`、占位符残留、Keeper 未达 quorum。
+
+不要直接应用 `manifests/templates/` 下的模板；其中的占位符必须由部署流程渲染。
+
+### 8.1 追加或移除一个集群
+
+集群集合就是 `clickhouse_clusters` 这个 map，**追加一个集群只需增加一个 key**：
+
+```hcl
+clickhouse_clusters = {
+  ebs = {
+    storage_profile = "ebs"
+    shards          = 1
+    replicas        = 3
+  }
+  nvme = {
+    storage_profile = "local-nvme"
+    shards          = 1
+    replicas        = 3
+  }
+}
+```
+
+然后重跑 `./scripts/deploy.sh`。已有集群不会被触碰——节点组按字符串 key 编址（`ck-<集群>-<AZ>`），不是按列表序号，所以增删任一集群都不会让其他集群的资源地址位移。
+
+移除单个集群：
+
+```bash
+./scripts/teardown.sh --cluster nvme
+```
+
+它只删该集群的 CHI、Keeper、namespace、节点组和 StorageClass，并回收 `Retain` 策略遗留的 EBS 卷。完成后需把对应 key 从 `clickhouse_clusters` 中删除，否则下次 apply 会重建。
+
+**2026-08-17 实测验证**（[验收记录](./docs/perf-results/multi-cluster-verify-20260817-summary.csv)）：在一套 EKS 上同时运行 `ebs`（gp3 3400 GiB）与 `nvme`（local NVMe 3436 GiB）两个 1×3 集群，复制在全部 6 个副本上生效；追加与移除集群时 `terraform plan` 在既有集群地址上均为**零变更**，且既有集群的 6 个 Pod UID 不变、重启次数为 0。
 
 ## 9. 验证与访问
 

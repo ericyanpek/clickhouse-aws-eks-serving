@@ -217,12 +217,45 @@ CLICKHOUSE_ADMIN_PASSWORD='...' AUTO_APPROVE=true ./scripts/deploy.sh
 
 Deployment order:
 
-1. Create the VPC, EKS cluster, node groups, S3 backup bucket, and IRSA.
-2. Install the operator, monitoring, and local-static-provisioner.
-3. Use a DaemonSet to format and mount instance-store NVMe on ClickHouse nodes.
-4. Apply manifests in namespace, backup configuration, Keeper, ClickHouse, and Grafana dashboard order.
+1. A two-phase `terraform apply`: AWS infrastructure first (VPC, EKS, node groups, S3, IRSA), then in-cluster resources. The split exists because the kubernetes/helm providers need an EKS API endpoint that does not exist until the cluster is built.
+2. Install the operator, monitoring, and — only when a `local-nvme` cluster exists — the local-static-provisioner.
+3. For **each cluster** in `clickhouse_clusters`: seven preflight checks, render the CHK/CHI templates, apply in order (namespace, backup, Keeper, wait for quorum, CHI), wait for pods, run the smoke test.
+4. Apply the shared Grafana dashboard once at the end.
 
-Do not directly apply the committed CHI. Its `REPLACE_WITH_ADMIN_SHA256` placeholder must be substituted by the deployment flow.
+The preflight checks stop known failure modes **before** the CHI is applied: a missing StorageClass or wrong `volumeBindingMode` (which leaves PVCs Pending forever), fewer nodes than `shards × replicas`, a leftover placeholder, or a Keeper that has not reached quorum.
+
+Do not apply the templates under `manifests/templates/` directly. Their placeholders must be rendered by the deployment process.
+
+### 8.1 Adding or Removing a Cluster
+
+The set of clusters *is* the `clickhouse_clusters` map, so **adding a cluster means adding a key**:
+
+```hcl
+clickhouse_clusters = {
+  ebs = {
+    storage_profile = "ebs"
+    shards          = 1
+    replicas        = 3
+  }
+  nvme = {
+    storage_profile = "local-nvme"
+    shards          = 1
+    replicas        = 3
+  }
+}
+```
+
+Then re-run `./scripts/deploy.sh`. Existing clusters are not touched: node groups are addressed by string key (`ck-<cluster>-<az>`) rather than list index, so adding or removing one cluster cannot shift another cluster's resource addresses.
+
+To remove a single cluster:
+
+```bash
+./scripts/teardown.sh --cluster nvme
+```
+
+That deletes only that cluster's CHI, Keeper, namespace, node groups, and StorageClass, and reclaims the EBS volumes its `Retain` policy leaves behind. Afterwards remove the key from `clickhouse_clusters`, or the next apply recreates it.
+
+**Verified on 2026-08-17** ([acceptance record](./docs/perf-results/multi-cluster-verify-20260817-summary.csv)): two 1×3 clusters ran simultaneously on one EKS, `ebs` on 3400 GiB gp3 and `nvme` on 3436 GiB local NVMe, with replication reaching all six replicas. Adding and removing a cluster both produced **zero** `terraform plan` changes on the surviving cluster's addresses, and its six pod UIDs and zero restart counts were unchanged.
 
 ## 9. Validation and Access
 
