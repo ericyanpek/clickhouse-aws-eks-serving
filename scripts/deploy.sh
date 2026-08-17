@@ -177,15 +177,21 @@ render_chi() {
 }
 
 # `kubectl wait` on a label selector exits non-zero immediately if nothing matches,
-# so a resource the operator has not created yet reads as a hard failure. Poll until
-# at least one pod exists before handing over to `kubectl wait`.
-wait_keeper_pods_exist() {
-  local ns=$1 n attempt
+# so a resource the operator has not created yet reads as a hard failure rather than
+# something to wait for.
+#
+# Waiting for at least ONE pod is not enough either: the operator creates replicas one
+# at a time, so `kubectl wait` is satisfied by the first Ready pod while replicas 2 and
+# 3 do not exist yet, and the smoke test then runs against an incomplete cluster. Poll
+# until the expected COUNT exists before handing over to `kubectl wait`.
+wait_pods_exist() {
+  local ns=$1 selector=$2 want=$3 n attempt
   for attempt in $(seq 1 60); do
-    n=$(kubectl -n "$ns" get pods -l app=clickhouse-keeper --no-headers 2>/dev/null | grep -c . || true)
-    [ "${n:-0}" -gt 0 ] && return 0
+    n=$(kubectl -n "$ns" get pods -l "$selector" --no-headers 2>/dev/null | grep -c . || true)
+    [ "${n:-0}" -ge "$want" ] && return 0
     [ "$attempt" -eq 60 ] || sleep 5
   done
+  echo "        only ${n:-0} of $want pod(s) matching '$selector' exist after 5 minutes" >&2
   return 1
 }
 
@@ -358,8 +364,8 @@ for cluster in $CLUSTERS; do
   #    creates the Keeper StatefulSet asynchronously, so the pods do not exist for
   #    several seconds after the CHK is applied. Poll for their existence first, then
   #    wait on readiness.
-  echo "    waiting for Keeper pods to be created in $ns"
-  wait_keeper_pods_exist "$ns" || {
+  echo "    waiting for all 3 Keeper pods to be created in $ns"
+  wait_pods_exist "$ns" "app=clickhouse-keeper" 3 || {
     echo "ERROR[$cluster]: the operator never created Keeper pods in $ns; check the CHK status." >&2
     exit 1
   }
@@ -371,20 +377,25 @@ for cluster in $CLUSTERS; do
   }
 
   kubectl apply -f "$dir/chi.yaml"
-  # TODO: same race as the Keeper wait below -- the operator creates replicas ONE AT A
-  # TIME, so `kubectl wait` returns as soon as the first pod is Ready while replicas 2
-  # and 3 do not exist yet, and the smoke test then runs against an incomplete cluster.
-  # Observed on both clusters during the 2026-08-17 end-to-end run. Fix by polling
-  # until the pod count reaches shards x replicas before waiting on readiness, the way
-  # wait_keeper_pods_exist does.
+
+  want_pods=$((shards * replicas))
+  echo "    waiting for all $want_pods ClickHouse pods to be created in $ns"
+  wait_pods_exist "$ns" "clickhouse.altinity.com/chi=$cluster" "$want_pods" || {
+    echo "ERROR[$cluster]: the operator never created all $want_pods ClickHouse pods." >&2
+    exit 1
+  }
+
   echo "    waiting for ClickHouse pods in $ns"
   kubectl -n "$ns" wait --for=condition=Ready pod -l "clickhouse.altinity.com/chi=$cluster" --timeout=900s ||
     echo "WARNING[$cluster]: pods not all Ready within timeout; check kubectl -n $ns get pods" >&2
 
+  # Pass the password so the smoke test authenticates as admin and therefore verifies
+  # the credential this script rendered into the CHI.
   CLICKHOUSE_NAMESPACE="$ns" \
     CLICKHOUSE_CHI="$cluster" \
     EXPECTED_SHARDS="$shards" \
     EXPECTED_REPLICAS="$replicas" \
+    CLICKHOUSE_ADMIN_PASSWORD="$CLICKHOUSE_ADMIN_PASSWORD" \
     ./scripts/smoke-test.sh || {
     echo "ERROR[$cluster]: smoke test failed." >&2
     exit 1

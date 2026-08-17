@@ -21,12 +21,24 @@ POD=$(kubectl -n "$NS" get pods -l "clickhouse.altinity.com/chi=$CHI" \
 }
 echo "==> target: namespace=$NS chi=$CHI pod=$POD logical cluster=$LOGICAL_CLUSTER"
 
-# TODO: these connect as ClickHouse's default user, with no credentials, so the smoke
-# test never exercises the admin password. A botched REPLACE_WITH_ADMIN_SHA256
-# substitution would still pass. Pass --user admin --password from deploy.sh to close
-# that gap.
-run() { kubectl -n "$NS" exec "$POD" -c clickhouse -- clickhouse-client -q "$1"; }
-run_on() { kubectl -n "$NS" exec "$1" -c clickhouse -- clickhouse-client -q "$2"; }
+# Authenticate as admin when a password is supplied, so the test actually exercises the
+# rendered credential. Connecting as the default user would let a botched
+# REPLACE_WITH_ADMIN_SHA256 substitution pass unnoticed: the cluster would look healthy
+# here and reject every real client afterwards.
+#
+# The password is passed through the environment rather than argv so it never appears in
+# a process listing.
+CH_AUTH=()
+if [ -n "${CLICKHOUSE_ADMIN_PASSWORD:-}" ]; then
+  CH_AUTH=(--user admin --password "$CLICKHOUSE_ADMIN_PASSWORD")
+  echo "==> authenticating as admin"
+else
+  echo "==> WARNING: CLICKHOUSE_ADMIN_PASSWORD not set; connecting as the default user."
+  echo "    The rendered admin credential is therefore NOT verified by this run."
+fi
+
+run() { kubectl -n "$NS" exec "$POD" -c clickhouse -- clickhouse-client "${CH_AUTH[@]}" -q "$1"; }
+run_on() { kubectl -n "$NS" exec "$1" -c clickhouse -- clickhouse-client "${CH_AUTH[@]}" -q "$2"; }
 
 echo "==> cluster topology"
 run "SELECT cluster, shard_num, replica_num, host_name FROM system.clusters WHERE cluster='$LOGICAL_CLUSTER' ORDER BY shard_num, replica_num"
