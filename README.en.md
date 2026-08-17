@@ -316,6 +316,23 @@ If every ClickHouse replica is lost, rebuild by partition from the upstream lake
 
 The script removes in-cluster resources before destroying EKS/VPC. It retains the S3 backup bucket together with versioning, encryption, and public-access-block settings, and removes those resources from Terraform state. It prints the exact bucket name. Delete all object versions and the bucket manually only after confirming that the backups are no longer needed.
 
+The ordering is not a matter of style. **The CHI must go first so the EBS CSI driver reclaims the volumes while the control plane is still alive**: data volumes have `DeleteOnTermination` set to `false`, so once the control plane is gone the CSI driver goes with it and nothing is left to delete them — they stay on the bill forever. The gp3 class also uses `reclaimPolicy: Retain`, which is precisely what lets a replacement node reattach the original volume instead of rebuilding, so deleting a PVC does not delete its volume either. `teardown.sh` therefore reads each PV's `csi.volumeHandle` **before** the namespace is deleted, then deletes the volumes individually and finishes with a tag-based sweep.
+
+Teardown is also deliberately **re-entrant and free of any Kubernetes API dependency**: it removes every helm/kubernetes resource from state before destroying. Both properties come from measured failures — a dropped SSM tunnel left a `helm_release` stalling for minutes before failing with zero resources destroyed, and a local DNS failure interrupted a run whose delete requests had already taken effect.
+
+### 12.1 Stopping Nodes to Save Money: Check the Storage Medium First
+
+Scaling nodes to zero, or stopping the EC2 instances, has **completely different** consequences per profile:
+
+| Profile | Effect of stopping the nodes |
+|---|---|
+| `ebs` | The gp3 volume exists independently of the instance and reattaches when the node returns, so **data survives**. You still pay for the volume while stopped. |
+| `local-nvme` | Data lives on instance store, so **stopping the instance destroys it permanently**; recovery means rebuilding from a healthy replica or the lakehouse. |
+
+A `local-nvme` cluster therefore has no "stop to save money" option. Saving money there means destroying it and accepting the rebuild, or switching that cluster to the `ebs` profile.
+
+Note also that node groups have `min_size` of 1, and a `local-nvme` cluster's Keeper is `min = max = 1` because quorum membership is fixed and must not autoscale. Scaling to zero therefore requires changing the Terraform configuration rather than adjusting the ASG directly — a direct ASG change is reverted by the next apply.
+
 ## 13. Scope Boundaries and Documentation Rules
 
 Current non-goals:

@@ -14,3 +14,12 @@ step,check,result,evidence
 8,Retain-policy volumes are reclaimed,pass,3 EBS volumes deleted during teardown
 8,existing cluster undisturbed by the removal,pass,6 pod UIDs identical restarts 0
 8,state converges after restore,pass,terraform plan reports No changes
+readd,re-adding a removed cluster leaves zero changes on the survivor,pass,third isolation check; add then remove then add all showed zero ebs-* changes
+readd,existing cluster undisturbed by the re-add,pass,6 pod UIDs identical restarts 0
+readd,both clusters healthy again simultaneously,pass,ck-ebs and ck-nvme each 1x3 CHI Completed
+smoke,cross-replica check actually executes,fixed,peer name lacked the pod ordinal so the check was silently skipped on every prior run
+smoke,cross-replica row count is asserted not printed,fixed,reading 0 rows previously still passed because the distributed count is served by the replica holding the data
+smoke,topology assertion is mandatory and CHI-derived,fixed,was opt-in via EXPECTED_REPLICAS and echoed back the callers own rendered value
+smoke,topology asserted before any write,fixed,an incomplete cluster accepts the inserts so every later check passed
+deploy,wait for CHI Completed before testing,fixed,pods Ready does not mean remote_servers reached every replica and system.clusters reads that config
+smoke,negative test: CHI claiming 5 replicas with 3 present,pass,fails with has 3 host rows expected 5 rather than passing

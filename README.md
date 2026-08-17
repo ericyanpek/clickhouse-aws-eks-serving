@@ -314,6 +314,23 @@ CONFIRM_REPLICA_DATA_LOSS=yes \
 
 脚本先删除集群内资源，再销毁 EKS/VPC。S3 备份桶及其版本化、加密和公有访问阻断配置会被保留，并从 Terraform state 移除。脚本会打印准确桶名；确认备份不再需要后，必须人工删除全部对象版本和 bucket。
 
+销毁顺序不是风格问题。**必须先删 CHI，让 EBS CSI 驱动在控制面还活着时回收卷**：数据卷的 `DeleteOnTermination` 是 `false`，一旦控制面消失，CSI 驱动随之消失，就再没有东西能执行删卷动作，卷会永久留在账单上。gp3 类的 `reclaimPolicy` 又是 `Retain`（这正是节点替换能重挂原卷、无需重灌的前提），所以删 PVC 也不会删卷——`teardown.sh` 会在删除 namespace **之前**读出每个 PV 的 `csi.volumeHandle`，之后再逐个删卷，并按标签兜底清扫。
+
+teardown 也刻意做成**可重入且不依赖 Kubernetes API**：它先把所有 helm/kubernetes 资源移出 state 再 destroy。这两点都来自实测教训——SSM 隧道中断会让 `helm_release` 卡住数分钟后失败且零资源被销毁，本地 DNS 故障会中断一次删除请求已生效的运行。
+
+### 12.1 停机省钱：先确认存储介质
+
+把节点缩到 0 或停掉 EC2 实例，对两种 profile 的后果**完全不同**：
+
+| profile | 停节点的后果 |
+|---|---|
+| `ebs` | gp3 卷独立于实例存在，节点恢复后重新挂载，**数据保留**。停机期间仍需为卷付费。 |
+| `local-nvme` | 数据在 instance store 上，**实例一停数据永久消失**，恢复后必须从健康副本或湖仓重灌。 |
+
+所以 `local-nvme` 集群不存在"停机省钱"这个选项——若想省钱只能销毁并接受重灌，或改用 `ebs` profile。
+
+另外节点组的 `min_size` 是 `1`，`local-nvme` 的 Keeper 更是 `min=max=1`（quorum 成员数固定不参与伸缩），因此缩到 0 需要先改 Terraform 配置，而不是直接调 ASG——直接调会被 Terraform 下次 apply 拉回。
+
 ## 13. 适用边界与文档规则
 
 当前非目标：
