@@ -27,7 +27,7 @@
 | [`superpowers/specs/2026-07-03-clickhouse-on-eks-design.md`](./superpowers/specs/2026-07-03-clickhouse-on-eks-design.md) | [`superpowers/specs/2026-07-03-clickhouse-on-eks-design.en.md`](./superpowers/specs/2026-07-03-clickhouse-on-eks-design.en.md) | 当前设计背景；实现与根 README 优先 |
 | [`superpowers/plans/2026-07-03-clickhouse-on-eks.md`](./superpowers/plans/2026-07-03-clickhouse-on-eks.md) | [`superpowers/plans/2026-07-03-clickhouse-on-eks.en.md`](./superpowers/plans/2026-07-03-clickhouse-on-eks.en.md) | **历史实施记录**，包含已废弃的 2×2/i4i 步骤，不是操作手册 |
 
-`perf-results/clickbench-43queries.csv`、`perf-results/ebs-gp3-clickbench-43queries.csv`、`perf-results/ebs-gp3-qps-summary.csv` 、`perf-results/storage-selection-20260812-summary.csv` 和 `perf-results/ha-ebs-20260813-summary.csv` 只有语言无关的字段名与数值，保留单份。带中文分组标题的 [`perf-results/qps-by-query-type.txt`](./perf-results/qps-by-query-type.txt) 已配套提供 [`英文版`](./perf-results/qps-by-query-type.en.txt)。
+`perf-results/multi-cluster-verify-20260817-summary.csv`、`perf-results/clickbench-43queries.csv`、`perf-results/ebs-gp3-clickbench-43queries.csv`、`perf-results/ebs-gp3-qps-summary.csv` 、`perf-results/storage-selection-20260812-summary.csv` 和 `perf-results/ha-ebs-20260813-summary.csv` 只有语言无关的字段名与数值，保留单份。带中文分组标题的 [`perf-results/qps-by-query-type.txt`](./perf-results/qps-by-query-type.txt) 已配套提供 [`英文版`](./perf-results/qps-by-query-type.en.txt)。
 
 ## 项目不变量
 

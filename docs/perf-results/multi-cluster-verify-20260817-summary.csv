@@ -1,0 +1,16 @@
+step,check,result,evidence
+1,static validation (fmt/validate/bash -n/shellcheck/check-docs),pass,all green
+2,bring up default ebs cluster from scratch,pass,t11-d9.log SMOKE TEST PASSED
+3,node group naming is map-keyed not index-keyed,pass,ck-ebs-us-east-1a/b/c and kp-ebs-us-east-1a/b/c
+3,namespace and storage class per cluster,pass,ck-ebs and ck-ebs-gp3
+5,ADD cluster leaves zero changes on ebs-* addresses,pass,t11-plan-add.log Plan 10 to add 0 to change 0 to destroy
+6,both clusters healthy simultaneously,pass,ck-ebs 3x replicas and ck-nvme 3x replicas all Running
+6,distinct storage media per cluster,pass,ck-ebs-gp3 3400Gi vs local-storage 3436Gi
+6,cross-replica replication both clusters,pass,1000 rows on all six replicas
+6,existing cluster undisturbed by the addition,pass,6 pod UIDs identical restarts 0
+7,autoscaler discovery tags reach the ASGs,pass,k8s.io/cluster-autoscaler/enabled=true and /clickhouse-eks=owned
+7,taints keep untolerated pods off data nodes,pass,taint-probe scheduled to workload=system
+8,per-cluster teardown removes only that cluster,partial,destroyed 9 resources but also backup_s3[ebs] via -target dependency expansion
+8,Retain-policy volumes are reclaimed,pass,3 EBS volumes deleted during teardown
+8,existing cluster undisturbed by the removal,pass,6 pod UIDs identical restarts 0
+8,state converges after restore,pass,terraform plan reports No changes
