@@ -10,14 +10,16 @@
 
 This project provides reviewable, executable Terraform + Kubernetes IaC that deploys the following into your AWS account:
 
-- ClickHouse: **1 shard × 3 replicas**, each on a dedicated cross-AZ `i8g.4xlarge` node with local NVMe.
-- ClickHouse Keeper: a 3-node cross-AZ quorum with persistent EBS storage.
+- ClickHouse: **one or more independent clusters on demand**, defaulting to a single 1 shard × 3 replica cluster, each replica on a dedicated cross-AZ `r8g.4xlarge` node with its own gp3 data volume.
+- ClickHouse Keeper: a **dedicated** 3-node cross-AZ quorum **per cluster**, with persistent EBS storage.
 - Altinity ClickHouse Operator `0.27.1`.
 - Prometheus, Grafana, daily S3 backup, and IRSA permissions.
 - Scripts for NVMe initialization, deployment, validation, lost-node recovery, and ordered teardown.
-- An optional `r8g` + high-performance gp3 comparison stack, with scripts to reproduce the selection experiment on one cluster.
+- Per-cluster teardown (`teardown.sh --cluster <key>`), so adding or removing one cluster leaves the others untouched.
 
-The data volume medium is this project's primary tradeoff. After measurement the **recommendation is EBS gp3** (clear operational recovery advantages, negligible performance cost in mainstream scenarios), with local NVMe retained as a performance profile for storage-bound workloads. The repository's default deployment path, however, **is still local NVMe**. Rationale, costs, and how to switch are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme).
+The set of clusters is defined by the Terraform `clickhouse_clusters` map, whose key is the cluster identifier. Adding a cluster means adding a key: because node groups are addressed by string key rather than list index, adding or removing one cluster does not touch another cluster's resources. Each cluster independently sets its topology, storage medium, instance size, and ClickHouse version.
+
+The data volume medium is the primary tradeoff. After measurement the **default is EBS gp3** (clear operational recovery advantages, negligible performance cost in mainstream scenarios), with local NVMe equally available as a performance profile for storage-bound workloads. Rationale and costs are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme).
 
 Its value is not to replace ClickHouse Cloud. It is a self-managed reference implementation for cases where:
 
@@ -92,7 +94,7 @@ The default strategy is to scale up before sharding. Adding a shard does not aut
 
 ### 4.3 Data Volume Selection: EBS gp3 versus Local NVMe
 
-> **The repository still defaults to local NVMe.** `./scripts/deploy.sh` deploys the [production CHI](./manifests/20-clickhouse-chi.yaml) with `local-storage`. The **recommendation** below comes from the 2026-08-12/13 measurements; adopting it requires the manual storage-class switch described in 4.3.4 and is not yet the repository default.
+> **The repository now defaults to EBS gp3.** The default value of `clickhouse_clusters` is a single cluster with `storage_profile = "ebs"`, and `./scripts/deploy.sh` renders the CHI accordingly with a per-cluster gp3 volume. Local NVMe remains a first-class option: set that cluster's `storage_profile` to `"local-nvme"`. The rationale and costs are below.
 
 #### 4.3.1 Measured Results
 
@@ -132,7 +134,7 @@ Choosing local storage means accepting that data is permanently lost when a node
 
 #### 4.3.4 How to Switch
 
-The repository provides a disabled-by-default [parallel R8g + high-performance gp3 comparison](./docs/storage-comparison.en.md) that does not replace the existing cluster, so the comparison above can be reproduced against your own data and queries before committing to a medium. Historical material also includes the [2026-08-11 EBS-only measurements](./docs/storage-comparison-results.en.md).
+To reproduce the comparison against your own data and queries, declare two clusters in `clickhouse_clusters` at once -- one with `storage_profile = "ebs"` and one with `local-nvme` -- which share the same EKS, monitoring, and load-generation node. Historical material also includes the [2026-08-11 EBS-only measurements](./docs/storage-comparison-results.en.md).
 
 Switching to EBS requires changing three things together: the CHI's `storageClassName` (`local-storage` to a gp3 class), the instance type (`i8g` to `r8g`), and the node group's subnet binding -- **a gp3 volume is AZ-scoped, so each node group must be pinned to a single subnet**. Otherwise a replacement node may land in a different AZ, fail to attach the original volume, and the recovery advantage in 4.3.2 does not hold.
 
@@ -174,17 +176,30 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 At minimum, review:
 
 ```hcl
-region             = "us-east-1"
-availability_zones = ["us-east-1b", "us-east-1c", "us-east-1d"]
-clickhouse_zones    = ["us-east-1b", "us-east-1c", "us-east-1d"]
+region              = "us-east-1"
+availability_zones  = ["us-east-1a", "us-east-1b", "us-east-1c"]
 
-backup_bucket_name = ""
+backup_bucket_name  = ""
 public_access_cidrs = ["203.0.113.0/24"]
+
+# The set of clusters. Defaults to a single ebs cluster; add a key to add a cluster.
+clickhouse_clusters = {
+  ebs = {
+    storage_profile = "ebs"
+    shards          = 1
+    replicas        = 3
+  }
+  # nvme = {
+  #   storage_profile = "local-nvme"
+  #   shards          = 1
+  #   replicas        = 3
+  # }
+}
 ```
 
-`availability_zones` and `clickhouse_zones` must contain three real, distinct AZs in the same region. The default `public_access_cidrs` exposes the EKS public API and must be restricted for production.
+`availability_zones` must contain three real, distinct AZs in the same region, and each cluster's `zones` must be a subset of it. The default `public_access_cidrs` exposes the EKS public API and must be restricted for production.
 
-Resources are sized for `i8g.4xlarge`. When changing instance type, also update CPU, memory, and PVC capacity in the [ClickHouse manifest](./manifests/20-clickhouse-chi.yaml).
+Each cluster's `cpu_request`, `memory_request`, and `data_volume_size_gib` are sized for a 16 vCPU / 128 GiB Graviton instance. Change `instance_type` and you must adjust all three, or pods will fail to schedule because their requests exceed what the node can allocate.
 
 ## 8. Deployment
 
@@ -202,12 +217,45 @@ CLICKHOUSE_ADMIN_PASSWORD='...' AUTO_APPROVE=true ./scripts/deploy.sh
 
 Deployment order:
 
-1. Create the VPC, EKS cluster, node groups, S3 backup bucket, and IRSA.
-2. Install the operator, monitoring, and local-static-provisioner.
-3. Use a DaemonSet to format and mount instance-store NVMe on ClickHouse nodes.
-4. Apply manifests in namespace, backup configuration, Keeper, ClickHouse, and Grafana dashboard order.
+1. A two-phase `terraform apply`: AWS infrastructure first (VPC, EKS, node groups, S3, IRSA), then in-cluster resources. The split exists because the kubernetes/helm providers need an EKS API endpoint that does not exist until the cluster is built.
+2. Install the operator, monitoring, and — only when a `local-nvme` cluster exists — the local-static-provisioner.
+3. For **each cluster** in `clickhouse_clusters`: seven preflight checks, render the CHK/CHI templates, apply in order (namespace, backup, Keeper, wait for quorum, CHI), wait for pods, run the smoke test.
+4. Apply the shared Grafana dashboard once at the end.
 
-Do not directly apply the committed CHI. Its `REPLACE_WITH_ADMIN_SHA256` placeholder must be substituted by the deployment flow.
+The preflight checks stop known failure modes **before** the CHI is applied: a missing StorageClass or wrong `volumeBindingMode` (which leaves PVCs Pending forever), fewer nodes than `shards × replicas`, a leftover placeholder, or a Keeper that has not reached quorum.
+
+Do not apply the templates under `manifests/templates/` directly. Their placeholders must be rendered by the deployment process.
+
+### 8.1 Adding or Removing a Cluster
+
+The set of clusters *is* the `clickhouse_clusters` map, so **adding a cluster means adding a key**:
+
+```hcl
+clickhouse_clusters = {
+  ebs = {
+    storage_profile = "ebs"
+    shards          = 1
+    replicas        = 3
+  }
+  nvme = {
+    storage_profile = "local-nvme"
+    shards          = 1
+    replicas        = 3
+  }
+}
+```
+
+Then re-run `./scripts/deploy.sh`. Existing clusters are not touched: node groups are addressed by string key (`ck-<cluster>-<az>`) rather than list index, so adding or removing one cluster cannot shift another cluster's resource addresses.
+
+To remove a single cluster:
+
+```bash
+./scripts/teardown.sh --cluster nvme
+```
+
+That deletes only that cluster's CHI, Keeper, namespace, node groups, and StorageClass, and reclaims the EBS volumes its `Retain` policy leaves behind. Afterwards remove the key from `clickhouse_clusters`, or the next apply recreates it.
+
+**Verified on 2026-08-17** ([acceptance record](./docs/perf-results/multi-cluster-verify-20260817-summary.csv)): two 1×3 clusters ran simultaneously on one EKS, `ebs` on 3400 GiB gp3 and `nvme` on 3436 GiB local NVMe, with replication reaching all six replicas. Adding and removing a cluster both produced **zero** `terraform plan` changes on the surviving cluster's addresses, and its six pod UIDs and zero restart counts were unchanged.
 
 ## 9. Validation and Access
 

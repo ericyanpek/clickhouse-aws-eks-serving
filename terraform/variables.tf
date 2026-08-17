@@ -21,8 +21,8 @@ variable "cluster_name" {
   default     = "clickhouse-eks"
 
   validation {
-    condition     = can(regex("^[a-z0-9-]{1,46}$", var.cluster_name))
-    error_message = "cluster_name must be lowercase letters, numbers, and hyphens, max 46 chars (feeds both the S3 backup bucket name and the '<name>-clickhouse-backup' IAM role, which has a 64-char limit)."
+    condition     = can(regex("^[a-z0-9-]{1,40}$", var.cluster_name))
+    error_message = "cluster_name must be lowercase letters, numbers, and hyphens, max 40 chars. It feeds the S3 backup bucket name and the per-cluster '<name>-ck-<cluster>-backup' IAM role, which has a 64-char limit."
   }
 }
 
@@ -56,151 +56,100 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
-variable "clickhouse_instance_type" {
-  description = "Instance type for ClickHouse nodes — ARM/Graviton local-NVMe family (i8g/im4gn/i4g). Default i8g.4xlarge (16 vCPU / 128 GiB / ~3.75TB NVMe). If you change the size, also re-tune the CHI container resources + data volume size in manifests/20-clickhouse-chi.yaml (they are hand-sized to this instance)."
-  type        = string
-  default     = "i8g.4xlarge"
-}
+variable "clickhouse_clusters" {
+  # The map key is the cluster identifier and doubles as the node-group for_each key.
+  # Because keys are strings rather than list indexes, adding or removing a cluster
+  # cannot change another cluster's Terraform addresses -- that is the core of this design.
+  # Keys must be lowercase alphanumeric with hyphens: they become part of namespace,
+  # CHI, and StorageClass names.
+  description = "ClickHouse clusters to bring up. Defaults to a single ebs cluster; add a key to add a cluster."
+  type = map(object({
+    storage_profile      = optional(string, "ebs")
+    shards               = optional(number, 1)
+    replicas             = optional(number, 3)
+    zones                = optional(list(string), ["us-east-1a", "us-east-1b", "us-east-1c"])
+    instance_type        = optional(string, "")
+    gp3_iops             = optional(number, 20000)
+    gp3_throughput_mibps = optional(number, 1250)
+    data_volume_size_gib = optional(number, 3400)
+    clickhouse_image     = optional(string, "clickhouse/clickhouse-server:25.3")
+    keeper_image         = optional(string, "clickhouse/clickhouse-keeper:25.3")
+    cpu_request          = optional(string, "14")
+    memory_request       = optional(string, "110Gi")
+    keeper_instance_type = optional(string, "m7g.large")
+    enable_backup        = optional(bool, true)
+  }))
 
-variable "enable_local_nvme" {
-  description = "Create the existing local-NVMe ClickHouse node pool. Defaults to true; set false only for an EBS-only benchmark that reuses historical NVMe results."
-  type        = bool
-  default     = true
-}
-
-variable "enable_local_nvme_comparison" {
-  description = "Append a benchmark-only local-NVMe node pool without changing the existing production-oriented local-NVMe pool or shifting current node-group indexes."
-  type        = bool
-  default     = false
-}
-
-variable "local_nvme_comparison_zones" {
-  description = "One to three distinct AZs for the benchmark-only local-NVMe profile. A single AZ is a performance-only fallback and must not be presented as an HA result."
-  type        = list(string)
-  default     = ["us-east-1a", "us-east-1b"]
-
-  validation {
-    condition = (
-      length(var.local_nvme_comparison_zones) >= 1 &&
-      length(var.local_nvme_comparison_zones) <= 3 &&
-      length(distinct(var.local_nvme_comparison_zones)) == length(var.local_nvme_comparison_zones)
-    )
-    error_message = "local_nvme_comparison_zones must contain one to three distinct availability zones."
-  }
-}
-
-variable "local_nvme_comparison_nodes_per_zone" {
-  description = "Benchmark-only local-NVMe nodes per selected AZ. Use 1 for cross-AZ comparison; 2 in one AZ is a performance-only capacity fallback."
-  type        = number
-  default     = 1
-
-  validation {
-    condition     = contains([1, 2], var.local_nvme_comparison_nodes_per_zone)
-    error_message = "local_nvme_comparison_nodes_per_zone must be 1 or 2."
-  }
-}
-
-variable "local_nvme_comparison_instance_type" {
-  description = "Instance type for the benchmark-only local-NVMe profile."
-  type        = string
-  default     = "i8g.4xlarge"
-}
-
-# NOTE: ClickHouse node count is NOT set as a count var. The blueprint creates one node group
-# per (pool × AZ) and applies desired_size PER AZ, so ClickHouse node count = len(clickhouse_zones)
-# (1 node per AZ, pinned in eks.tf). Replica count in the CHI must match len(clickhouse_zones).
-
-variable "clickhouse_zones" {
-  description = "Exactly 3 AZs for the fixed 1-shard x 3-replica ClickHouse data pool (1 node per AZ). These must also be present in availability_zones."
-  type        = list(string)
-  default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
-
-  validation {
-    condition     = length(var.clickhouse_zones) == 3 && length(distinct(var.clickhouse_zones)) == 3
-    error_message = "This design requires exactly 3 distinct ClickHouse availability zones for its 1-shard x 3-replica topology."
-  }
-}
-
-variable "clickhouse_ami_type" {
-  description = "EKS AMI type for the ClickHouse node pool. Must be ARM64 for i8g/Graviton (AL2023_ARM_64_STANDARD); switch to AL2023_x86_64_STANDARD only if using an x86 instance family."
-  type        = string
-  default     = "AL2023_ARM_64_STANDARD"
-}
-
-variable "enable_ebs_comparison" {
-  description = "Add a separate R8g ClickHouse node pool and tuned gp3 StorageClass for comparison. The existing local-NVMe cluster remains unchanged when enable_local_nvme is true."
-  type        = bool
-  default     = false
-}
-
-variable "ebs_comparison_zones" {
-  description = "Two or three distinct AZs for the optional EBS profile. Use two to reproduce the historical 1x2 NVMe test basis; the default remains 1x3."
-  type        = list(string)
-  default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
-
-  validation {
-    condition = (
-      length(var.ebs_comparison_zones) >= 2 &&
-      length(var.ebs_comparison_zones) <= 3 &&
-      length(distinct(var.ebs_comparison_zones)) == length(var.ebs_comparison_zones)
-    )
-    error_message = "ebs_comparison_zones must contain two or three distinct availability zones."
-  }
-}
-
-variable "ebs_comparison_instance_type" {
-  description = "Instance type for the optional EBS comparison pool. r8g.4xlarge matches i8g.4xlarge at 16 vCPU and 128 GiB without paying for unused instance-store capacity."
-  type        = string
-  default     = "r8g.4xlarge"
-}
-
-variable "ebs_comparison_volume_size_gib" {
-  description = "Size in GiB of each ClickHouse EBS data volume in the comparison cluster."
-  type        = number
-  default     = 3400
-
-  validation {
-    condition     = var.ebs_comparison_volume_size_gib >= 100
-    error_message = "ebs_comparison_volume_size_gib must be at least 100 GiB."
+  default = {
+    ebs = {
+      storage_profile = "ebs"
+      shards          = 1
+      replicas        = 3
+    }
   }
 
   validation {
-    condition     = var.ebs_comparison_volume_size_gib <= 16384
-    error_message = "ebs_comparison_volume_size_gib must not exceed the gp3 maximum of 16384 GiB."
+    condition     = alltrue([for k, v in var.clickhouse_clusters : can(regex("^[a-z0-9-]+$", k))])
+    error_message = "Cluster keys may contain only lowercase letters, digits, and hyphens."
   }
-}
-
-variable "ebs_comparison_iops" {
-  # 20000 matches the r8g.4xlarge SUSTAINED EBS baseline. 40000 is that instance's
-  # BURST ceiling, reachable only for 30 minutes per 24 hours, so provisioning it
-  # buys capability the instance cannot sustain. Measured 2026-08-12: peak 14,993
-  # and 9,701 IOPS under read-heavy ClickBench, and only 1,415/1,428 during a
-  # merge. At the observed 120-157 KiB per I/O, saturating 1,250 MiB/s needs about
-  # 8,200 IOPS, so this workload is throughput-bound, not IOPS-bound.
-  description = "Provisioned gp3 IOPS per comparison volume. 20000 matches the r8g.4xlarge sustained EBS baseline; its 40000 burst ceiling is only available 30 minutes per 24 hours."
-  type        = number
-  default     = 20000
 
   validation {
-    condition     = var.ebs_comparison_iops >= 3000 && var.ebs_comparison_iops <= 80000
-    error_message = "ebs_comparison_iops must be between 3000 and the current gp3 maximum of 80000."
+    condition     = alltrue([for k, v in var.clickhouse_clusters : contains(["ebs", "local-nvme"], v.storage_profile)])
+    error_message = "storage_profile must be \"ebs\" or \"local-nvme\"."
   }
-}
-
-variable "ebs_comparison_throughput_mibps" {
-  # Hold at 1250 and do NOT reduce this. The instance channel is 625 MB/s
-  # sustained (= 596.05 MiB/s) and 1250 MB/s burst (= 1192.09 MiB/s) -- note AWS
-  # states instance throughput in decimal MB/s while gp3 is provisioned in MiB/s.
-  # Merge-window device counters from 2026-08-12 put EBS p95 at 1,130-1,193 MiB/s
-  # with peak utilization at 102%, so dropping to 1000 MiB/s would clip sustained
-  # merge throughput and further extend a merge already 48% slower than local NVMe.
-  description = "Provisioned gp3 throughput in MiB/s per comparison volume. Hold at 1250: measured merge p95 reaches 1,130-1,193 MiB/s, so reducing this clips merge throughput."
-  type        = number
-  default     = 1250
 
   validation {
-    condition     = var.ebs_comparison_throughput_mibps >= 125 && var.ebs_comparison_throughput_mibps <= 2000
-    error_message = "ebs_comparison_throughput_mibps must be between 125 and the current gp3 maximum of 2000 MiB/s."
+    # One pod per node and one node group per AZ, so total pods must divide evenly
+    # across AZs. shards is included because the CHI provisions shards x replicas
+    # pods while the node groups must supply a node for each of them.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : (v.shards * v.replicas) % length(v.zones) == 0])
+    error_message = "shards x replicas must be a multiple of the number of zones (each AZ carries an equal share)."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas >= 1 && v.shards >= 1])
+    error_message = "shards and replicas must both be at least 1."
+  }
+
+  validation {
+    # Keeper places one member per AZ, so an even AZ count yields an even Raft
+    # ensemble, which tolerates no failures at all.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(v.zones) % 2 == 1])
+    error_message = "zones must contain an odd number of AZs so the Keeper ensemble forms a real quorum."
+  }
+
+  validation {
+    # A duplicate AZ would otherwise surface as "Two different items produced the
+    # key" from deep inside a for expression, pointing at nothing the user typed.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(distinct(v.zones)) == length(v.zones)])
+    error_message = "zones must not contain duplicate availability zones."
+  }
+
+  validation {
+    # gp3 hard limit: throughput may not exceed 0.25x provisioned IOPS.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.gp3_throughput_mibps <= v.gp3_iops * 0.25])
+    error_message = "gp3 throughput in MiB/s must not exceed 0.25 times the provisioned IOPS."
+  }
+
+  validation {
+    # Only Graviton families are supported: node groups use an ARM64 AMI. An x86
+    # instance type would otherwise pair with an ARM AMI and fail mid-apply with an
+    # EKS API error that names nothing the user wrote.
+    condition = alltrue([
+      for k, v in var.clickhouse_clusters :
+      can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.instance_type != "" ? v.instance_type : "r8g.4xlarge")) &&
+      can(regex("^(r8g|r7g|i8g|i7g|m8g|m7g|c8g|c7g)\\.", v.keeper_instance_type))
+    ])
+    error_message = "instance_type and keeper_instance_type must be Graviton families (r8g/r7g/i8g/i7g/m8g/m7g/c8g/c7g), because node groups use an ARM64 AMI."
+  }
+
+  validation {
+    # Cluster keys feed the IAM role name "<cluster_name>-ck-<key>-backup", capped by
+    # IAM at 64 characters. A validation block may only reference its own variable, so
+    # the combined length is asserted as a precondition in irsa.tf; this bounds the
+    # key's own contribution so that cluster_name keeps its documented 40-char budget.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : length(k) <= 20])
+    error_message = "Cluster keys must be 20 characters or fewer: they feed the IAM role name '<cluster_name>-ck-<key>-backup', which IAM caps at 64 characters."
   }
 }
 

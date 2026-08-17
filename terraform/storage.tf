@@ -2,9 +2,46 @@
 # blueprint //eks submodule (eks/addons.tf). Keeper's CHK references it by name.
 # Do NOT redefine it here — a duplicate metadata.name collides at apply.
 
-# local-storage class for ClickHouse instance-store NVMe. No provisioner —
-# PVs are published by the local-static-provisioner DaemonSet below.
+# One gp3 class per ebs cluster, so each cluster can run a different tier.
+# The 20k IOPS / 1250 MiB/s default comes from measurement: observed peak was
+# 14,993 IOPS, and at 120-157 KiB per I/O saturating 1250 MiB/s needs only about
+# 8,200 IOPS -- this workload is throughput-bound, not IOPS-bound. 20k also equals
+# the r8g.4xlarge sustained EBS baseline; its 40k figure is a burst ceiling
+# available only 30 minutes per 24 hours. Throughput must NOT be reduced: during a
+# merge, p95 reached 1,130-1,193 MiB/s at 102% device utilization.
+resource "kubernetes_storage_class" "clickhouse_gp3" {
+  for_each = local.ebs_clusters
+
+  metadata {
+    name = "ck-${each.key}-gp3"
+  }
+
+  storage_provisioner = "ebs.csi.aws.com"
+
+  parameters = {
+    encrypted  = "true"
+    fsType     = "ext4"
+    type       = "gp3"
+    iops       = tostring(each.value.gp3_iops)
+    throughput = tostring(each.value.gp3_throughput_mibps)
+  }
+
+  # Retain rather than Delete: the whole point of this profile is that a volume
+  # outlives its node. Delete would discard data the moment a PVC is removed,
+  # which is exactly the local-NVMe failure mode this profile exists to avoid.
+  reclaim_policy = "Retain"
+  # WaitForFirstConsumer binds the volume in the AZ where the pod is scheduled,
+  # matching the AZ-scoped nature of a gp3 volume.
+  volume_binding_mode    = "WaitForFirstConsumer"
+  allow_volume_expansion = true
+}
+
+# local-storage class for ClickHouse instance-store NVMe, used when
+# storage_profile = "local-nvme". No provisioner — PVs are published by the
+# local-static-provisioner DaemonSet below.
 resource "kubernetes_storage_class" "local" {
+  count = local.has_local_nvme ? 1 : 0
+
   metadata {
     name = "local-storage"
   }
@@ -20,6 +57,8 @@ resource "kubernetes_storage_class" "local" {
 # "Preparing NVMe Disks". On a fresh node with empty /mnt/disks, no PVs appear and
 # ClickHouse PVCs stay Pending.
 resource "helm_release" "local_static_provisioner" {
+  count = local.has_local_nvme ? 1 : 0
+
   depends_on = [module.eks, kubernetes_storage_class.local]
 
   name       = "local-static-provisioner"
@@ -44,37 +83,4 @@ resource "helm_release" "local_static_provisioner" {
       effect   = "NoSchedule"
     }]
   })]
-}
-
-# Optional EBS comparison class. It is deliberately separate from the blueprint's
-# default gp3-encrypted class, which leaves gp3 at its 3000 IOPS / 125 MiB/s defaults.
-# The selected defaults match the aggregate EBS ceiling of r8g.4xlarge so the first
-# comparison measures EBS architecture rather than an artificially under-provisioned volume.
-resource "kubernetes_storage_class" "clickhouse_ebs_comparison" {
-  count = var.enable_ebs_comparison ? 1 : 0
-
-  lifecycle {
-    precondition {
-      condition     = var.ebs_comparison_throughput_mibps <= var.ebs_comparison_iops * 0.25
-      error_message = "gp3 throughput in MiB/s must not exceed 0.25 times the provisioned IOPS."
-    }
-  }
-
-  metadata {
-    name = "clickhouse-ebs-gp3"
-  }
-
-  storage_provisioner = "ebs.csi.aws.com"
-
-  parameters = {
-    encrypted  = "true"
-    fsType     = "ext4"
-    type       = "gp3"
-    iops       = tostring(var.ebs_comparison_iops)
-    throughput = tostring(var.ebs_comparison_throughput_mibps)
-  }
-
-  reclaim_policy         = "Delete"
-  volume_binding_mode    = "WaitForFirstConsumer"
-  allow_volume_expansion = true
 }

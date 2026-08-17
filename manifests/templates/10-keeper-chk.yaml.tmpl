@@ -1,8 +1,8 @@
 apiVersion: "clickhouse-keeper.altinity.com/v1"
 kind: "ClickHouseKeeperInstallation"
 metadata:
-  name: keeper
-  namespace: clickhouse
+  name: keeper-__CLUSTER__
+  namespace: __NAMESPACE__
 spec:
   configuration:
     clusters:
@@ -24,6 +24,7 @@ spec:
         spec:
           nodeSelector:
             workload: keeper
+            ck-cluster: __CLUSTER__
           tolerations:
             - key: dedicated
               operator: Equal
@@ -48,7 +49,7 @@ spec:
               # 25.3 LTS: operator 0.27.1 injects coordination settings (use_xid_64,
               # async_replication) that 24.8 rejects with UNKNOWN_SETTING. Keeper + server
               # image versions must be compatible with the operator's rendered config.
-              image: "clickhouse/clickhouse-keeper:25.3"
+              image: "__KEEPER_IMAGE__"
               resources:
                 requests:
                   cpu: "1"

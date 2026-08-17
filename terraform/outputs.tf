@@ -13,9 +13,9 @@ output "backup_bucket" {
   value = aws_s3_bucket.backup.id
 }
 
-output "backup_role_arn" {
-  description = "Annotate the clickhouse-backup ServiceAccount with this role ARN"
-  value       = aws_iam_role.backup.arn
+output "backup_role_arns" {
+  description = "Per-cluster backup IRSA role ARNs, for deploy.sh to render the ServiceAccount annotation."
+  value       = { for k, r in aws_iam_role.backup : k => r.arn }
 }
 
 output "clickhouse_namespace" {
@@ -26,40 +26,27 @@ output "region" {
   value = var.region
 }
 
-output "ebs_comparison" {
-  description = "Resolved side-by-side EBS comparison profile."
+output "clickhouse_cluster_names" {
+  description = "Configured ClickHouse cluster keys, for deploy.sh to iterate."
+  value       = keys(var.clickhouse_clusters)
+}
+
+output "clickhouse_cluster_config" {
+  description = "Per-cluster render parameters, for deploy.sh to fill the manifest templates."
   value = {
-    enabled          = var.enable_ebs_comparison
-    instance_type    = var.ebs_comparison_instance_type
-    storage_class    = var.enable_ebs_comparison ? kubernetes_storage_class.clickhouse_ebs_comparison[0].metadata[0].name : null
-    volume_size_gib  = var.ebs_comparison_volume_size_gib
-    iops             = var.ebs_comparison_iops
-    throughput_mibps = var.ebs_comparison_throughput_mibps
+    for k, v in var.clickhouse_clusters : k => {
+      storage_profile      = v.storage_profile
+      storage_class        = v.storage_profile == "ebs" ? "ck-${k}-gp3" : "local-storage"
+      shards               = v.shards
+      replicas             = v.replicas
+      zones                = v.zones
+      data_volume_size_gib = v.data_volume_size_gib
+      clickhouse_image     = v.clickhouse_image
+      keeper_image         = v.keeper_image
+      cpu_request          = v.cpu_request
+      memory_request       = v.memory_request
+      enable_backup        = v.enable_backup
+      namespace            = "ck-${k}"
+    }
   }
-}
-
-output "ebs_comparison_volume_size_gib" {
-  description = "PVC size used when rendering the optional EBS comparison CHI."
-  value       = var.ebs_comparison_volume_size_gib
-}
-
-output "ebs_comparison_replica_count" {
-  description = "Replica count used when rendering the optional EBS CHI."
-  value       = length(var.ebs_comparison_zones)
-}
-
-output "local_nvme_comparison" {
-  description = "Resolved benchmark-only local-NVMe profile."
-  value = {
-    enabled        = var.enable_local_nvme_comparison
-    instance_type  = var.local_nvme_comparison_instance_type
-    replica_count  = length(var.local_nvme_comparison_zones) * var.local_nvme_comparison_nodes_per_zone
-    zones          = var.local_nvme_comparison_zones
-    nodes_per_zone = var.local_nvme_comparison_nodes_per_zone
-  }
-}
-
-output "local_nvme_comparison_replica_count" {
-  description = "Replica count used when rendering the benchmark-only local-NVMe CHI."
-  value       = length(var.local_nvme_comparison_zones) * var.local_nvme_comparison_nodes_per_zone
 }

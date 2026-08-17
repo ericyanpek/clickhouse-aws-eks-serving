@@ -2,26 +2,29 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: clickhouse-backup
-  namespace: clickhouse
+  namespace: __NAMESPACE__
   annotations:
-    # Replace with `terraform output -raw backup_role_arn` before apply
+    # Replace with this cluster's entry from `terraform output -json backup_role_arns` before apply
     eks.amazonaws.com/role-arn: "REPLACE_WITH_BACKUP_ROLE_ARN"
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: clickhouse-backup-config
-  namespace: clickhouse
+  namespace: __NAMESPACE__
 data:
   # Replace with `terraform output -raw backup_bucket` and your region before apply
   S3_BUCKET: "REPLACE_WITH_BUCKET"
+  # One prefix per cluster: the backup IAM role only grants s3://<bucket>/<cluster>/*,
+  # so clusters can neither overwrite nor read each other's backups.
+  S3_PATH: "__CLUSTER__"
   S3_REGION: "us-east-1"
 ---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: clickhouse-backup-daily
-  namespace: clickhouse
+  namespace: __NAMESPACE__
 spec:
   schedule: "0 2 * * *" # daily 02:00 UTC
   concurrencyPolicy: Forbid
@@ -45,7 +48,7 @@ spec:
                   BACKUP="backup-$(date +%Y%m%d-%H%M%S)"
                   # 1 shard: any replica holds the full dataset, so back up one replica only.
                   # (chi-<chi>-<cluster>-<shard>-<replica>; shard 0, replica 0.)
-                  BASE="http://chi-ch-main-0-0.clickhouse.svc.cluster.local:7171"
+                  BASE="http://chi-__CLUSTER__-main-0-0.__NAMESPACE__.svc.cluster.local:7171"
                   # background=false makes the REST calls synchronous so curl -sf waits and
                   # a real failure fails the job (create is async by default → upload would race).
                   curl -sf -X POST "$BASE/backup/create?name=$BACKUP&background=false"
