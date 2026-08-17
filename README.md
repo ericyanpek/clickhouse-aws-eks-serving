@@ -10,14 +10,16 @@
 
 本项目提供一套可评审、可执行的 Terraform + Kubernetes IaC，在自有 AWS 账号中部署：
 
-- ClickHouse：**1 分片 × 3 副本**，每副本独占一个跨 AZ 的 `i8g.4xlarge` 节点和本地 NVMe。
-- ClickHouse Keeper：3 节点跨 AZ quorum，数据存放在持久化 EBS。
+- ClickHouse：**按需一个或多个独立集群**，默认单个 1 分片 × 3 副本集群，每副本独占一个跨 AZ 的 `r8g.4xlarge` 节点和独立 gp3 数据卷。
+- ClickHouse Keeper：**每集群独立**一套 3 节点跨 AZ quorum，数据存放在持久化 EBS。
 - Altinity ClickHouse Operator `0.27.1`。
 - Prometheus、Grafana、每日 S3 备份和 IRSA 权限。
 - NVMe 初始化、部署、验证、节点丢失恢复和有序销毁脚本。
-- 可选的 `r8g` + 高性能 gp3 存储对比方案，以及在同一集群内复现选型实验的脚本。
+- 单集群粒度的销毁（`teardown.sh --cluster <key>`），增删任一集群不影响其他集群。
 
-数据卷介质是本项目最主要的取舍点。实测后的**推荐是 EBS gp3**（运维恢复优势明显、性能代价在主流场景内可忽略），本地 NVMe 保留为存储密集场景的性能 profile；但仓库默认部署路径**仍是本地 NVMe**。依据、代价与切换方式见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme)。
+集群集合由 Terraform 的 `clickhouse_clusters` map 定义，map 的 key 就是集群标识符。追加一个集群只需增加一个 key——因为节点组按字符串 key 而非列表序号编址，增删任一集群都不会改动其他集群的资源。每个集群可独立指定拓扑、存储介质、实例规格和 ClickHouse 版本。
+
+数据卷介质是最主要的取舍点。实测后的**默认是 EBS gp3**（运维恢复优势明显、性能代价在主流场景内可忽略），本地 NVMe 作为存储密集场景的性能 profile 同等可用。依据与代价见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme)。
 
 它的核心价值不是替代 ClickHouse Cloud，而是为以下场景提供自管参考实现：
 
@@ -92,7 +94,7 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 
 ### 4.3 数据卷选型：EBS gp3 与本地 NVMe
 
-> **仓库当前默认仍是本地 NVMe。** `./scripts/deploy.sh` 部署的 [生产 CHI](./manifests/templates/20-clickhouse-chi.yaml.tmpl) 使用 `local-storage`。下述**推荐**来自 2026-08-12/13 的实测，采纳它需要按 4.3.4 手工切换存储类，尚未成为仓库默认值。
+> **仓库默认已是 EBS gp3。** `clickhouse_clusters` 的默认值是一个 `storage_profile = "ebs"` 的集群，`./scripts/deploy.sh` 据此渲染 CHI 并挂载每集群独立的 gp3 卷。本地 NVMe 仍是一等选项，只需把该集群的 `storage_profile` 改为 `"local-nvme"`；依据与代价见下。
 
 #### 4.3.1 实测结论
 
@@ -172,17 +174,30 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 至少检查：
 
 ```hcl
-region             = "us-east-1"
-availability_zones = ["us-east-1b", "us-east-1c", "us-east-1d"]
-clickhouse_zones    = ["us-east-1b", "us-east-1c", "us-east-1d"]
+region              = "us-east-1"
+availability_zones  = ["us-east-1a", "us-east-1b", "us-east-1c"]
 
-backup_bucket_name = ""
+backup_bucket_name  = ""
 public_access_cidrs = ["203.0.113.0/24"]
+
+# The set of clusters. Defaults to a single ebs cluster; add a key to add a cluster.
+clickhouse_clusters = {
+  ebs = {
+    storage_profile = "ebs"
+    shards          = 1
+    replicas        = 3
+  }
+  # nvme = {
+  #   storage_profile = "local-nvme"
+  #   shards          = 1
+  #   replicas        = 3
+  # }
+}
 ```
 
-`availability_zones` 和 `clickhouse_zones` 必须是同一区域内三个真实、不同的 AZ。`public_access_cidrs` 默认值会开放 EKS 公网 API，生产环境必须收紧。
+`availability_zones` 必须是同一区域内三个真实、不同的 AZ，且每个集群的 `zones` 必须是它的子集。`public_access_cidrs` 默认值会开放 EKS 公网 API，生产环境必须收紧。
 
-资源值按 `i8g.4xlarge` 定尺。切换实例类型时必须同步调整 [ClickHouse manifest](./manifests/templates/20-clickhouse-chi.yaml.tmpl) 中的 CPU、内存和 PVC 容量。
+每集群的 `cpu_request`、`memory_request` 和 `data_volume_size_gib` 默认按 16 vCPU / 128 GiB 的 Graviton 规格定尺。改 `instance_type` 时必须同步调整这三项，否则 Pod 会因资源超过节点可分配量而无法调度。
 
 ## 8. 部署
 
