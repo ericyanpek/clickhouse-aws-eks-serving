@@ -331,7 +331,33 @@ Scaling nodes to zero, or stopping the EC2 instances, has **completely different
 
 A `local-nvme` cluster therefore has no "stop to save money" option. Saving money there means destroying it and accepting the rebuild, or switching that cluster to the `ebs` profile.
 
-Note also that node groups have `min_size` of 1, and a `local-nvme` cluster's Keeper is `min = max = 1` because quorum membership is fixed and must not autoscale. Scaling to zero therefore requires changing the Terraform configuration rather than adjusting the ASG directly — a direct ASG change is reverted by the next apply.
+#### 12.1.1 The Correct Order for Scaling to Zero (measured 2026-08-18)
+
+Node groups declare `min_size` of 1 (Keeper is `min = max = 1`), and EKS rejects `desired < min`, so **`min` has to come down in the same call**:
+
+```bash
+aws eks update-nodegroup-config --cluster-name clickhouse-eks \
+  --nodegroup-name "$NG" --region us-east-1 \
+  --scaling-config minSize=0,maxSize=1,desiredSize=0
+```
+
+**Scale the `system` node groups down first, then the data and Keeper groups.** The cluster-autoscaler runs on `system`; if the data groups go first, it sees Pending ClickHouse pods and scales those groups straight back up, fighting the scale-down. On the way back up the order reverses: `system` must come up first, because CoreDNS, the operator, and the autoscaler all live there and nothing else reconciles until they are ready.
+
+`terraform apply` is the cleanest way back, since it restores `min_size` to the declared values. Note though that `desired_size` on the ClickHouse node groups sits under `ignore_changes` (the autoscaler owns it at runtime), so it may stay at 0 after an apply and needs to be checked and set separately.
+
+#### 12.1.2 Scaling Everything to Zero Stalls on the PDB, and That Is Expected
+
+When all node groups are scaled to zero at once, 10 of the 16 instances were observed sitting in `Terminating:Wait` inside their ASGs for about five minutes with no progress. **This is not a failure.** The managed node group's termination lifecycle hook drains pods first and honors the operator's `maxUnavailable: 1`. The first node in each pool drains normally, but its pod then has nowhere to go — every node group is heading to zero — so it stays Pending, the PDB never regains headroom, and the remaining evictions block.
+
+The hook's `DefaultResult` is `CONTINUE` with a 1800-second timeout, so it always proceeds eventually and needs no intervention. To release it immediately, complete the lifecycle action explicitly:
+
+```bash
+aws autoscaling complete-lifecycle-action --region us-east-1 \
+  --auto-scaling-group-name "$ASG" --lifecycle-hook-name Terminate-LC-Hook \
+  --instance-id "$IID" --lifecycle-action-result CONTINUE
+```
+
+That is safe when the nodes are going away regardless: ClickHouse is crash-safe against a killed process, and on the `ebs` profile the data volumes are `Retain` and independent of the instance. Do **not** use it during a rolling replacement — skipping the drain there discards exactly the protection the PDB exists to provide.
 
 ## 13. Scope Boundaries and Documentation Rules
 

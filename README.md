@@ -329,7 +329,33 @@ teardown 也刻意做成**可重入且不依赖 Kubernetes API**：它先把所�
 
 所以 `local-nvme` 集群不存在"停机省钱"这个选项——若想省钱只能销毁并接受重灌，或改用 `ebs` profile。
 
-另外节点组的 `min_size` 是 `1`，`local-nvme` 的 Keeper 更是 `min=max=1`（quorum 成员数固定不参与伸缩），因此缩到 0 需要先改 Terraform 配置，而不是直接调 ASG——直接调会被 Terraform 下次 apply 拉回。
+#### 12.1.1 缩到零的正确顺序（2026-08-18 实测）
+
+节点组声明的 `min_size` 是 `1`（Keeper 更是 `min=max=1`），而 EKS 拒绝 `desired < min`，**所以必须在同一次调用里把 `min` 一起降下来**：
+
+```bash
+aws eks update-nodegroup-config --cluster-name clickhouse-eks \
+  --nodegroup-name "$NG" --region us-east-1 \
+  --scaling-config minSize=0,maxSize=1,desiredSize=0
+```
+
+**先缩 `system` 节点组，再缩数据与 Keeper 节点组。** cluster-autoscaler 运行在 `system` 上，若数据节点先缩，它会检测到 Pending 的 ClickHouse Pod 并把节点组重新扩回来，与缩容动作互相对抗。恢复时顺序相反：`system` 必须先起来，因为 CoreDNS、operator 和 autoscaler 都在上面，其余组件在它们就绪前不会开始收敛。
+
+恢复用 `terraform apply` 最干净——它会把 `min_size` 恢复成声明值。但注意 ClickHouse 节点组的 `desired_size` 处于 `ignore_changes` 之下（运行时交由 autoscaler 调整），因此 apply 之后可能仍停留在 0，需要单独确认并设置。
+
+#### 12.1.2 全量缩零会卡在 PDB，属预期
+
+同时把所有节点组缩到 0 时，实测有 16 台中的 10 台在 ASG 里停在 `Terminating:Wait` 约 5 分钟不动。**这不是故障。** 托管节点组的终止生命周期钩子会先驱逐 Pod，并遵守 operator 的 `maxUnavailable: 1`；每个池第一个节点正常排空后，它的 Pod 因为所有节点组都在缩零而无处调度、只能 Pending，PDB 于是再也腾不出配额，剩余驱逐全部阻塞。
+
+钩子的 `DefaultResult` 是 `CONTINUE`、超时 1800 秒，所以最终一定会自行推进，无需干预。要立即放行可以显式完成生命周期动作：
+
+```bash
+aws autoscaling complete-lifecycle-action --region us-east-1 \
+  --auto-scaling-group-name "$ASG" --lifecycle-hook-name Terminate-LC-Hook \
+  --instance-id "$IID" --lifecycle-action-result CONTINUE
+```
+
+这样做在"节点本来就要全部消失"的前提下是安全的：ClickHouse 对进程被杀是崩溃安全的，`ebs` profile 的数据卷是 `Retain` 且独立于实例。但**不要**把这个动作用在滚动替换场景——那时跳过排空就等于放弃了 PDB 的保护。
 
 ## 13. 适用边界与文档规则
 
