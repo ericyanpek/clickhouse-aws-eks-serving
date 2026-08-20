@@ -8,7 +8,11 @@
 
 ## 1. Positioning and Value
 
-This project provides reviewable, executable Terraform + Kubernetes IaC that deploys the following into your AWS account:
+**Core proposition: define ClickHouse as a rebuildable acceleration layer downstream of the lakehouse first, then choose topology and disks.** That order governs every tradeoff that follows — once ClickHouse's role is "rebuildable," losing a local disk no longer means losing authoritative truth, and EBS's value shifts from *preserving data* to *reloading less and replacing nodes faster*. Conversely, if ClickHouse is the only copy of the data, this repository's entire recovery model does not apply.
+
+The question here is not "how do I run ClickHouse on EKS" but: **when the lakehouse is already the sole source of truth, how do you build a rebuildable, low-latency, operable OLAP acceleration layer with self-managed ClickHouse.** The central tension trades **query performance and control** against **recovery complexity and operational burden** — and this repository's defaults consistently favor the latter, because authoritative durability already lives in the upstream lakehouse.
+
+Concretely it delivers reviewable, executable Terraform + Kubernetes IaC that deploys the following into your AWS account:
 
 - ClickHouse: **one or more independent clusters on demand**, defaulting to a single 1 shard × 3 replica cluster, each replica on a dedicated cross-AZ `r8g.4xlarge` node with its own gp3 data volume.
 - ClickHouse Keeper: a **dedicated** 3-node cross-AZ quorum **per cluster**, with persistent EBS storage.
@@ -30,6 +34,20 @@ Its value is not to replace ClickHouse Cloud. It is a self-managed reference imp
 
 For a ClickHouse Cloud-to-OSS migration POC, this repository addresses EKS deployment, storage, HA, backup, and operations. It does **not** include Kafka/Flink dual-write, historical backfill, result comparison, or traffic cutover logic; those belong to the upstream data pipeline.
 
+**Whether this approach fits you depends on six variables (data role, working set, recovery constraint, single-query compute, organizational capacity, AZ supply), covered in [4.0](#40-first-decide-whether-this-approach-fits).** Read that section before going further — if the control that self-managing buys is not needed, the complexity here is pure cost.
+
+When comparing approaches, only four things are worth comparing, and each is "what you traded for" rather than "which is more modern":
+
+| Approach | What you actually trade for |
+|---|---|
+| ClickHouse Cloud | Less control, for a smaller incident surface |
+| Self-managed EC2 | One less control plane (Kubernetes) |
+| This repository (EKS + self-managed CHI) | Platform complexity, for reviewable and reusable IaC |
+| Default EBS `1×3` | About 9% monthly cost, for simpler recovery (reattach a volume instead of reloading) |
+| Local NVMe profile | Reload risk, for throughput headroom |
+
+One differentiating value of this repository is that **storage medium selection is a reproducible measurement rather than a judgment call.** Both media were deployed in parallel on one EKS, producing five classes of evidence — query, merge, device-level I/O, recovery RTO, and cost — with explicit notes on which conclusions do **not** hold. The measured numbers are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) and [11](#11-backup-and-recovery); boundaries and gaps are in each report's "what cannot be claimed" section.
+
 ## 2. Current Architecture
 
 ```text
@@ -43,15 +61,21 @@ Sole SoT, complete history, replayable
          | incremental load / replay
          v
 +------------------------- Amazon EKS, 3 AZ -------------------------+
-| ClickHouse 1 shard x 3 replicas                                   |
-|   i8g.4xlarge + local NVMe, one Pod per node                      |
 |                                                                    |
-| ClickHouse Keeper 3 nodes + EBS                                   |
-| Altinity Operator + local-static-provisioner                      |
-| Prometheus + Grafana                                               |
+|  cluster "ebs"  (namespace ck-ebs)      <- default                 |
+|    ClickHouse 1 shard x 3 replicas                                 |
+|      r8g.4xlarge + gp3 data volume, one Pod per node               |
+|    Keeper 3 nodes + gp3            <- dedicated per cluster        |
+|                                                                    |
+|  cluster "<key>" (namespace ck-<key>)   <- added on demand         |
+|    topology / medium / instance / version all set per cluster      |
+|    Keeper 3 nodes + gp3            <- not shared with "ebs"        |
+|                                                                    |
+|  shared: Altinity Operator, Prometheus + Grafana,                  |
+|          cluster-autoscaler, local-static-provisioner (if nvme)    |
 +------------------------------+-------------------------------------+
                                |
-                               | daily backup via IRSA
+                               | daily backup via IRSA, prefix per cluster
                                v
                     S3 backup bucket (not the SoT)
 ```
@@ -61,12 +85,14 @@ Key properties:
 | Dimension | Current implementation |
 |---|---|
 | Data role | Lakehouse is the sole SoT; ClickHouse is an eventually consistent, rebuildable OLAP acceleration layer |
-| ClickHouse topology | 1 shard × 3 replicas, fixed at 3 data nodes |
-| Data storage | Default is approximately 3.4 TiB local NVMe per replica, `ReplicatedMergeTree`; measurements recommend gp3 instead, see [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) |
-| Coordination | 3-node Keeper on EBS `gp3-encrypted` |
+| Cluster count | One EKS hosts N mutually independent ClickHouse clusters, defined by the `clickhouse_clusters` map |
+| Per-cluster topology | 1 shard × 3 replicas by default; `shards` and `replicas` are set independently per cluster |
+| Data storage | **EBS gp3 by default** (3,400 GiB / 20,000 IOPS / 1,250 MiB/s per replica); local NVMe is an equally supported performance profile, see [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) |
+| Coordination | A **dedicated** 3-node Keeper per cluster, cross-AZ quorum, gp3-backed |
+| Isolation granularity | Namespace, CHI, Keeper, node groups, StorageClass, IRSA role, and S3 prefix all derive from the cluster key |
 | Service exposure | `ClusterIP`, not publicly exposed by default |
 | Disaster recovery | ClickHouse replicas + daily S3 backup; the upstream lakehouse remains the authoritative full-recovery source |
-| Images | ClickHouse / Keeper `25.3` LTS |
+| Images | ClickHouse / Keeper `25.3` LTS, operator `0.27.1` |
 
 ## 3. Data Flow and Kafka/Flink Boundary
 
@@ -81,6 +107,29 @@ Recommended data ownership:
 Possible ingestion patterns include a Flink ClickHouse connector, Kafka engine + Materialized View, batch `INSERT SELECT` from Iceberg/Parquet, or externally orchestrated incremental backfill. The right choice depends on delivery semantics and throughput. This repository neither implements nor promises exactly-once delivery.
 
 ## 4. Key Design Tradeoffs
+
+### 4.0 First Decide Whether This Approach Fits
+
+The sections that follow are about choosing *within* a self-managed deployment. The prior question is **whether to self-manage at all**. These six variables actually change the answer; most others (team preference, enthusiasm for Kubernetes, whether an instance family is newer) do not.
+
+| Variable | When it leans this way | How the conclusion changes |
+|---|---|---|
+| **Data role** | ClickHouse is the only copy, with no replayable upstream | **This repository's recovery model does not apply.** Every design premise assumes ClickHouse is rebuildable |
+| **Working set** | Hot data fits in memory | EBS gp3 by default; the storage medium is nearly unobservable |
+| **Recovery constraint** | Node replacement must require zero rebuild | EBS is mandatory *and* node groups must be pinned to a single-AZ subnet; neither alone suffices |
+| **Single-query compute** | One query must span several machines | Only then consider sharding; otherwise scale up first |
+| **Organizational capacity** | No platform team to operate EKS and stateful workloads | ClickHouse Cloud or EC2 is usually the better fit |
+| **AZ supply** | The target instance type is unavailable in all 3 AZs | Cross-AZ HA exists only on the diagram; see the capacity risk in [6](#6-prerequisites-and-cost) |
+
+A few decision rules, in priority order:
+
+1. **Without a hard self-management requirement, prefer ClickHouse Cloud.** What this IaC buys is control over topology, storage, scheduling, and upgrade cadence — **not lighter operations**. If that control is not needed, the complexity is pure cost.
+2. **When the lakehouse is already the SoT and the goal is low-latency serving, a self-managed acceleration layer is justified.** Authoritative durability lives upstream, so the ClickHouse side can trade "rebuildable" for simplicity.
+3. **While one node still holds the data and single queries are still acceptable, do not shard.** Adding a shard does not migrate historical data, and re-sharding costs far more than provisioning headroom.
+4. **When queries are predominantly warm, choose EBS gp3.** The recovery model shifts from reloading data to reattaching a volume, and the price is 8.77% more per month.
+5. **When several clusters must coexist on one EKS, the cluster identity must be a map key rather than a list index** — otherwise adding or removing one cluster rebuilds the others' node groups.
+
+**Two signals that things have drifted:** someone starts calling ClickHouse or the backup bucket "where the data lives"; or cross-AZ HA is drawn on the architecture diagram while the actual instances are crowded into a single AZ.
 
 ### 4.1 EKS vs. EC2
 
@@ -148,7 +197,7 @@ Switching to EBS requires changing three things together: the CHI's `storageClas
 - **Altinity Terraform EKS Blueprint:** this project reuses its VPC/EKS/node-group and operator infrastructure, but replaces its encapsulated cluster layer with owned CHI/CHK manifests.
 - **AWS data-on-eks:** a broader data-platform reference stack; this project focuses on a fixed 1×3 topology, dedicated nodes, a selectable storage medium, and fewer dependencies.
 
-One way this project differentiates from the above is that storage-medium selection is treated as a **reproducible measurement** rather than a judgment call: both media are deployed in parallel on one cluster, producing five classes of evidence -- query, merge, device-level I/O, recovery RTO, and cost -- with explicit notes on which conclusions do not hold.
+The tradeoff matrix across these four is in [1](#1-positioning-and-value), and whether to self-manage at all is in [4.0](#40-first-decide-whether-this-approach-fits). Design rationale, measurement reports, and the authority level of historical material are in the [documentation index](./docs/README.md).
 
 See the [documentation index](./docs/README.en.md) for the status of design evidence, performance results, and historical records.
 
@@ -259,19 +308,24 @@ That deletes only that cluster's CHI, Keeper, namespace, node groups, and Storag
 
 ## 9. Validation and Access
 
+Each cluster has its own namespace, `ck-<cluster key>`, so every command below carries the cluster key. Using the default `ebs` cluster:
+
 ```bash
-kubectl -n clickhouse get chi,chk,pods
-./scripts/smoke-test.sh
+kubectl -n ck-ebs get chi,chk,pods
+CLICKHOUSE_NAMESPACE=ck-ebs CLICKHOUSE_CHI=ebs \
+  CLICKHOUSE_ADMIN_PASSWORD='...' ./scripts/smoke-test.sh
 ```
 
-The smoke test validates the 1×3 topology, ReplicatedMergeTree writes, cross-replica synchronization, and `system.replicas`.
+`deploy.sh` already runs the smoke test once per cluster; the above is how to re-run it afterwards. It reads the expected topology from the CHI and asserts `system.clusters` against it, then validates ReplicatedMergeTree writes, cross-replica synchronization, and that the `system.replicas` queues drain. Topology and replica count are not hardcoded, so clusters that are not 1×3 are covered too.
 
 ClickHouse is available only inside the cluster by default. For temporary access:
 
 ```bash
-kubectl -n clickhouse port-forward svc/clickhouse-ch 8123:8123
+kubectl -n ck-ebs port-forward svc/clickhouse-ebs 8123:8123
 curl -u admin:yourpassword "http://localhost:8123/?query=SELECT+version()"
 ```
+
+The service is named `clickhouse-<cluster key>`, and pods are named `chi-<cluster key>-main-<shard>-<replica>-0`.
 
 ## 10. Monitoring
 
@@ -283,21 +337,23 @@ Monitor replica delay, replication queues, disk usage, merge backlog, query late
 
 ## 11. Backup and Recovery
 
-A daily CronJob calls `clickhouse-backup` at `02:00 UTC` and uploads one complete replica of the single shard to a versioned, encrypted, public-access-blocked S3 bucket.
+Every cluster with backup enabled gets its own daily CronJob, which calls `clickhouse-backup` at `02:00 UTC` and uploads one complete replica of its shard to S3. The bucket is shared, versioned, encrypted, and public-access-blocked, but **each cluster writes to its own prefix**, `s3://<bucket>/<cluster key>/`, and each cluster's IRSA role is authorized only for that prefix — one cluster's backup credentials cannot read or write another's.
 
-Inspect backups:
+Inspect backups (using the `ebs` cluster):
 
 ```bash
-kubectl -n clickhouse get cronjob clickhouse-backup-daily
-kubectl -n clickhouse get jobs
+kubectl -n ck-ebs get cronjob clickhouse-backup-daily
+kubectl -n ck-ebs get jobs
 cd terraform && terraform output -raw backup_bucket
 ```
 
-When a local-NVMe node is permanently lost, Kubernetes does not automatically move its PVC to a new node. After confirming that the node will not return and at least one other replica is healthy, run:
+An individual cluster can set `enable_backup = false`, in which case its ServiceAccount, ConfigMap, CronJob, and the CHI sidecar are all left unrendered.
+
+When a local-NVMe node is permanently lost, Kubernetes does not automatically move its PVC to a new node. After confirming that the node will not return and at least one other replica is healthy, run the following (the argument is the StatefulSet name, of the form `chi-<cluster key>-main-<shard>-<replica>`):
 
 ```bash
 CONFIRM_REPLICA_DATA_LOSS=yes \
-  ./scripts/recover-local-replica.sh chi-ch-main-0-1
+  ./scripts/recover-local-replica.sh chi-nvme-main-0-1
 ```
 
 The script refuses to delete a Ready Pod, handles only a `local-storage` PVC, briefly pauses the operator while removing the old Pod/PVC/PV, restores the operator, and waits for the replacement replica. After the Pod is Ready, verify that `system.replicas` queues have drained.

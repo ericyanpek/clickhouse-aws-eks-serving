@@ -8,7 +8,11 @@
 
 ## 1. 项目定位与价值
 
-本项目提供一套可评审、可执行的 Terraform + Kubernetes IaC，在自有 AWS 账号中部署：
+**核心命题：先把 ClickHouse 定义成湖仓下游的可重建加速层，再去选拓扑和磁盘。** 这个顺序决定了后面所有取舍——一旦 ClickHouse 的角色是"可重建"，本地盘丢数据就不再等于丢权威事实，而 EBS 的价值也从"保住数据"变成"少重灌、快换节点"。反过来，如果 ClickHouse 是唯一数据源，本仓库的整套恢复模型都不适用。
+
+它要回答的问题不是"怎么把 ClickHouse 跑上 EKS"，而是：**湖仓已经是唯一事实来源时，如何用自管 ClickHouse 做一个可重建、低延迟、可运维的 OLAP 加速层。** 中心矛盾是**查询性能与控制权**换**恢复复杂度与运维负担**——本仓库的默认选择一律偏向后者，因为权威 durability 已经由上游湖仓承担。
+
+具体交付一套可评审、可执行的 Terraform + Kubernetes IaC，在自有 AWS 账号中部署：
 
 - ClickHouse：**按需一个或多个独立集群**，默认单个 1 分片 × 3 副本集群，每副本独占一个跨 AZ 的 `r8g.4xlarge` 节点和独立 gp3 数据卷。
 - ClickHouse Keeper：**每集群独立**一套 3 节点跨 AZ quorum，数据存放在持久化 EBS。
@@ -30,6 +34,20 @@
 
 对于从 ClickHouse Cloud 迁移到 OSS 的 POC，本仓库可回答 EKS 部署、存储、HA、备份和运维问题；它**不包含** Kafka/Flink 双写、历史数据回填、结果比对或切流逻辑，这些属于上游数据管道。
 
+**这套方案适不适合你，取决于六个变量（数据角色、工作集、恢复约束、单查询算力、组织能力、AZ 供给），见 [4.0](#40-先判断这套方案适不适合你)。** 先读那一节再决定是否继续——如果不需要自管带来的控制权，这里的复杂度就是净成本。
+
+比较方案时，值得比的只有四件事，每件都是"换到了什么"而不是"哪个更先进"：
+
+| 方案 | 真正换到的东西 |
+|---|---|
+| ClickHouse Cloud | 少控制权，换少事故面 |
+| EC2 自管 | 少一层 Kubernetes 控制面 |
+| 本仓库（EKS + 自管 CHI） | 用平台复杂度换可评审、可复用的 IaC |
+| 默认 EBS `1×3` | 用约 9% 月成本换恢复简单（重挂卷而非重灌） |
+| 本地 NVMe profile | 用重灌风险换吞吐余量 |
+
+本仓库相对其他方案的一项差异化价值是：**存储介质选型是可复现的实测，不是经验判断。** 同一 EKS 内并行部署两种介质，产出查询、merge、设备级 I/O、恢复 RTO 和成本五类证据，并明确标注哪些结论**不**成立。实测数字见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme) 与 [11](#11-备份与恢复)，边界与未覆盖项见各报告的"不能主张的"章节。
+
 ## 2. 当前架构
 
 ```text
@@ -43,15 +61,21 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
          | incremental load / replay
          v
 +------------------------- Amazon EKS, 3 AZ -------------------------+
-| ClickHouse 1 shard x 3 replicas                                   |
-|   i8g.4xlarge + local NVMe, one Pod per node                      |
 |                                                                    |
-| ClickHouse Keeper 3 nodes + EBS                                   |
-| Altinity Operator + local-static-provisioner                      |
-| Prometheus + Grafana                                               |
+|  cluster "ebs"  (namespace ck-ebs)      <- default                 |
+|    ClickHouse 1 shard x 3 replicas                                 |
+|      r8g.4xlarge + gp3 data volume, one Pod per node               |
+|    Keeper 3 nodes + gp3            <- dedicated per cluster        |
+|                                                                    |
+|  cluster "<key>" (namespace ck-<key>)   <- added on demand         |
+|    topology / medium / instance / version all set per cluster      |
+|    Keeper 3 nodes + gp3            <- not shared with "ebs"        |
+|                                                                    |
+|  shared: Altinity Operator, Prometheus + Grafana,                  |
+|          cluster-autoscaler, local-static-provisioner (if nvme)    |
 +------------------------------+-------------------------------------+
                                |
-                               | daily backup via IRSA
+                               | daily backup via IRSA, prefix per cluster
                                v
                     S3 backup bucket (not the SoT)
 ```
@@ -61,12 +85,14 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 | 维度 | 当前实现 |
 |---|---|
 | 数据角色 | 湖仓是唯一 SoT；ClickHouse 是最终一致、可重建的派生 OLAP 加速层 |
-| ClickHouse 拓扑 | 1 shard × 3 replicas，固定 3 个数据节点 |
-| 数据存储 | 默认每副本约 3.4 TiB 本地 NVMe，`ReplicatedMergeTree`；实测后推荐改用 gp3，见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme) |
-| 协调层 | 3 节点 Keeper，EBS `gp3-encrypted` |
+| 集群数量 | 一套 EKS 承载 N 个互相独立的 ClickHouse 集群，由 `clickhouse_clusters` map 定义 |
+| 每集群拓扑 | 默认 1 shard × 3 replicas；`shards` 与 `replicas` 每集群可独立设置 |
+| 数据存储 | **默认 EBS gp3**（每副本 3,400 GiB / 20,000 IOPS / 1,250 MiB/s）；本地 NVMe 是同等可用的性能 profile，见 [4.3](#43-数据卷选型ebs-gp3-与本地-nvme) |
+| 协调层 | **每集群独立**一套 3 节点 Keeper，跨 AZ quorum，gp3 持久化 |
+| 隔离粒度 | namespace、CHI、Keeper、节点组、StorageClass、IRSA 角色、S3 前缀全部按集群 key 派生 |
 | 服务暴露 | `ClusterIP`，默认不公网暴露 |
 | 灾备 | ClickHouse 副本 + 每日 S3 备份；全量权威恢复源仍是上游湖仓 |
-| 镜像 | ClickHouse / Keeper `25.3` LTS |
+| 镜像 | ClickHouse / Keeper `25.3` LTS，operator `0.27.1` |
 
 ## 3. 数据流与 Kafka/Flink 边界
 
@@ -81,6 +107,29 @@ Data Lakehouse on S3 (Iceberg / Delta / Hudi / Parquet)
 可选摄入方式包括 Flink ClickHouse connector、Kafka engine + Materialized View、从 Iceberg/Parquet 批量 `INSERT SELECT`，或外部编排的增量回填。具体选择取决于交付语义和吞吐量，本仓库不替用户实现或承诺 exactly-once。
 
 ## 4. 关键设计取舍
+
+### 4.0 先判断这套方案适不适合你
+
+后面几节讨论的都是"选定自管之后怎么选"，但更前置的问题是**该不该用这套方案**。下面六个变量是实际会改变结论的；其余（团队偏好、是否喜欢 Kubernetes、机型是否更新）通常不改变结论。
+
+| 变量 | 往这边偏时 | 结论怎么变 |
+|---|---|---|
+| **数据角色** | ClickHouse 是唯一数据源，没有可重放的上游 | **本仓库的恢复模型不适用。** 全部设计前提是 ClickHouse 可重建 |
+| **工作集** | 热数据装得进内存 | 默认 EBS gp3；存储介质的差异几乎观察不到 |
+| **恢复约束** | 节点替换必须零重建 | 必须 EBS + 节点组绑单 AZ 子网，两者缺一不可 |
+| **单查询算力** | 一条查询必须吃多台机器 | 才需要考虑分片；否则先垂直扩容 |
+| **组织能力** | 没有平台团队运维 EKS 和有状态负载 | ClickHouse Cloud 或 EC2 通常更合适 |
+| **AZ 供给** | 目标机型在 3 个 AZ 买不齐 | 跨 AZ HA 只存在于图纸上，见 [6](#6-前置条件与成本) 的容量风险 |
+
+几条判断规则，按优先级排列：
+
+1. **没有自管硬需求时，优先 ClickHouse Cloud。** 这套 IaC 换来的是拓扑、存储、调度和升级节奏的控制权，**不是更轻的运维**。如果不需要那份控制权，复杂度就是净成本。
+2. **湖仓已是 SoT、目标是低延迟 serving 时，自管加速层成立。** 权威 durability 已经被上游拿走，ClickHouse 侧可以用"能重建"换简单。
+3. **单节点还装得下、单查询还能接受时，不要分片。** 加 shard 不会自动搬迁历史数据，re-sharding 的代价远高于预留容量。
+4. **查询以 warm 为主时，选 EBS gp3。** 恢复模型从"重灌数据"变成"重挂卷"，代价只是月成本贵 8.77%。
+5. **要在一套 EKS 上并存多个集群时，集群标识必须是 map key 而非列表序号**，否则增删一个集群会重建其他集群的节点组。
+
+**判断自己是否已经跑偏的两个信号：** 有人开始把 ClickHouse 或备份桶称作"数据的家"；或者跨 AZ HA 画在架构图上，但实际机型挤在同一个 AZ 里。
 
 ### 4.1 EKS 与 EC2
 
@@ -148,7 +197,7 @@ merge 那一行的机制值得单独说明：两种介质**累计搬运的字节
 - **Altinity Terraform EKS Blueprint**：本项目复用其 VPC/EKS/节点组和 operator 基础设施层，但用自有 CHI/CHK 清单替换其封装的集群层。
 - **AWS data-on-eks**：更偏完整数据平台样板；本项目聚焦固定 1×3、专属节点、可选存储介质和较少依赖。
 
-本项目相对上述方案的差异化价值之一，是把存储介质选型做成了**可复现的实测**而不是经验判断：同一集群内并行部署两种介质，产出查询、merge、设备级 I/O、恢复 RTO 和成本五类证据，并明确标注哪些结论不成立。设计依据、实测报告和历史材料的状态见 [文档索引](./docs/README.md)。
+这四者的取舍矩阵见 [1](#1-项目定位与价值)，是否该自管见 [4.0](#40-先判断这套方案适不适合你)。设计依据、实测报告和历史材料的权威级别见 [文档索引](./docs/README.md)。
 
 ## 6. 前置条件与成本
 
@@ -257,19 +306,24 @@ clickhouse_clusters = {
 
 ## 9. 验证与访问
 
+每个集群有自己的 namespace `ck-<集群 key>`，所以下面的命令都要带上集群 key。以默认的 `ebs` 集群为例：
+
 ```bash
-kubectl -n clickhouse get chi,chk,pods
-./scripts/smoke-test.sh
+kubectl -n ck-ebs get chi,chk,pods
+CLICKHOUSE_NAMESPACE=ck-ebs CLICKHOUSE_CHI=ebs \
+  CLICKHOUSE_ADMIN_PASSWORD='...' ./scripts/smoke-test.sh
 ```
 
-Smoke test 会验证 1×3 拓扑、ReplicatedMergeTree 写入、跨副本复制和 `system.replicas`。
+`deploy.sh` 已对每个集群跑过一次 smoke test，上面是事后单独复验的方式。它会从 CHI 读取期望拓扑并据此断言 `system.clusters`、验证 ReplicatedMergeTree 写入、跨副本复制和 `system.replicas` 队列归零——拓扑与副本数不是硬编码的，因此非 1×3 的集群同样适用。
 
 ClickHouse 默认仅在集群内可用。临时访问：
 
 ```bash
-kubectl -n clickhouse port-forward svc/clickhouse-ch 8123:8123
+kubectl -n ck-ebs port-forward svc/clickhouse-ebs 8123:8123
 curl -u admin:yourpassword "http://localhost:8123/?query=SELECT+version()"
 ```
+
+Service 名是 `clickhouse-<集群 key>`，Pod 名形如 `chi-<集群 key>-main-<shard>-<replica>-0`。
 
 ## 10. 监控
 
@@ -281,21 +335,23 @@ kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
 
 ## 11. 备份与恢复
 
-每日 CronJob 在 `02:00 UTC` 调用 `clickhouse-backup`，将单分片的一个完整副本上传到版本化、加密并阻断公有访问的 S3 bucket。
+每个启用了备份的集群都有自己的每日 CronJob，在 `02:00 UTC` 调用 `clickhouse-backup`，将该分片的一个完整副本上传到 S3。bucket 是共享的、版本化、加密并阻断公有访问，但**每个集群写入自己的前缀** `s3://<bucket>/<集群 key>/`，且各自的 IRSA 角色只被授权该前缀——一个集群的备份凭据无法读写另一个集群的备份。
 
-查看备份：
+查看备份（以 `ebs` 集群为例）：
 
 ```bash
-kubectl -n clickhouse get cronjob clickhouse-backup-daily
-kubectl -n clickhouse get jobs
+kubectl -n ck-ebs get cronjob clickhouse-backup-daily
+kubectl -n ck-ebs get jobs
 cd terraform && terraform output -raw backup_bucket
 ```
 
-永久丢失本地 NVMe 节点时，Kubernetes 不会自动把 PVC 移到新节点。确认故障节点不会恢复且至少一个其他副本健康后执行：
+单个集群可以用 `enable_backup = false` 关闭备份，此时该集群的 ServiceAccount、ConfigMap、CronJob 和 CHI 里的 sidecar 都不会被渲染。
+
+永久丢失本地 NVMe 节点时，Kubernetes 不会自动把 PVC 移到新节点。确认故障节点不会恢复且至少一个其他副本健康后执行（参数是 StatefulSet 名，形如 `chi-<集群 key>-main-<shard>-<replica>`）：
 
 ```bash
 CONFIRM_REPLICA_DATA_LOSS=yes \
-  ./scripts/recover-local-replica.sh chi-ch-main-0-1
+  ./scripts/recover-local-replica.sh chi-nvme-main-0-1
 ```
 
 脚本拒绝删除 Ready Pod，只处理 `local-storage` PVC，并在清理旧 Pod/PVC/PV 时短暂停止 operator，随后恢复 operator 并等待新副本。Pod Ready 后仍需检查 `system.replicas` 队列归零。
