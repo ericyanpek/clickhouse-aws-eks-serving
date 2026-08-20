@@ -8,11 +8,11 @@
 
 ## 1. Positioning and Value
 
-**Core proposition: define ClickHouse as a rebuildable acceleration layer downstream of the lakehouse first, then choose topology and disks.** That order governs every tradeoff that follows — once ClickHouse's role is "rebuildable," losing a local disk no longer means losing authoritative truth, and EBS's value shifts from *preserving data* to *reloading less and replacing nodes faster*. Conversely, if ClickHouse is the only copy of the data, this repository's entire recovery model does not apply.
+**The question is not "how do I run ClickHouse on EKS" but: when the lakehouse is already the sole source of truth, how do you build a rebuildable, low-latency, operable OLAP acceleration layer with self-managed ClickHouse.**
 
-The question here is not "how do I run ClickHouse on EKS" but: **when the lakehouse is already the sole source of truth, how do you build a rebuildable, low-latency, operable OLAP acceleration layer with self-managed ClickHouse.** The central tension trades **query performance and control** against **recovery complexity and operational burden** — and this repository's defaults consistently favor the latter, because authoritative durability already lives in the upstream lakehouse.
+**Core proposition: define ClickHouse as a rebuildable acceleration layer first, then choose topology and disks.** That order governs every tradeoff that follows — once the role is "rebuildable," losing a local disk no longer means losing authoritative truth, and EBS's value shifts from preserving data to reloading less and replacing nodes faster. If ClickHouse is the only copy of the data, this repository's recovery model does not apply.
 
-Concretely it delivers reviewable, executable Terraform + Kubernetes IaC that deploys the following into your AWS account:
+It delivers reviewable, executable Terraform + Kubernetes IaC, deployed into your own AWS account:
 
 - ClickHouse: **one or more independent clusters on demand**, defaulting to a single 1 shard × 3 replica cluster, each replica on a dedicated cross-AZ `r8g.4xlarge` node with its own gp3 data volume.
 - ClickHouse Keeper: a **dedicated** 3-node cross-AZ quorum **per cluster**, with persistent EBS storage.
@@ -25,28 +25,21 @@ The set of clusters is defined by the Terraform `clickhouse_clusters` map, whose
 
 The data volume medium is the primary tradeoff. After measurement the **default is EBS gp3** (clear operational recovery advantages, negligible performance cost in mainstream scenarios), with local NVMe equally available as a performance profile for storage-bound workloads. Rationale and costs are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme).
 
-Its value is not to replace ClickHouse Cloud. It is a self-managed reference implementation for cases where:
+It suits cases where data must stay inside your own VPC, you need control over topology and upgrade cadence, and the lakehouse already owns the sole data truth. It does **not replace ClickHouse Cloud**: what it buys is control, not lighter operations. Whether it fits you depends on six variables, see [4.0](#40-first-decide-whether-this-approach-fits).
 
-- Data must run entirely inside your AWS account and VPC.
-- You need control over ClickHouse topology, scheduling, settings, storage, and upgrade timing.
-- The lakehouse already owns the sole data truth and needs a rebuildable hot-query acceleration layer.
-- You need consistent IaC for a POC, cost assessment, performance validation, and compliance review.
+What each approach trades for:
 
-For a ClickHouse Cloud-to-OSS migration POC, this repository addresses EKS deployment, storage, HA, backup, and operations. It does **not** include Kafka/Flink dual-write, historical backfill, result comparison, or traffic cutover logic; those belong to the upstream data pipeline.
-
-**Whether this approach fits you depends on six variables (data role, working set, recovery constraint, single-query compute, organizational capacity, AZ supply), covered in [4.0](#40-first-decide-whether-this-approach-fits).** Read that section before going further — if the control that self-managing buys is not needed, the complexity here is pure cost.
-
-When comparing approaches, only four things are worth comparing, and each is "what you traded for" rather than "which is more modern":
-
-| Approach | What you actually trade for |
+| Approach | Trades |
 |---|---|
 | ClickHouse Cloud | Less control, for a smaller incident surface |
 | Self-managed EC2 | One less control plane (Kubernetes) |
-| This repository (EKS + self-managed CHI) | Platform complexity, for reviewable and reusable IaC |
-| Default EBS `1×3` | About 9% monthly cost, for simpler recovery (reattach a volume instead of reloading) |
+| This repository (EKS + self-managed CHI) | Platform complexity, for reviewable IaC |
+| Default EBS `1×3` | ~9% monthly cost, for reattaching a volume instead of reloading |
 | Local NVMe profile | Reload risk, for throughput headroom |
 
-One differentiating value of this repository is that **storage medium selection is a reproducible measurement rather than a judgment call.** Both media were deployed in parallel on one EKS, producing five classes of evidence — query, merge, device-level I/O, recovery RTO, and cost — with explicit notes on which conclusions do **not** hold. The measured numbers are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) and [11](#11-backup-and-recovery); boundaries and gaps are in each report's "what cannot be claimed" section.
+**Storage medium selection is a reproducible measurement, not a judgment call** — both media were deployed in parallel on one EKS, producing five classes of evidence (query, merge, device-level I/O, recovery RTO, cost) with explicit notes on which conclusions do **not** hold. Numbers are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) and [11](#11-backup-and-recovery).
+
+As a Cloud-to-OSS migration POC, this repository covers EKS deployment, storage, HA, backup, and operations. It does **not** include Kafka/Flink dual-write, historical backfill, result comparison, or traffic cutover; those belong to the upstream pipeline.
 
 ## 2. Current Architecture
 
@@ -110,26 +103,26 @@ Possible ingestion patterns include a Flink ClickHouse connector, Kafka engine +
 
 ### 4.0 First Decide Whether This Approach Fits
 
-The sections that follow are about choosing *within* a self-managed deployment. The prior question is **whether to self-manage at all**. These six variables actually change the answer; most others (team preference, enthusiasm for Kubernetes, whether an instance family is newer) do not.
+The sections that follow are about choosing *within* a self-managed deployment; the prior question is **whether to self-manage at all**. Only these six variables change the answer — team preference and instance-family recency do not:
 
-| Variable | When it leans this way | How the conclusion changes |
+| Variable | When it leans this way | Conclusion |
 |---|---|---|
-| **Data role** | ClickHouse is the only copy, with no replayable upstream | **This repository's recovery model does not apply.** Every design premise assumes ClickHouse is rebuildable |
-| **Working set** | Hot data fits in memory | EBS gp3 by default; the storage medium is nearly unobservable |
-| **Recovery constraint** | Node replacement must require zero rebuild | EBS is mandatory *and* node groups must be pinned to a single-AZ subnet; neither alone suffices |
-| **Single-query compute** | One query must span several machines | Only then consider sharding; otherwise scale up first |
-| **Organizational capacity** | No platform team to operate EKS and stateful workloads | ClickHouse Cloud or EC2 is usually the better fit |
-| **AZ supply** | The target instance type is unavailable in all 3 AZs | Cross-AZ HA exists only on the diagram; see the capacity risk in [6](#6-prerequisites-and-cost) |
+| **Data role** | ClickHouse is the only copy, no replayable upstream | **Recovery model does not apply**; every premise assumes rebuildable |
+| **Working set** | Hot data fits in memory | Choose EBS gp3; the medium is nearly unobservable |
+| **Recovery constraint** | Node replacement must require zero rebuild | EBS *and* single-AZ subnet pinning; neither alone suffices |
+| **Single-query compute** | One query must span several machines | Only then shard; otherwise scale up |
+| **Organizational capacity** | No platform team | Cloud or EC2 fits better |
+| **AZ supply** | Target type unavailable in all 3 AZs | Cross-AZ HA is diagram-only, see [6](#6-prerequisites-and-cost) |
 
-A few decision rules, in priority order:
+Decision rules, in priority order:
 
-1. **Without a hard self-management requirement, prefer ClickHouse Cloud.** What this IaC buys is control over topology, storage, scheduling, and upgrade cadence — **not lighter operations**. If that control is not needed, the complexity is pure cost.
-2. **When the lakehouse is already the SoT and the goal is low-latency serving, a self-managed acceleration layer is justified.** Authoritative durability lives upstream, so the ClickHouse side can trade "rebuildable" for simplicity.
-3. **While one node still holds the data and single queries are still acceptable, do not shard.** Adding a shard does not migrate historical data, and re-sharding costs far more than provisioning headroom.
-4. **When queries are predominantly warm, choose EBS gp3.** The recovery model shifts from reloading data to reattaching a volume, and the price is 8.77% more per month.
-5. **When several clusters must coexist on one EKS, the cluster identity must be a map key rather than a list index** — otherwise adding or removing one cluster rebuilds the others' node groups.
+1. **Without a hard self-management requirement, choose Cloud.** This IaC buys control, not lighter operations.
+2. **When the lakehouse is already the SoT, a self-managed acceleration layer is justified** — authoritative durability lives upstream, so this side can trade "rebuildable" for simplicity.
+3. **While one node still holds the data, do not shard.** Adding a shard does not migrate historical data, and re-sharding costs far more than provisioning headroom.
+4. **When queries are predominantly warm, choose EBS gp3.** Recovery shifts from reloading to reattaching, at 8.77% more per month.
+5. **With several clusters on one EKS, the cluster identity must be a map key** — a list index makes adding or removing one cluster rebuild the others' node groups.
 
-**Two signals that things have drifted:** someone starts calling ClickHouse or the backup bucket "where the data lives"; or cross-AZ HA is drawn on the architecture diagram while the actual instances are crowded into a single AZ.
+**Drift signals:** someone calls ClickHouse or the backup bucket "where the data lives"; or cross-AZ HA is drawn on the diagram while the instances are crowded into a single AZ.
 
 ### 4.1 EKS vs. EC2
 
@@ -372,24 +365,24 @@ If every ClickHouse replica is lost, rebuild by partition from the upstream lake
 
 The script removes in-cluster resources before destroying EKS/VPC. It retains the S3 backup bucket together with versioning, encryption, and public-access-block settings, and removes those resources from Terraform state. It prints the exact bucket name. Delete all object versions and the bucket manually only after confirming that the backups are no longer needed.
 
-The ordering is not a matter of style. **The CHI must go first so the EBS CSI driver reclaims the volumes while the control plane is still alive**: data volumes have `DeleteOnTermination` set to `false`, so once the control plane is gone the CSI driver goes with it and nothing is left to delete them — they stay on the bill forever. The gp3 class also uses `reclaimPolicy: Retain`, which is precisely what lets a replacement node reattach the original volume instead of rebuilding, so deleting a PVC does not delete its volume either. `teardown.sh` therefore reads each PV's `csi.volumeHandle` **before** the namespace is deleted, then deletes the volumes individually and finishes with a tag-based sweep.
+The ordering is not a matter of style. **The CHI must go first so the EBS CSI driver reclaims the volumes while the control plane is still alive**: data volumes have `DeleteOnTermination` set to `false`, so once the control plane is gone the CSI driver goes with it and nothing is left to delete them — they stay on the bill forever. The gp3 class also uses `reclaimPolicy: Retain`, which is precisely what lets a replacement node reattach the original volume, so deleting a PVC does not delete its volume either. `teardown.sh` therefore reads each PV's `csi.volumeHandle` **before** the namespace is deleted, then deletes the volumes and finishes with a tag-based sweep.
 
-Teardown is also deliberately **re-entrant and free of any Kubernetes API dependency**: it removes every helm/kubernetes resource from state before destroying. Both properties come from measured failures — a dropped SSM tunnel left a `helm_release` stalling for minutes before failing with zero resources destroyed, and a local DNS failure interrupted a run whose delete requests had already taken effect.
+Teardown is also deliberately **re-entrant and free of any Kubernetes API dependency** (it removes helm/kubernetes resources from state before destroying). Both come from measured failures: a dropped SSM tunnel left a `helm_release` stalling for minutes before failing with zero resources destroyed, and a local DNS failure interrupted a run whose delete requests had already taken effect.
 
 ### 12.1 Stopping Nodes to Save Money: Check the Storage Medium First
 
-Scaling nodes to zero, or stopping the EC2 instances, has **completely different** consequences per profile:
+Scaling to zero has **completely different** consequences per profile:
 
 | Profile | Effect of stopping the nodes |
 |---|---|
-| `ebs` | The gp3 volume exists independently of the instance and reattaches when the node returns, so **data survives**. You still pay for the volume while stopped. |
-| `local-nvme` | Data lives on instance store, so **stopping the instance destroys it permanently**; recovery means rebuilding from a healthy replica or the lakehouse. |
+| `ebs` | The volume is independent of the instance and reattaches when the node returns, so **data survives**; you still pay for the volume |
+| `local-nvme` | Data lives on instance store, so **stopping the instance destroys it permanently**; recovery means rebuilding from a healthy replica or the lakehouse |
 
-A `local-nvme` cluster therefore has no "stop to save money" option. Saving money there means destroying it and accepting the rebuild, or switching that cluster to the `ebs` profile.
+So `local-nvme` has no "stop to save money" option — only destroying it and accepting the rebuild, or switching to `ebs`.
 
 #### 12.1.1 The Correct Order for Scaling to Zero (measured 2026-08-18)
 
-Node groups declare `min_size` of 1 (Keeper is `min = max = 1`), and EKS rejects `desired < min`, so **`min` has to come down in the same call**:
+Node groups declare `min_size` of 1 (Keeper is `min = max = 1`), and EKS rejects `desired < min`, so **`min` must come down in the same call**:
 
 ```bash
 aws eks update-nodegroup-config --cluster-name clickhouse-eks \
@@ -397,15 +390,15 @@ aws eks update-nodegroup-config --cluster-name clickhouse-eks \
   --scaling-config minSize=0,maxSize=1,desiredSize=0
 ```
 
-**Scale the `system` node groups down first, then the data and Keeper groups.** The cluster-autoscaler runs on `system`; if the data groups go first, it sees Pending ClickHouse pods and scales those groups straight back up, fighting the scale-down. On the way back up the order reverses: `system` must come up first, because CoreDNS, the operator, and the autoscaler all live there and nothing else reconciles until they are ready.
+**Scale `system` down first, then the data and Keeper groups.** The cluster-autoscaler runs on `system`; if the data groups go first, it sees Pending ClickHouse pods and scales them straight back up, fighting the scale-down. On the way back up the order reverses — CoreDNS, the operator, and the autoscaler all live on `system`, and nothing else reconciles until they are ready.
 
-`terraform apply` is the cleanest way back, since it restores `min_size` to the declared values. Note though that `desired_size` on the ClickHouse node groups sits under `ignore_changes` (the autoscaler owns it at runtime), so it may stay at 0 after an apply and needs to be checked and set separately.
+`terraform apply` is the cleanest way back, since it restores `min_size` to the declared values. But `desired_size` on the ClickHouse groups sits under `ignore_changes` (the autoscaler owns it at runtime), so it may stay at 0 after an apply and needs checking separately.
 
 #### 12.1.2 Scaling Everything to Zero Stalls on the PDB, and That Is Expected
 
-When all node groups are scaled to zero at once, 10 of the 16 instances were observed sitting in `Terminating:Wait` inside their ASGs for about five minutes with no progress. **This is not a failure.** The managed node group's termination lifecycle hook drains pods first and honors the operator's `maxUnavailable: 1`. The first node in each pool drains normally, but its pod then has nowhere to go — every node group is heading to zero — so it stays Pending, the PDB never regains headroom, and the remaining evictions block.
+10 of 16 instances were observed sitting in `Terminating:Wait` inside their ASGs for about five minutes. **This is not a failure.** The termination lifecycle hook drains pods first and honors the operator's `maxUnavailable: 1`. The first node in each pool drains normally, but its pod has nowhere to go — every group is heading to zero — so it stays Pending, the PDB never regains headroom, and the remaining evictions block.
 
-The hook's `DefaultResult` is `CONTINUE` with a 1800-second timeout, so it always proceeds eventually and needs no intervention. To release it immediately, complete the lifecycle action explicitly:
+The hook is `DefaultResult=CONTINUE` with a 1800-second timeout, so it always proceeds eventually. To release it immediately:
 
 ```bash
 aws autoscaling complete-lifecycle-action --region us-east-1 \
@@ -413,7 +406,7 @@ aws autoscaling complete-lifecycle-action --region us-east-1 \
   --instance-id "$IID" --lifecycle-action-result CONTINUE
 ```
 
-That is safe when the nodes are going away regardless: ClickHouse is crash-safe against a killed process, and on the `ebs` profile the data volumes are `Retain` and independent of the instance. Do **not** use it during a rolling replacement — skipping the drain there discards exactly the protection the PDB exists to provide.
+This is safe when the nodes are going away regardless: ClickHouse is crash-safe against a killed process, and on `ebs` the data volumes are `Retain` and independent of the instance. Do **not** use it during a rolling replacement — skipping the drain discards the protection the PDB exists to provide.
 
 ## 13. Scope Boundaries and Documentation Rules
 
