@@ -8,11 +8,11 @@
 
 ## 1. Positioning and Value
 
-**The question is not "how do I run ClickHouse on EKS" but: when the lakehouse is already the sole source of truth, how do you build a rebuildable, low-latency, operable OLAP acceleration layer with self-managed ClickHouse.**
+This project addresses a specific question: when the lakehouse is already the sole source of truth, how should self-managed ClickHouse be deployed as a rebuildable, low-latency OLAP acceleration layer with a defined operating model?
 
-**Core proposition: define ClickHouse as a rebuildable acceleration layer first, then choose topology and disks.** That order governs every tradeoff that follows — once the role is "rebuildable," losing a local disk no longer means losing authoritative truth, and EBS's value shifts from preserving data to reloading less and replacing nodes faster. If ClickHouse is the only copy of the data, this repository's recovery model does not apply.
+The design starts by defining ClickHouse's data role, then selects topology and storage accordingly. When ClickHouse is a rebuildable acceleration layer, loss of a local disk does not remove authoritative data. The value of EBS is therefore reduced reload work and faster node replacement, rather than preservation of the only data copy. If ClickHouse is the only copy of the data, this repository's recovery model does not apply.
 
-It delivers reviewable, executable Terraform + Kubernetes IaC, deployed into your own AWS account:
+The repository provides reviewable, executable Terraform + Kubernetes IaC for deploying the following components into your own AWS account:
 
 - ClickHouse: **one or more independent clusters on demand**, defaulting to a single 1 shard × 3 replica cluster, each replica on a dedicated cross-AZ `r8g.4xlarge` node with its own gp3 data volume.
 - ClickHouse Keeper: a **dedicated** 3-node cross-AZ quorum **per cluster**, with persistent EBS storage.
@@ -21,23 +21,23 @@ It delivers reviewable, executable Terraform + Kubernetes IaC, deployed into you
 - Scripts for NVMe initialization, deployment, validation, lost-node recovery, and ordered teardown.
 - Per-cluster teardown (`teardown.sh --cluster <key>`), so adding or removing one cluster leaves the others untouched.
 
-The set of clusters is defined by the Terraform `clickhouse_clusters` map, whose key is the cluster identifier. Adding a cluster means adding a key: because node groups are addressed by string key rather than list index, adding or removing one cluster does not touch another cluster's resources. Each cluster independently sets its topology, storage medium, instance size, and ClickHouse version.
+The Terraform `clickhouse_clusters` map defines the cluster set, with each map key serving as a cluster identifier. Adding a cluster requires one additional key. Node groups are addressed by string key rather than list index, so adding or removing a cluster does not change the resource addresses of other clusters. Each cluster independently sets its topology, storage medium, instance size, and ClickHouse version.
 
-The data volume medium is the primary tradeoff. After measurement the **default is EBS gp3** (clear operational recovery advantages, negligible performance cost in mainstream scenarios), with local NVMe equally available as a performance profile for storage-bound workloads. Rationale and costs are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme).
+The data volume medium directly affects recovery procedures, I/O limits, and cost. Based on the measurements, the repository **defaults to EBS gp3**: it simplifies recovery after node failure and performs similarly to local NVMe for warm queries. Local NVMe remains available as a performance profile for storage-bound workloads. Selection criteria are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme).
 
-It suits cases where data must stay inside your own VPC, you need control over topology and upgrade cadence, and the lakehouse already owns the sole data truth. It does **not replace ClickHouse Cloud**: what it buys is control, not lighter operations. Whether it fits you depends on six variables, see [4.0](#40-first-decide-whether-this-approach-fits).
+This design applies when data must remain in your own VPC, topology and upgrade cadence require direct control, and the lakehouse already holds the sole authoritative data. It does **not replace ClickHouse Cloud**; greater control over infrastructure also brings additional operational responsibility. See [4.0](#40-first-decide-whether-this-approach-fits) for the applicability criteria.
 
-What each approach trades for:
+The main tradeoffs are:
 
-| Approach | Trades |
+| Approach | Primary tradeoff |
 |---|---|
-| ClickHouse Cloud | Less control, for a smaller incident surface |
-| Self-managed EC2 | One less control plane (Kubernetes) |
-| This repository (EKS + self-managed CHI) | Platform complexity, for reviewable IaC |
-| Default EBS `1×3` | ~9% monthly cost, for reattaching a volume instead of reloading |
-| Local NVMe profile | Reload risk, for throughput headroom |
+| ClickHouse Cloud | Less infrastructure control and a smaller operational scope |
+| Self-managed EC2 | Avoids introducing the Kubernetes control plane |
+| This repository (EKS + self-managed CHI) | Adds platform complexity in exchange for reviewable IaC |
+| Default EBS `1×3` | Adds about 9% to monthly cost; node replacement reattaches the volume instead of reloading data |
+| Local NVMe profile | Provides more throughput headroom but requires data reload after node loss |
 
-**Storage medium selection is a reproducible measurement, not a judgment call** — both media were deployed in parallel on one EKS, producing five classes of evidence (query, merge, device-level I/O, recovery RTO, cost) with explicit notes on which conclusions do **not** hold. Numbers are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) and [11](#11-backup-and-recovery).
+Storage selection is based on a reproducible experiment. Both media were deployed in parallel on the same EKS cluster, with query, merge, device-level I/O, recovery RTO, and cost recorded separately. The reports also state the limits of each conclusion. Results are in [4.3](#43-data-volume-selection-ebs-gp3-versus-local-nvme) and [11](#11-backup-and-recovery).
 
 As a Cloud-to-OSS migration POC, this repository covers EKS deployment, storage, HA, backup, and operations. It does **not** include Kafka/Flink dual-write, historical backfill, result comparison, or traffic cutover; those belong to the upstream pipeline.
 
@@ -103,7 +103,7 @@ Possible ingestion patterns include a Flink ClickHouse connector, Kafka engine +
 
 ### 4.0 First Decide Whether This Approach Fits
 
-The sections that follow are about choosing *within* a self-managed deployment; the prior question is **whether to self-manage at all**. Only these six variables change the answer — team preference and instance-family recency do not:
+Before comparing options within a self-managed deployment, determine whether self-management is appropriate. The following six variables directly affect that decision:
 
 | Variable | When it leans this way | Conclusion |
 |---|---|---|
@@ -116,13 +116,13 @@ The sections that follow are about choosing *within* a self-managed deployment; 
 
 Decision rules, in priority order:
 
-1. **Without a hard self-management requirement, choose Cloud.** This IaC buys control, not lighter operations.
-2. **When the lakehouse is already the SoT, a self-managed acceleration layer is justified** — authoritative durability lives upstream, so this side can trade "rebuildable" for simplicity.
+1. **Without an explicit self-management requirement, consider Cloud first.** This design provides greater infrastructure control and adds operational responsibility.
+2. **When the lakehouse is already the SoT, ClickHouse can operate as a self-managed acceleration layer.** Authoritative durability remains upstream, allowing ClickHouse to be designed as a rebuildable component.
 3. **While one node still holds the data, do not shard.** Adding a shard does not migrate historical data, and re-sharding costs far more than provisioning headroom.
 4. **When queries are predominantly warm, choose EBS gp3.** Recovery shifts from reloading to reattaching, at 8.77% more per month.
 5. **With several clusters on one EKS, the cluster identity must be a map key** — a list index makes adding or removing one cluster rebuild the others' node groups.
 
-**Drift signals:** someone calls ClickHouse or the backup bucket "where the data lives"; or cross-AZ HA is drawn on the diagram while the instances are crowded into a single AZ.
+**Conditions that require reassessment:** ClickHouse or the backup bucket is treated as the authoritative data store; or the architecture claims cross-AZ HA while the target instances are available in only one AZ.
 
 ### 4.1 EKS vs. EC2
 
@@ -150,27 +150,27 @@ The [2026-08-12 same-run selection experiment](./docs/storage-selection-report.e
 | Permanent node loss recovery | EBS reattaches the volume in 111s with zero rebuild; local must reload about 130 GiB | **EBS** |
 | Monthly cost (1x2, excluding shared costs) | Local $2,004.29; EBS $2,180.14 | Local, by 8.77% |
 
-The merge row deserves its mechanism spelled out: both media moved **nearly the same number of bytes** (about 1.0 TiB per node), and the entire difference is sustained throughput (217 vs 328 MiB/s). During the merge EBS sat at 102% device utilization with p95 at 1,130-1,193 MiB/s against a 1,250 MiB/s provisioned ceiling, while local NVMe peaked at 2,630-2,815 MiB/s and still stayed under 89% utilization. **That is a difference in capability headroom -- EBS's ceiling is purchased, instance storage's is given by the hardware.**
+The merge difference came from sustained throughput rather than data volume. Both media moved **nearly the same number of bytes** (about 1.0 TiB per node), at 217 MiB/s for EBS and 328 MiB/s for local NVMe. During the merge, EBS reached 102% device utilization and a p95 of 1,130-1,193 MiB/s against a provisioned ceiling of 1,250 MiB/s. Local NVMe peaked at 2,630-2,815 MiB/s while remaining below 89% utilization. Under this workload, local NVMe retained more throughput headroom, whereas the EBS limit was constrained by the instance channel and provisioned settings.
 
 #### 4.3.2 Why EBS Is the Default Recommendation
 
-Under this project's premise (the lakehouse is the SoT and ClickHouse is a rebuildable acceleration layer), EBS wins on operations rather than performance:
+Under this project's premise (the lakehouse is the SoT and ClickHouse is a rebuildable acceleration layer), the primary benefit of EBS is operational recovery rather than query performance:
 
 - **Node replacement needs no data reload.** Measured in the [2026-08-13 HA drill](./docs/ha-drill-report.en.md): stopping a data node let the original volume reattach to a same-AZ replacement within 111 seconds with **zero data rebuild** and only 3 seconds of service interruption. The same failure on local storage requires [`recover-local-replica.sh`](./scripts/recover-local-replica.sh) to reload roughly 130 GiB from a healthy replica or the lakehouse, making RTO a function of data volume.
 - **Routine operations cause no interruption.** Pod deletion and `kubectl drain` both produced zero failed queries in the drill, which makes node rolling upgrades, AMI rotation, and autoscaler scale-down low-risk.
 - **Capacity is decoupled from the instance.** Volume size is no longer bounded by the instance-store capacity of a given instance type, can be grown independently, and IOPS/throughput can be changed online without rebuilding the node.
-- **The performance cost is negligible in mainstream scenarios.** Warm queries are on par; EBS only falls behind materially on storage-bound work.
+- **Warm-query performance is comparable.** The experiment placed both media in the same performance range; the material EBS difference appeared in storage-bound workloads.
 
-The price is **8.77% more per month** and **maintenance windows sized at roughly 1.5x** (merges are 48% slower). For a rebuildable acceleration layer, trading 8.77% to eliminate "reload 130 GiB whenever a node dies" is usually worth it.
+The price is **8.77% more per month** and **maintenance windows sized at roughly 1.5x** (merges are 48% slower). Whether this cost is acceptable depends on whether the time and operational cost of reloading about 130 GiB after node failure exceed the incremental EBS expense.
 
 #### 4.3.3 When Local NVMe Is Still the Right Choice
 
-Local storage's performance advantage becomes decision-grade if any of the following holds:
+Local NVMe should receive priority evaluation if any of the following conditions holds:
 
 - The query working set **substantially exceeds memory**, with frequent page-cache-bypassing scans (EBS is 66-78% slower on direct I/O).
 - There is a **strict direct-I/O tail-latency** SLA.
 - Background merges must finish inside a **fixed nightly window**, where a 48% difference would overrun it.
-- Throughput must be **sustained beyond the instance EBS channel**. Note that `r8g.4xlarge` is a burstable size: 1,250 MB/s is available only 30 minutes per 24 hours before falling back to a 625 MB/s baseline. If sustained load genuinely needs high throughput, the correct move is `r8g.8xlarge`, where baseline equals maximum, not more volume provisioning.
+- Throughput must be **sustained beyond the instance EBS channel**. Note that `r8g.4xlarge` is a burstable size: 1,250 MB/s is available only 30 minutes per 24 hours before falling back to a 625 MB/s baseline. If the sustained load requires higher throughput, use `r8g.8xlarge`, where baseline equals maximum, rather than adding more provisioned volume performance.
 
 Choosing local storage means accepting that data is permanently lost when a node terminates, that a local PV does not automatically move, and that recovery is manually triggered. **This tradeoff is valid only because ClickHouse data is rebuildable from the lakehouse**; if ClickHouse is the only data source, this repository's recovery model does not apply.
 

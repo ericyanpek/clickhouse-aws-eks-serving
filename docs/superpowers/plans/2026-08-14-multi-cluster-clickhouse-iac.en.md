@@ -1228,13 +1228,13 @@ clickhouse_clusters = {
 }
 ```
 
-- [x] **Step 5: 验证 plan 在 ebs-* 地址零变更（核心验收标准）**
+- [x] **Step 5: Verify zero plan changes on ebs-* addresses (resource-independence criterion)**
 
 ```bash
 terraform -chdir=terraform plan -lock=false -out=/tmp/add-nvme.plan 2>&1 | tee /tmp/plan-add.log
 sed 's/\x1b\[[0-9;]*m//g' /tmp/plan-add.log | grep -E '^  # ' | grep '"ebs' || echo "ZERO CHANGES ON ebs-* — PASS"
 ```
-Expected: 输出 `ZERO CHANGES ON ebs-* — PASS`。若任何 `ebs-*` 地址出现在变更列表中，说明隔离性未达成，必须停下修复而不是继续。
+Expected: `ZERO CHANGES ON ebs-* — PASS`. If any `ebs-*` address appears in the change list, resource isolation has failed and the implementation must be corrected before continuing.
 
 - [x] **Step 6: apply 并验证两集群同时健康**
 

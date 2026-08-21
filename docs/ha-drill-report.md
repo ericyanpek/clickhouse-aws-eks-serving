@@ -51,7 +51,7 @@
 
 窗口内探针 59 次全部成功，流量在 Pod 不可用期间由存活副本承接（`0-1-0` 服务 43 次、`0-0-0` 服务 16 次），延迟 p50 44 ms、最大 57 ms。
 
-> 一处测量陷阱值得记录：删除后立即轮询 Pod 状态会读到**正在终止的旧 Pod** 仍为 `Running:true`，从而得出错误的「2 秒恢复」。必须以新 Pod 的 `creationTimestamp` 为起点判断，本报告的 34s 是按此校正后的值。
+> **测量注意事项：** 删除后立即轮询 Pod 状态会读到**正在终止的旧 Pod** 仍为 `Running:true`，从而得出错误的「2 秒恢复」。必须以新 Pod 的 `creationTimestamp` 为起点判断，本报告的 34s 是按此校正后的值。
 
 ## 5. P7b：优雅驱逐（`kubectl drain`）
 
@@ -94,11 +94,11 @@ drain 完成后节点处于 cordoned 状态，Pod 保持 `Pending` 属预期行�
 
 **数据零重建。** 恢复后两副本均为 999,974,970 行、139,911,668,216 字节、1 个 active part，与演练前**逐字节一致**。数据来自重新挂载的原卷，而非从健康副本重新复制。
 
-这是 EBS profile 相对本地 NVMe 的核心差异所在：本地 NVMe 节点永久丢失时，实例存储随之消失，必须触发 [`recover-local-replica.sh`](../scripts/recover-local-replica.sh) 从健康副本或湖仓重灌约 130 GiB；EBS 侧只需等待卷重挂，本轮为 111 秒。
+两种 profile 的恢复路径不同：本地 NVMe 节点永久丢失时，实例存储随之消失，必须触发 [`recover-local-replica.sh`](../scripts/recover-local-replica.sh) 从健康副本或湖仓重灌约 130 GiB；EBS profile 在卷未损坏且替换节点位于同一 AZ 时可以重挂原卷，本轮耗时 111 秒。
 
 > **本轮未覆盖：** 实例停止是**受控**故障，AWS 有序 detach 了卷。硬件级突发故障、AZ 级故障、以及卷本身损坏均未测试。111 秒也不包含任何数据重灌时间，因为不需要重灌；若卷同时损坏，恢复路径与本地 NVMe 相同，RTO 将由数据量决定而非由重挂决定。
 
-## 7. 演练发现的配置缺陷（比 RTO 数字更重要）
+## 7. 演练发现的配置缺陷
 
 ### 7.1 现象
 
@@ -127,13 +127,13 @@ chi-ch-local-mainlocal   N/A             1                 1
 - Cluster Autoscaler / Karpenter 缩容被阻塞
 - Kubernetes 版本升级期间的节点替换被阻塞
 
-即把「高可用」配置成了「不可运维」。
+这会使配置满足副本可用性约束,但无法执行需要驱逐 Pod 的常规运维操作。
 
 **该缺陷同样存在于生产 1×3 manifest** [`20-clickhouse-chi.yaml`](../manifests/templates/20-clickhouse-chi.yaml.tmpl)。1×3 拓扑在算术上能够承受 `minAvailable: 2`，因此缺陷二不适用；但**缺陷一与副本数无关**，重叠 PDB 在 1×3 上同样使 Pod 永久不可驱逐。
 
 ### 7.4 修复
 
-删除全部手写 PDB，仅保留 operator 自动创建的。**保障未减弱**：operator 的 `maxUnavailable: 1` 同样只允许一个副本同时下线，与手写 PDB 的意图一致。
+删除全部手写 PDB，仅保留 operator 自动创建的。operator 的 `maxUnavailable: 1` 仍只允许一个副本同时下线，与手写 PDB 的可用性目标一致。
 
 实测验证：两个 PDB 并存时 drain 失败；删除冗余 PDB 后 drain 7 秒完成，零失败查询。
 

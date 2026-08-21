@@ -2,9 +2,9 @@
 
 [中文](./community-corroboration.md) · **English**
 
-> Research date: 2026-07-05. Purpose: to test whether the five core design claims in this proposal are merely "one party's opinion," or whether they are supported by community and official practice.
-> Method: searched GitHub, company engineering blogs, conference talks, Hacker News, and official ClickHouse/Altinity content. Every conclusion includes a traceable URL; areas where no corroboration could be found are labeled honestly.
-> Position: honesty first, including identifying the choices in this proposal that are "the most opinionated and not the vendor default."
+> Research date: 2026-07-05. Purpose: to identify community and official evidence for the proposal's five design claims.
+> Method: searched GitHub, company engineering blogs, conference talks, Hacker News, and official ClickHouse/Altinity content. Every conclusion includes a traceable URL; areas without supporting evidence are labeled separately.
+> Evidence boundary: distinguishes vendor guidance, community practice, and design combinations assembled by this project.
 
 ---
 
@@ -12,18 +12,18 @@
 
 | # | Design claim | Corroboration strength | Strongest source |
 |---|---|---|---|
-| 1 | One shard fills one large machine; scale-up first, shard last | **Strong (the vendor itself says so)** | ClickHouse "at Scale" |
+| 1 | One shard fills one large machine; scale-up first, shard last | **Strong (explicit vendor guidance)** | ClickHouse "at Scale" |
 | 2 | Run production ClickHouse on EKS / Kubernetes | **Strong** | ClickHouse LogHouse (19 PiB, running on K8s) |
 | 3 | Large memory / one Pod per node / no CPU limit / page-cache awareness | **Strong model; the complete combination must be assembled independently** | Altinity "8 tricks" + oneuptime + Altinity caching guide |
 | 4 | Use local NVMe instead of EBS; replicas provide online availability, while the lakehouse provides authoritative durability | **Strong in practice, but not the vendor default** | mrkrbrts.com; Altinity KB EC2 Storage |
-| 5 | Treat ClickHouse as a rebuildable serving layer and the upstream lakehouse as the single source of truth | **Strong and now mainstream** | ClickHouse "data lakehouse" Pattern 4; Tinybird |
+| 5 | Treat ClickHouse as a rebuildable serving layer and the upstream lakehouse as the single source of truth | **Strong, with several vendor examples** | ClickHouse "data lakehouse" Pattern 4; Tinybird |
 
 ---
 
 ## Claim-by-Claim Corroboration
 
 ### Claim 1 — One shard fills a large machine / scale-up first, shard last
-**Corroboration: strong. This is almost exactly the position ClickHouse repeatedly emphasizes officially.**
+**Corroboration: strong. ClickHouse materials repeatedly recommend scaling up before sharding.**
 
 - Official ClickHouse video, "ClickHouse at Scale" — https://www.youtube.com/watch?v=vBjCJtw_Ei0 — exact wording: "scale up is preferred to scale out until the scale up cost becomes more than linear," and "sharding should only be considered if there's the perspective of data volume or data processing speed to exceed the capacity of a single server in the near future." **This is the vendor statement that most closely matches this claim.**
 - Official ClickHouse documentation, Table shards and replicas — https://clickhouse.com/docs/shards — positions sharding as a last resort when "the data is too large to fit on one machine" or "one machine is too slow," rather than as the default.
@@ -53,7 +53,7 @@
 - ClickHouse OSS usage tips — https://clickhouse.com/docs/operations/tips — "use a reasonable amount of RAM (128 GB or more) so the hot data subset will fit in the cache of pages."
 - ClickHouse sizing/hardware recommendations — https://clickhouse.com/docs/guides/sizing-and-hardware-recommendations — real configuration example: 256 GB RAM per replica, 4–6 GB RAM/vCPU.
 
-**Honest gap**: no authoritative document was found that packages "one Pod per node + no CPU limit + large memory + page-cache awareness" into a single checklist. This proposal systematically assembles those scattered practices, which is itself the incremental value.
+**Evidence gap**: no authoritative document was found that packages "one Pod per node + no CPU limit + large memory + page-cache awareness" into a single checklist. This proposal combines those separate recommendations, and the combined design still requires project-specific validation.
 
 ### Claim 4 — Use local NVMe instead of EBS; replicas provide online availability, while the lakehouse provides authoritative durability
 **Corroboration: strong as a practice, but there is an important honest caveat about OSS durability semantics.**
@@ -67,7 +67,7 @@
 **Honest caveat**: ClickHouse's official sizing guide recommends provisioned-IOPS EBS rather than instance store. Thus, "local disk instead of EBS" is an intentional choice by cost-oriented practitioners, not the vendor default; and using OSS replicas for online availability means N complete local copies.
 
 ### Claim 5 — Treat ClickHouse as a rebuildable serving layer and the upstream lakehouse as the single source of truth
-**Corroboration: strong and increasingly mainstream. ClickHouse Inc and Tinybird have explicitly documented it as an architectural pattern.**
+**Corroboration: strong. ClickHouse Inc and Tinybird have documented it as an architectural pattern.**
 
 - ClickHouse Inc, "What is a data lakehouse?" — https://clickhouse.com/resources/engineering/data-lakehouse — Pattern 4 is precisely this claim: "Data is initially written to Iceberg or Delta Lake tables (the source of truth)... incrementally replicated to ClickHouse... Lakehouse maintains full history."
 - Tinybird, "Apache Iceberg with ClickHouse" — https://www.tinybird.co/blog/clickhouse-apache-iceberg-integration — "Keep Iceberg as your source of truth... use ClickHouse (with periodic copies) as the query engine... This is the pattern Tinybird uses." A real vendor operates this way.
@@ -83,11 +83,11 @@ Ordered by number of matching claims:
 
 1. **Mark Roberts — "cost-efficient ClickHouse with separated storage & compute"**
    https://mrkrbrts.com/blog/how-to-run-a-cost-efficient-clickhouse-cluster-with-separated-storage-and-compute
-   Matches **2 + 4 + 5 (implicitly 3)**. EKS + Altinity operator + ephemeral local NVMe + durable S3 + replica HA. **The person with the most similar "same idea."** Key difference: he uses S3 as the primary disk + NVMe as cache; this project defines the upstream lakehouse as the sole SoT, uses NVMe-derived replicas in ClickHouse, and uses a separate S3 backup bucket only to shorten recovery time.
+   Matches **2 + 4 + 5 (implicitly 3)**. EKS + Altinity operator + ephemeral local NVMe + durable S3 + replica HA. Key difference: this design uses S3 as the primary disk and NVMe as cache; this project defines the upstream lakehouse as the sole SoT, uses NVMe-derived replicas in ClickHouse, and uses a separate S3 backup bucket only to shorten recovery time.
 
 2. **OpenMetal case study — ClickHouse deployment on bare metal + OpenStack + Ceph**
    https://openmetal.io/resources/case-studies/architecture-big-data-clickhouse-deployment
-   Matches **1 + 3 + 4 + 5**. Real production (a cybersecurity company): 6 bare-metal machines, 1 TB RAM each, about 268 TiB of local Micron NVMe as the "hot tier," and S3-compatible Ceph as the "cold/historical" tier. Large dedicated nodes + local NVMe + object-storage fallback all at once. **The named real-world production case closest to Claims 3–5.**
+   Matches **1 + 3 + 4 + 5**. Production case (a cybersecurity company): 6 bare-metal machines, 1 TB RAM each, about 268 TiB of local Micron NVMe as the "hot tier," and S3-compatible Ceph as the "cold/historical" tier. The case combines large dedicated nodes, local NVMe, and object storage.
 
 3. **ClickHouse LogHouse (the vendor itself)**
    https://clickhouse.com/blog/building-a-logging-platform-with-clickhouse-and-saving-millions-over-datadog
@@ -101,8 +101,8 @@ Ordered by number of matching claims:
 
 ## Conclusion
 
-- **Claims 1, 2, and 5 are essentially mainstream/vendor-endorsed.**
-- **Claim 3 has strong support item by item, but the complete combination must be assembled independently** — the systematization in this proposal is the incremental value.
-- **Claim 4 (local disk instead of EBS) is the most opinionated choice** — strongly supported by cost-oriented practitioners + one strong bare-metal production case (OpenMetal), but explicitly not ClickHouse Inc's default recommendation; replicas are only responsible for online redundancy and require N complete local copies, while authoritative data recovery still depends on the lakehouse.
+- **Claims 1, 2, and 5 are supported by vendor materials or several public examples.**
+- **The individual measures in Claim 3 have supporting sources, but there is no single authoritative implementation of the complete combination.**
+- **Claim 4 (local disk instead of EBS) is supported by cost-oriented community practices and the OpenMetal bare-metal production case**, but it is not ClickHouse Inc's default recommendation; replicas provide online redundancy and require N complete local copies, while authoritative data recovery still depends on the lakehouse.
 
-**In one sentence**: this proposal is not novelty for novelty's sake; it systematically assembles practices that are "vendor-endorsed (1/2/5) + community-backed but not default (3/4)" into reviewable IaC. Moreover, no public implementation packages all five into turnkey EKS IaC — mrkrbrts is a blog, OpenMetal is a bare-metal case study, and LogHouse is internal to the vendor. **This repository fills exactly that gap.**
+Based on the available sources, Claims 1, 2, and 5 map directly to vendor materials, while Claims 3 and 4 combine several community practices. The research found no public EKS IaC implementation that covers all five claims: mrkrbrts is a blog design, OpenMetal is a bare-metal case study, and LogHouse is an internal vendor system. The repository's distinction is therefore the packaging of these practices as reviewable EKS IaC, rather than a new underlying mechanism.

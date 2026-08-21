@@ -14,13 +14,13 @@ The current IaC can only bring up **one** cluster with a fixed 1 shard × 3 repl
 - Node pools are managed by the upstream Altinity module, which keys node groups by **list index**.
 - IRSA, backup, and StorageClass all assume a single cluster in a single namespace.
 
-The node-group keying mechanism is the hardest constraint. From upstream `eks/main.tf:89`:
+The node-group keying mechanism is the primary constraint. From upstream `eks/main.tf:89`:
 
 ```hcl
 eks_managed_node_groups = { for idx, np in local.node_pool_combinations : "node-group-${tostring(idx)}" => {
 ```
 
-**The key is the list position index.** So any change to list length or order shifts the addresses of every subsequent node group, and Terraform decides they must be rebuilt — including node groups currently serving traffic. This was hit in practice during this work: disabling one flag removed an entry from the head of the list, and `plan` showed live node groups being rebuilt. `node-group-10` still has an orphaned launch template today.
+**The key is the list position index.** So any change to list length or order shifts the addresses of every subsequent node group, and Terraform decides they must be rebuilt — including node groups currently serving traffic. This behavior was observed during this work: disabling one flag removed an entry from the head of the list, and `plan` showed live node groups being rebuilt. `node-group-10` still has an orphaned launch template today.
 
 This conflicts directly with the goal: **adding or removing a cluster must never affect the others.**
 
@@ -31,16 +31,16 @@ This conflicts directly with the goal: **adding or removing a cluster must never
 | Dimension | Requirement |
 |---|---|
 | Concurrency | Multiple ClickHouse clusters may exist under one EKS; only `ebs` starts by default, others are added on demand |
-| Robustness | Clusters are independent and do not affect each other; startup is trustworthy and does not error midway; runtime is stable |
+| Stability | Clusters are independent and do not affect each other; preflight checks cover known failure conditions; resource addresses remain stable at runtime |
 | Extensibility | Start with one, add a second at any time; adding and removing must not touch existing clusters |
 | Customizability | Per cluster: topology (shards × replicas), storage medium and capacity, instance size and resource quotas, ClickHouse version and configuration |
 
-The **quantified acceptance criterion** for robustness: when adding or removing a cluster, `terraform plan` must show **zero changes** on the existing clusters' resource addresses. "Looks fine" is not accepted.
+The **quantified acceptance criterion** for stability: when adding or removing a cluster, `terraform plan` must show **zero changes** on the existing clusters' resource addresses.
 
 ### 2.2 Non-Goals
 
 - No cross-AZ or multi-region orchestration across several EKS clusters; this design is scoped to one EKS.
-- No Karpenter. It is closer to the elasticity goal but introduces a new component and requires redesigning the local-NVMe path, which works against "startup must be trustworthy."
+- No Karpenter. It adds another scheduling component and requires redesigning the local-NVMe node lifecycle, which is outside this multi-cluster change.
 - No change to the premise that the lakehouse is the sole SoT.
 - No cross-cluster data migration or federated queries.
 
@@ -82,7 +82,7 @@ Each key derives a complete, non-overlapping set of resources:
 
 Keeper is **one dedicated set per cluster** rather than shared. Sharing would save about $178.70/month per cluster, but the quorum would become a failure domain shared across clusters — losing quorum would strip replication from every cluster at once, which conflicts with cluster independence.
 
-### 3.2 Taking Over Node Groups (Core Mechanism)
+### 3.2 Taking Over Node Groups
 
 The upstream module continues to own VPC / EKS / addons / autoscaler and the **shared node pools** (`system`, `bench`), whose count is fixed and therefore cannot shift. ClickHouse and Keeper node groups become self-managed:
 
@@ -102,7 +102,7 @@ resource "aws_eks_node_group" "ck" {
 }
 ```
 
-**Why this is smooth:** `for_each` keys are strings. Removing the `nvme` key destroys only `nvme-*` resources; every `ebs-*` address stays exactly as it was, with no shifting.
+`for_each` uses string keys. Removing `nvme` destroys only `nvme-*` resources; every `ebs-*` resource address remains unchanged rather than shifting with list position.
 
 **One subnet per AZ is deliberate.** A gp3 volume is an AZ-scoped resource, and pinning a node group to a single subnet is what guarantees a replacement node lands in the volume's AZ so the original volume can reattach. This mechanism was validated in the [2026-08-13 HA drill](../../ha-drill-report.en.md): after permanent node loss the volume reattached in 111 seconds with zero data rebuild.
 
@@ -116,7 +116,7 @@ The upstream module exposes only five outputs, excluding the node IAM role and s
 | Per-AZ private subnet | `data.aws_subnets`, filter tag Name = `${cluster_name}-vpc-private-${az}` | Confirmed against the live subnet tags |
 | Cluster name / CA / endpoint | Upstream outputs and `data.aws_eks_cluster` | Already exposed |
 
-### 3.4 Node Group Attributes That Must Be Carried Over
+### 3.4 Required Node Group Attributes
 
 Upstream `eks/main.tf:89-115` provides the full attribute list. Once self-managed, each of the following must be declared explicitly; omitting one causes a specific failure:
 
@@ -153,7 +153,7 @@ The current CHI resource values are hand-sized to `i8g.4xlarge`; once parameteri
 
 The two-phase apply keeps its existing rationale: the kubernetes/helm providers need a reachable cluster API, which does not exist until the first apply completes.
 
-### 4.2 Preflight Checks (Delivering Trustworthy Startup)
+### 4.2 Preflight Checks
 
 Each cluster validates the following **before** the CHI is applied. Any failure exits with an actionable message:
 
@@ -186,7 +186,7 @@ The approach is therefore **destroy first, then rebuild with the new IaC**. Meas
 
 ## 5. Verification Plan
 
-"It actually brings up a cluster" is a precondition for accepting this design, so verification is based on real deployment rather than static checks alone.
+Acceptance requires a successful deployment, so verification cannot rely on static checks alone.
 
 | Step | Action | Pass criterion |
 |---|---|---|
@@ -196,7 +196,7 @@ The approach is therefore **destroy first, then rebuild with the new IaC**. Meas
 | 4 | Remove the `nvme` cluster | `plan` shows **zero changes** on `ebs-*` addresses |
 | 5 | Check autoscaler recognition and taint effectiveness | Node groups are recognized by the autoscaler; other workloads cannot schedule onto data nodes |
 
-Steps 3 and 4 are the quantified acceptance criteria for independence.
+Steps 3 and 4 are the quantified acceptance criteria for resource independence.
 
 **Cost note:** step 3 runs two clusters concurrently for a short period. At 1 shard × 3 replicas on `r8g.4xlarge` with 20k IOPS / 1250 MiB/s gp3, one cluster runs at roughly $3,449/month (about $2,064 for data nodes, $179 for Keeper, $1,206 for volumes), plus roughly $196/month of shared cost. During verification the second cluster can use smaller instances and volumes, since its only purpose is to prove that adding a cluster does not disturb the existing one.
 

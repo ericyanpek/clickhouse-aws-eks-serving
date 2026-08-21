@@ -1010,7 +1010,7 @@ spec:
                   done
 ```
 
-> **Note:** The backup container uses the pod ServiceAccount for IRSA, but the sidecar in Task 10 runs in the CH pod (which uses the operator-managed SA). For IRSA to reach the sidecar, the README documents annotating the CHI pod's ServiceAccount OR running backup as a standalone deployment. Simpler correct default chosen here: the CronJob triggers the sidecar's REST API; the sidecar's S3 credentials come from the node/pod IRSA. README documents the one-line CHI `podTemplate.spec.serviceAccountName: clickhouse-backup` addition to wire IRSA to the sidecar.
+> **Note:** The backup container uses the Pod ServiceAccount for IRSA, but the sidecar in Task 10 runs in the CH Pod, which uses the operator-managed SA. The README documents two ways to provide IRSA to the sidecar: assign an annotated ServiceAccount to the CHI Pod, or run backup as a standalone deployment. This plan uses a CronJob to trigger the sidecar REST API; the sidecar obtains S3 credentials from node or Pod IRSA. The README also records the `podTemplate.spec.serviceAccountName: clickhouse-backup` configuration.
 
 - [ ] **Step 2: Validate**
 

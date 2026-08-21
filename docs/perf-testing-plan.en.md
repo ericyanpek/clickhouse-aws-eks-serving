@@ -49,7 +49,7 @@
 
 **Relevance to this cluster:**
 - PRIMARY benchmark for finding the single-node query ceiling (queries Q3, Q6, Q12, Q14, Q33–Q43 are the CPU/scan-heavy ones that saturate 16 vCPUs).
-- 14 GB fits trivially on the 3.75 TB NVMe — load once, test repeatedly.
+- The 14 GB dataset occupies a small fraction of the 3.75 TB NVMe and can be loaded once for repeated tests.
 - Directly supports the `parallel_replicas` ON vs. OFF comparison (step C2 below).
 
 ---
@@ -207,7 +207,7 @@ while read -r query; do
 done < queries.sql
 ```
 
-The published leaderboard at `benchmark.clickhouse.com` uses a `c6a.4xlarge` as the reference machine; results on an `i8g.4xlarge` (Graviton, 16 vCPU / 128 GiB) should be comparable or faster on scan-heavy queries due to higher memory bandwidth in Neoverse V2 cores.
+The published leaderboard at `benchmark.clickhouse.com` uses a `c6a.4xlarge` as the reference machine. The `i8g.4xlarge` (Graviton, 16 vCPU / 128 GiB) has different memory-bandwidth and instruction-set characteristics, so the leaderboard is only a reference; this plan must measure the actual difference for scan-heavy queries.
 
 ### B3 — System Tables for Metrics Capture
 

@@ -51,7 +51,7 @@ The query was `SELECT hostName() FROM hits LIMIT 1` with `connect_timeout 2` and
 
 All 59 probe attempts in the window succeeded. Traffic was carried by the surviving replica while the pod was unavailable (`0-1-0` served 43, `0-0-0` served 16), at p50 44 ms and max 57 ms.
 
-> One measurement trap is worth recording: polling pod status immediately after deletion reads the **terminating old pod** as still `Running:true`, which yields a false "2 second recovery". The start point must be the new pod's `creationTimestamp`; the 34s above is the corrected value.
+> **Measurement note:** polling pod status immediately after deletion reads the **terminating old pod** as still `Running:true`, which yields a false "2 second recovery". The start point must be the new pod's `creationTimestamp`; the 34s above is the corrected value.
 
 ## 5. P7b: Graceful Eviction (`kubectl drain`)
 
@@ -94,11 +94,11 @@ EC2 instance `i-0147e51440dba27ae` (`us-east-1a`), hosting `0-1-0` and the data 
 
 **Zero data rebuild.** After recovery both replicas reported 999,974,970 rows, 139,911,668,216 bytes, and 1 active part — **byte-identical to the pre-drill state**. The data came from the reattached original volume, not from re-replicating off the healthy replica.
 
-This is the core difference between the EBS profile and local NVMe. When a local-NVMe node is permanently lost, its instance store goes with it and [`recover-local-replica.sh`](../scripts/recover-local-replica.sh) must rebuild roughly 130 GiB from a healthy replica or the lakehouse. On EBS the volume simply reattaches, which took 111 seconds here.
+The two profiles use different recovery paths. When a local-NVMe node is permanently lost, its instance store goes with it and [`recover-local-replica.sh`](../scripts/recover-local-replica.sh) must rebuild roughly 130 GiB from a healthy replica or the lakehouse. With EBS, the original volume can be reattached when the volume remains healthy and the replacement node is in the same AZ; that took 111 seconds in this drill.
 
 > **Not covered by this drill:** stopping an instance is a **controlled** failure, and AWS detached the volume in an orderly way. Abrupt hardware failure, AZ-level failure, and volume corruption were not tested. The 111 seconds also contains no data rebuild time, because none was needed; if the volume were also lost, the recovery path becomes the same as local NVMe and RTO would be governed by data volume rather than by reattachment.
 
-## 7. The Configuration Defect Found (More Important Than the RTO Numbers)
+## 7. Configuration Defect Found During the Drill
 
 ### 7.1 Symptom
 
@@ -127,13 +127,13 @@ Neither defect is limited to drills:
 - Cluster Autoscaler / Karpenter scale-down is blocked
 - node replacement during Kubernetes version upgrades is blocked
 
-In short, "highly available" was configured as "unmaintainable".
+The configuration therefore met its replica-availability constraint but prevented routine operations that require pod eviction.
 
 **The same defect exists in the production 1×3 manifest** [`20-clickhouse-chi.yaml`](../manifests/templates/20-clickhouse-chi.yaml.tmpl). A 1×3 topology can arithmetically tolerate `minAvailable: 2`, so defect 2 does not apply there; but **defect 1 is independent of replica count**, and an overlapping PDB makes pods permanently unevictable on 1×3 just the same.
 
 ### 7.4 Fix
 
-Remove all hand-written PDBs and keep only the operator-managed ones. **The guarantee is not weakened**: the operator's `maxUnavailable: 1` still permits only one replica down at a time, which matches the intent of the hand-written PDBs.
+Remove all hand-written PDBs and keep only the operator-managed ones. The operator's `maxUnavailable: 1` still permits only one replica down at a time, matching the availability objective of the hand-written PDBs.
 
 Verified by measurement: drain failed while both PDBs were present, and completed in 7 seconds with zero failed queries once the redundant one was removed.
 

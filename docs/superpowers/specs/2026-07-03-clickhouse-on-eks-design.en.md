@@ -26,9 +26,9 @@
 
 ---
 
-## 2. Core Architectural Tradeoff: Local NVMe (Confirmed Option A)
+## 2. Storage Architecture Tradeoff: Local NVMe (Confirmed Option A)
 
-Local NVMe pursues maximum IO performance, but inherently conflicts with the Kubernetes principle that "Pods can move freely," making this the highest-risk aspect of the design. The design uses **Option A**:
+Local NVMe provides a higher I/O ceiling, but its data is tied to the node lifecycle, so a Pod cannot move to another node while retaining the original data. This is the design's primary recovery constraint. The design uses **Option A**:
 
 - Use `local-static-provisioner` (or `local` PVs) to pin each ClickHouse Pod to a specific i8g.4xlarge node.
 - Anti-affinity ensures that **the 3 replicas run on different nodes in different AZs**.
@@ -46,11 +46,11 @@ Local NVMe pursues maximum IO performance, but inherently conflicts with the Kub
 
 After reviewing the source of upstream `Altinity/terraform-aws-eks-clickhouse` (v0.5.7), the division of responsibilities is:
 
-**Parts reused from the blueprint (mature, developed in official collaboration with AWS, no need to reinvent them):**
+**Parts reused from the blueprint:**
 - The `//eks` submodule: VPC + subnets across 3 AZs + NAT + EKS cluster + node groups + cluster-autoscaler + IAM. Referenced as a child module (this submodule contains no internal provider blocks and can be consumed cleanly).
 - The `//clickhouse-operator` submodule: installs the Altinity operator (version pinned to `0.27.1`, overriding its default `0.24.4`).
 
-**Parts discarded from the blueprint (closed and unable to express this design):**
+**Parts not reused from the blueprint:**
 - The `//clickhouse-cluster` submodule - not used. Its CHI topology is hard-coded in the upstream `clickhouse-eks` Helm chart (0.1.8), and Terraform exposes only zones/instance_type/name/user/password. It **cannot configure a custom shard/replica topology, local NVMe (it hard-codes `gp3-encrypted`), anti-affinity, or backups**. We write our own CHI/CHK manifests instead.
 
 **Blueprint interface constraints (must be observed in the implementation plan):**
@@ -87,7 +87,7 @@ After reviewing the source of upstream `Altinity/terraform-aws-eks-clickhouse` (
 
 **Design principles:**
 - Three independent node groups with isolated responsibilities (system components / ClickHouse / Keeper do not interfere with one another).
-- Deploy Keeper independently (CHK CRD), never colocated with ClickHouse - a mandatory best practice from the research report.
+- Deploy Keeper independently (CHK CRD) rather than colocating it with ClickHouse, isolating coordination-layer and data-layer resources.
 - Layered decoupling: Terraform manages AWS infrastructure + Helm add-ons; manifests manage the ClickHouse application topology (CHI/CHK). The CHI topology can be changed without modifying Terraform.
 
 ---
@@ -144,7 +144,7 @@ clickhouse-deployment/
 
 ## 6. Validation and Test Strategy
 
-`smoke-test.sh` performs end-to-end validation (not just "Pod Running"):
+`smoke-test.sh` performs the following end-to-end checks in addition to Pod readiness:
 - Create `ReplicatedMergeTree` + `Distributed` tables
 - Write to one replica → query another replica to confirm synchronization (validates that Keeper works)
 - Inspect `system.replicas` / `system.clusters` to check topology health

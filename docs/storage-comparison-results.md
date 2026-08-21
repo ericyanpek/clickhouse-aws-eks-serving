@@ -130,7 +130,7 @@ LIMIT 10;
 
 ## 7. 决策
 
-1. 对能完整进入内存的 ClickBench warm 查询，R8g + 高配 gp3 与 i8g + NVMe 同档，NVMe 没有体现可用于商业决策的优势。
+1. 对能完整进入内存的 ClickBench warm 查询，R8g + 高配 gp3 与 i8g + NVMe 同档；该场景的差异不足以作为存储介质选型依据。
 2. EBS 的主要架构价值仍是节点故障后同 AZ 重挂原卷；本轮没有执行节点故障恢复测试，不能给出实测 RTO。
 3. direct-I/O 说明存储敏感查询仍可能受 EBS 影响。要证明 NVMe 优势，需要同一时点、相同 parts 布局下扩大数据集，并增加持续 INSERT/merge 测试。
 4. 过滤聚合 QPS 不应进入选型表，除非两边先执行相同的 parts 整理策略并记录 `system.parts`。

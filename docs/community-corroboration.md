@@ -2,9 +2,9 @@
 
 **中文** · [English](./community-corroboration.en.md)
 
-> 调研日期:2026-07-05。目的:检验本方案的五条核心设计主张是否只是"一家之言",还是有社区/官方实践支撑。
-> 方法:检索 GitHub、公司工程博客、会议 talk、Hacker News、ClickHouse/Altinity 官方内容。每条结论均带可追溯 URL;找不到印证的地方如实标注。
-> 立场:诚实优先——包括标出本方案里"最有主见、非原厂默认"的选择。
+> 调研日期:2026-07-05。目的:核查本方案五条设计主张的社区与官方依据。
+> 方法:检索 GitHub、公司工程博客、会议 talk、Hacker News、ClickHouse/Altinity 官方内容。每条结论均附可追溯 URL,未找到依据的部分单独标注。
+> 证据边界:区分原厂建议、社区实践与本项目自行组合的设计选择。
 
 ---
 
@@ -12,18 +12,18 @@
 
 | # | 设计主张 | 印证强度 | 最强出处 |
 |---|---|---|---|
-| 1 | 一分片占满一台大机、scale-up first、shard last | **强(原厂自己就这么说)** | ClickHouse "at Scale" |
+| 1 | 一分片占满一台大机、scale-up first、shard last | **强(有原厂明确表述)** | ClickHouse "at Scale" |
 | 2 | 在 EKS / Kubernetes 上跑生产 ClickHouse | **强** | ClickHouse LogHouse(19 PiB,跑在 K8s) |
 | 3 | 大内存 / 一 Pod 一节点 / 不设 CPU limit / page-cache 感知 | **模型强,完整组合需自行组装** | Altinity "8 tricks" + oneuptime + Altinity 缓存指南 |
 | 4 | 本地 NVMe 代替 EBS,副本保在线可用性、湖仓保权威 durability | **实践强,但非原厂默认** | mrkrbrts.com;Altinity KB EC2 Storage |
-| 5 | ClickHouse 当可重建 serving 层,上游湖仓当唯一真相源 | **强,已主流化** | ClickHouse "data lakehouse" Pattern 4;Tinybird |
+| 5 | ClickHouse 当可重建 serving 层,上游湖仓当唯一真相源 | **强,已有多个厂商案例** | ClickHouse "data lakehouse" Pattern 4;Tinybird |
 
 ---
 
 ## 逐条印证
 
 ### 主张 1 —— 一分片占满大机 / scale-up first, shard last
-**印证:强。这几乎是 ClickHouse 官方反复强调的立场。**
+**印证:强。ClickHouse 官方材料多次明确建议优先垂直扩容。**
 
 - ClickHouse "ClickHouse at Scale" 官方视频 —— https://www.youtube.com/watch?v=vBjCJtw_Ei0 —— 原话:"scale up is preferred to scale out until the scale up cost becomes more than linear",且"sharding should only be considered if there's the perspective of data volume or data processing speed to exceed the capacity of a single server in the near future"。**与本主张最贴合的原厂表述。**
 - ClickHouse 官方文档 Table shards and replicas —— https://clickhouse.com/docs/shards —— 把分片定位为"数据太大装不下单机"或"单机太慢"时的最后手段,而非默认。
@@ -53,7 +53,7 @@
 - ClickHouse OSS usage tips —— https://clickhouse.com/docs/operations/tips —— "use a reasonable amount of RAM (128 GB or more) so the hot data subset will fit in the cache of pages"。
 - ClickHouse sizing/hardware 建议 —— https://clickhouse.com/docs/guides/sizing-and-hardware-recommendations —— 真实配置示例:每副本 256 GB RAM,4–6 GB RAM/vCPU。
 
-**诚实缺口**:没找到把"一 Pod 一节点 + 不设 CPU limit + 大内存 + page-cache"打包成单一 checklist 的权威文档。本方案是把这些散落实践系统化组装——这本身即增量价值。
+**证据缺口**:未找到把"一 Pod 一节点 + 不设 CPU limit + 大内存 + page-cache"汇总为单一 checklist 的权威文档。本方案将这些分散建议组合使用,组合后的适用性仍需由项目测试验证。
 
 ### 主张 4 —— 本地 NVMe 代替 EBS,副本保在线可用性、湖仓保权威 durability
 **印证:作为实践强;但有关于 OSS durability 语义的重要诚实 caveat。**
@@ -67,7 +67,7 @@
 **诚实 caveat**:ClickHouse 官方 sizing 指南推荐 provisioned-IOPS EBS 而非 instance-store。所以"本地盘代替 EBS"是成本导向实践者的刻意取舍,不是原厂默认;且 OSS 用副本保持在线可用性意味着 N 份完整本地拷贝。
 
 ### 主张 5 —— ClickHouse 当可重建 serving 层,上游湖仓当唯一真相源
-**印证:强,且日益主流。已被 ClickHouse Inc 和 Tinybird 明确记录为架构模式。**
+**印证:强。ClickHouse Inc 和 Tinybird 已将其记录为架构模式。**
 
 - ClickHouse Inc, "What is a data lakehouse?" —— https://clickhouse.com/resources/engineering/data-lakehouse —— Pattern 4 正是本主张:"Data is initially written to Iceberg or Delta Lake tables (the source of truth)... incrementally replicated to ClickHouse... Lakehouse maintains full history."
 - Tinybird, "Apache Iceberg with ClickHouse" —— https://www.tinybird.co/blog/clickhouse-apache-iceberg-integration —— "Keep Iceberg as your source of truth... use ClickHouse (with periodic copies) as the query engine... This is the pattern Tinybird uses." 真实厂商就这么跑。
@@ -83,11 +83,11 @@
 
 1. **Mark Roberts —— "cost-efficient ClickHouse with separated storage & compute"**
    https://mrkrbrts.com/blog/how-to-run-a-cost-efficient-clickhouse-cluster-with-separated-storage-and-compute
-   命中 **2 + 4 + 5(隐含 3)**。EKS + Altinity operator + 临时本地 NVMe + S3 durable + 副本 HA。**最像"同一个想法"的人。** 关键差别:他是 S3 主盘 + NVMe 缓存;本项目把上游湖仓定义为唯一 SoT,ClickHouse 使用 NVMe 派生副本,独立 S3 backup bucket 只用于缩短恢复时间。
+   命中 **2 + 4 + 5(隐含 3)**。EKS + Altinity operator + 临时本地 NVMe + S3 durable + 副本 HA。关键差别:该方案以 S3 为主盘、NVMe 为缓存;本项目把上游湖仓定义为唯一 SoT,ClickHouse 使用 NVMe 派生副本,独立 S3 backup bucket 只用于缩短恢复时间。
 
 2. **OpenMetal 案例 —— 裸机 + OpenStack + Ceph 的 ClickHouse 部署**
    https://openmetal.io/resources/case-studies/architecture-big-data-clickhouse-deployment
-   命中 **1 + 3 + 4 + 5**。真实生产(网安公司):6 台裸机、每台 1 TB RAM、约 268 TiB 本地 Micron NVMe 当"热层",S3 兼容 Ceph 当"冷/历史"层。大专属节点 + 本地 NVMe + 对象存储兜底一次全占。**最接近主张 3–5 的真实命名生产案例。**
+   命中 **1 + 3 + 4 + 5**。生产案例(网安公司):6 台裸机、每台 1 TB RAM、约 268 TiB 本地 Micron NVMe 当"热层",S3 兼容 Ceph 当"冷/历史"层。该案例同时采用大规格专属节点、本地 NVMe 和对象存储。
 
 3. **ClickHouse LogHouse(原厂自己)**
    https://clickhouse.com/blog/building-a-logging-platform-with-clickhouse-and-saving-millions-over-datadog
@@ -101,8 +101,8 @@
 
 ## 结论
 
-- **主张 1、2、5 基本是主流/原厂认可。**
-- **主张 3 逐条有强支撑,但完整组合需自行组装**——本方案的系统化即增量价值。
-- **主张 4(本地盘代替 EBS)是最有主见的选择**——成本导向实践者力挺 + 一个强裸机生产案例(OpenMetal),但明确不是 ClickHouse Inc 的默认推荐;副本只负责在线冗余且需要 N 份完整本地拷贝,权威数据恢复仍依赖湖仓。
+- **主张 1、2、5 有原厂材料或多个公开案例支持。**
+- **主张 3 的各项措施分别有资料支持,但完整组合没有单一权威参考实现。**
+- **主张 4(本地盘代替 EBS)有成本导向的社区实践和 OpenMetal 裸机生产案例支持**,但不是 ClickHouse Inc 的默认推荐;副本只负责在线冗余且需要 N 份完整本地拷贝,权威数据恢复仍依赖湖仓。
 
-**一句话**:本方案不是标新立异,而是把"原厂认可(1/2/5)+ 社区力挺但非默认(3/4)"的实践系统化组装成一套可评审 IaC。而且没有任何公开实践把这五条全部打包成 turnkey 的 EKS IaC——mrkrbrts 是博客、OpenMetal 是裸机案例、LogHouse 是原厂内部。**本仓库填的正是这个空位。**
+综合现有资料,主张 1、2、5 可直接对应原厂材料,主张 3、4 主要来自多项社区实践的组合。调研未发现同时覆盖五条主张的公开 EKS IaC 实现:mrkrbrts 是博客方案,OpenMetal 是裸机案例,LogHouse 是原厂内部系统。因此,本仓库的差异主要在于将这些做法整理为可评审的 EKS IaC,而不是提出新的底层机制。

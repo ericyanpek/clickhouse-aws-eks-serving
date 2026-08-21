@@ -8,9 +8,9 @@
 
 ---
 
-## I. Key Conclusion: The Operator Is the Center of the Entire Ecosystem
+## I. Main Conclusion: The Operator Is the Primary Deployment and Operations Interface
 
-**The Altinity Kubernetes Operator for ClickHouse is the de facto standard**, with no second option mature enough to compete with it.
+As of the research date, the Altinity Kubernetes Operator for ClickHouse had the most complete combination of public documentation, EKS test records, and production examples, making it the default candidate for this project. The research found no second option with comparable evidence of maturity.
 
 | Attribute | Facts (verified on 2026-07-03) |
 |---|---|
@@ -18,14 +18,14 @@
 | Stars / Releases | ~2,526 stars, 88 releases, latest **0.27.1 (2026-06-04)** |
 | Platform coverage | **Explicitly tested on AWS EKS** (as well as GKE / AKS / Minikube) |
 | Endorsement | Has underpinned **Altinity.Cloud since 2019**; users include eBay, Cisco, and Twilio |
-| Maturity | ★★★★★ Production-grade; recommended as the default choice |
+| Maturity | Public production usage; default candidate for this project |
 
 Sources (primary):
 - https://github.com/Altinity/clickhouse-operator
 - https://altinity.com/kubernetes-operator
 - https://docs.altinity.com/altinitykubernetesoperator
 
-**Authoritative pattern validation**: ClickHouse's official BYOC on AWS itself follows this pattern: it runs a ClickHouse operator plus supporting services (ingress, DNS, certificate management, state exporters, and scrapers) on EKS in the customer's VPC, stores logs/metrics on EBS, and uses the Prometheus/Thanos stack. The management plane resides in ClickHouse's own VPC, accesses the environment through private endpoints, and does not directly access customer data. In effect, ClickHouse has validated the "operator on EKS" approach in production at scale.
+**Vendor example**: ClickHouse BYOC on AWS runs a ClickHouse operator and supporting services (ingress, DNS, certificate management, state exporters, and scrapers) on EKS in the customer's VPC, stores logs and metrics on EBS, and uses Prometheus/Thanos. The management plane resides in ClickHouse's own VPC, accesses the environment through private endpoints, and does not directly access customer data. This shows that ClickHouse uses the operator-on-EKS pattern in its BYOC product.
 - https://clickhouse.com/docs/cloud/reference/byoc/architecture
 - https://clickhouse.com/blog/building-clickhouse-byoc-on-aws
 
@@ -83,12 +83,12 @@ Sources:
 
 ---
 
-## V. Quick Start: Official Terraform Blueprint
+## V. Reference Implementation: Terraform Blueprint
 
-**Preferred for greenfield deployments: Altinity's open-source Terraform AWS EKS Blueprint (developed in collaboration with the AWS EKS team).**
+Altinity provides an open-source Terraform AWS EKS Blueprint that can serve as a starting point for greenfield deployments. It was developed in collaboration with the AWS EKS team.
 
-- One-shot deployment of **EKS + EBS + autoscaling + operator + ClickHouse + Keeper**.
-- Reduced to "modify a few lines in the control file + run two Terraform commands."
+- Covers **EKS + EBS + autoscaling + operator + ClickHouse + Keeper**.
+- Most configuration is performed through control files and Terraform commands.
 - Uses **ClickHouse Keeper (not ZooKeeper)** by default.
 
 Sources:
@@ -104,9 +104,9 @@ Sources:
 The following items were explicitly raised in the question but are **not supported by confirmatory evidence**. Do not treat them as resolved:
 
 1. The capabilities / maturity of the **official ClickHouse Operator (released 2026-01)** and how it compares with Altinity's operator — this is critical to the selection decision and requires dedicated research.
-2. **Storage selection details**: EBS CSI vs. local NVMe, gp3 IOPS/throughput tuning, volume expansion, `WaitForFirstConsumer` binding, and **the conflict between EBS AZ affinity and cross-AZ replica placement** — one of the easiest pitfalls to encounter with stateful workloads on EKS; this study did not obtain conclusive evidence.
+2. **Storage selection details**: EBS CSI vs. local NVMe, gp3 IOPS/throughput tuning, volume expansion, `WaitForFirstConsumer` binding, and **the conflict between EBS AZ affinity and cross-AZ replica placement** — this study did not obtain enough evidence for a specific conclusion.
 3. **Integration between clickhouse-backup and the operator**: S3 targets, scheduling, recovery procedures, and incremental backups — explicitly raised in the question, but none of the claims survived validation.
-4. **K8s pitfalls for stateful workloads**: cross-AZ EBS detach/reattach latency, PVC/StatefulSet rescheduling, rolling upgrade order and replica quorum safety, and recovery from a full disk — unverified and worthy of dedicated research.
+4. **K8s constraints for stateful workloads**: cross-AZ EBS detach/reattach latency, PVC/StatefulSet rescheduling, rolling upgrade order and replica quorum safety, and recovery from a full disk — not verified in this study and requiring separate tests.
 
 ---
 

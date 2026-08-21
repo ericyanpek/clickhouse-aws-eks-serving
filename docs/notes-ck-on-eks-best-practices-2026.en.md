@@ -2,26 +2,26 @@
 
 [中文](./notes-ck-on-eks-best-practices-2026.md) · **English**
 
-> Origin: starting from the awslabs data-on-eks clickhouse-on-eks reference stack (Altinity Operator + Keeper + Karpenter + ArgoCD, with a 3×3 example), this document works through each layer and arrives at a deployment position of its own.
+> Background: starting from the awslabs data-on-eks clickhouse-on-eks reference stack (Altinity Operator + Keeper + Karpenter + ArgoCD, with a 3×3 example), this document derives deployment recommendations for this project's data role and operational boundaries.
 > Reference page: https://awslabs.github.io/data-on-eks/docs/datastacks/databases/clickhouse-on-eks
 
 ---
 
-## 0. Applicability Boundaries of These Best Practices (Clarify the Scope First)
+## 0. Applicability Boundaries
 
-**These recommendations target a specific role: the upstream data lakehouse holds the sole authoritative Source of Truth, while CK is its downstream, derived, eventually consistent, rebuildable OLAP / BI serving acceleration layer.**
+These recommendations target a specific data role: the upstream data lakehouse holds the sole authoritative Source of Truth, while CK is its downstream, derived, eventually consistent, rebuildable OLAP / BI serving acceleration layer.
 
-Within this role, all the tradeoffs below are internally consistent and close to optimal. But this is not "the one correct solution for CK on EKS" — the tradeoffs change in the following situations, so do not apply it rigidly:
+The recommendations apply only within this role. Reevaluate the storage, sharding, and replica strategy in the following situations:
 
 - CK must be the **primary store / sole SoT** (with no upstream lakehouse fallback) → durability requirements rise sharply, the local-NVMe approach no longer works, and the design must return to EBS + backups as the foundation.
 - **Extremely high-throughput real-time ingestion** (such as large-scale direct Kafka ingestion, with writes outweighing reads) → write amplification becomes the primary constraint, and both replica and sharding strategies must be reevaluated.
 - **Very large scale, where a single query must fan out across many machines** → true sharding is mandatory; 1-shard scale-up cannot handle it.
 
-**Conclusion: it is more accurate to call this "best practices for CK as a lakehouse-derived serving layer on EKS." It is strong within that scope; do not treat it as a universally applicable template.**
+This document therefore covers deployment recommendations for CK as a lakehouse-derived serving layer on EKS, not every ClickHouse-on-EKS scenario.
 
 ---
 
-## 1. Topology Fundamentals (Fix the Concepts First; Everything Later Depends on Them)
+## 1. Topology Fundamentals
 
 ### shard = horizontal partitioning by rows, not by columns
 - Each shard stores a **subset of the table's rows**, with the same schema; only their union forms the complete table.
@@ -30,19 +30,19 @@ Within this role, all the tradeoffs below are internally consistent and close to
 - The minimum shard count is **1** (0 does not exist). Any positive integer is valid (2/4/7…).
 
 ### replica = a complete copy of the same shard, multi-master, with no primary/secondary
-- **Critical correction**: CK's ReplicatedMergeTree is **multi-master and peer-to-peer (masterless)**, not primary-replica like MySQL/PG/Redis.
+- **Model clarification**: CK's ReplicatedMergeTree is **multi-master and peer-to-peer (masterless)**, not the primary-replica model used by MySQL/PG/Redis.
   - There is no "primary replica" role, **no primary/secondary election, and no failover promotion**.
   - Every replica can read and write; if one goes down, the others continue normally, and after restart it reconciles with Keeper and catches up by itself.
   - (Historical baggage: old versions had a "leader" that only scheduled merges and had nothing to do with reads or writes; after 20.5 there are multiple leaders, so that bottleneck has largely disappeared. Do not impose the "primary/secondary" model on CK.)
 - Replica counts have **no odd/even requirement** (2/4 are both valid). ⚠️ Do not confuse this with **Keeper** — Keeper uses Raft and needs an odd number (3/5) to form a quorum; **data replicas do not use quorum** (replication is asynchronous by default).
 
-### What each of the two dimensions solves (the core mental model)
+### What Each Dimension Solves
 ```
 Want one "query" to run faster / store more data  →  add SHARDS (horizontal partitioning, by row)
 Want to handle more "concurrent queries" / keep serving through failures  →  add REPLICAS (redundancy, multi-master peers)
 ```
 
-### Analogy with Kafka/MSK (shift the comparison by one position)
+### Analogy with Kafka/MSK
 ```
 Kafka partition  ≈  CK SHARD    ← parallelism/partitioning unit
 Kafka replica    ≈  CK REPLICA  ← redundancy unit
@@ -54,9 +54,9 @@ Kafka replica    ≈  CK REPLICA  ← redundancy unit
 
 ## 2. Recommended Starting Point: 1 Shard × 3 Replicas + Large Nodes (Scale Up First)
 
-**The right mental model for CK is "make a single node larger first; sharding is the last resort,"** because:
-- A single CK node can handle far more data than intuition suggests (terabytes after compression are no problem).
-- **Re-sharding is extremely painful**: CK has no automatic rebalance; after adding a shard, old data does not move automatically and must be reloaded manually with `INSERT SELECT` or `clickhouse-copier`.
+This project defaults to scaling up a single node and introduces sharding only after reaching a capacity or single-query compute limit, for two reasons:
+- A single CK node can hold terabytes of compressed data; the practical capacity depends on query shape and storage configuration.
+- **Re-sharding has significant operational cost**: CK has no automatic rebalance; after adding a shard, historical data does not move automatically and must be reloaded manually with `INSERT SELECT` or `clickhouse-copier`.
 
 Therefore, the recommended default topology is: **no sharding (`shardsCount: 1`) + 3 replicas + each replica exclusively occupies one large Graviton, spread across 3 AZs.**
 
@@ -69,44 +69,44 @@ Therefore, the recommended default topology is: **no sharding (`shardsCount: 1`)
    1 shard = every node has the full table, with no horizontal partitioning; each pod exclusively occupies one EC2 instance
 ```
 
-**Why this is the optimal starting point:**
-- ✅ Zero re-sharding pain (you never face CK's most painful operational task).
-- ✅ No cross-shard fan-out, the shortest query path, and no coordinator overhead for aggregating multiple shards.
+**Reasons for this default topology:**
+- ✅ No re-sharding is required initially.
+- ✅ No cross-shard fan-out or coordinator overhead for aggregating multiple shards.
 - ✅ HA + read scaling are both in place: if 1 machine fails, 2 copies remain; read QPS is approximately 3×.
-- ✅ Scaling is extremely simple: insufficient reads → add replicas (add an STS without changing data layout); insufficient resources → switch to a larger instance type. Neither touches data partitioning.
+- ✅ The scaling paths are explicit: add replicas when read throughput is insufficient, or select a larger instance type when single-node resources are insufficient. Neither changes data partitioning.
 
-**Two points you must remember:**
-1. **Keeper cannot be omitted**. As long as a `Replicated` engine is used, replication coordination goes through Keeper, **regardless of the number of shards**. A 1×3 topology still needs a 3-node Keeper ensemble. Common misconception: "No sharding means no Keeper" — wrong.
-2. **Do not use Distributed tables**. With 1 shard, each replica has all the data, so there is no need for cross-node fan-out. Distributed only adds a needless hop. Put an LB in front of the clients to round-robin across the 3 pods, **query the local ReplicatedMergeTree tables directly**, and reads will naturally spread across the 3 replicas.
+**Two topology constraints:**
+1. **A `Replicated` engine requires Keeper**. Replication coordination is independent of the shard count, so a 1×3 topology still needs a 3-node Keeper ensemble.
+2. **A Distributed table is usually unnecessary with 1 shard**. Each replica holds all data, so clients can query local ReplicatedMergeTree tables through an LB that distributes connections across the 3 pods. A Distributed table adds an extra forwarding hop.
 
-**When do you hit a wall → and only then introduce shards (three thresholds; hitting any one qualifies):**
+**Conditions for introducing shards:**
 1. The complete dataset no longer fits on one node (compressed data exceeds a single machine's disk / the maximum EBS/NVMe attachable to an instance type).
 2. **A single large aggregation is too slow** — with 1 shard, one query can use only one machine's compute; replicas do not accelerate a single query. Heavy aggregations that scan most of a table will be bottlenecked by one machine's CPU. (The most common hidden limit.)
 3. Ingestion throughput exceeds one node's limit (less common).
 
-**The decisive tool for delaying that wall: `parallel_replicas`**. Once enabled, a query can call multiple replicas of the same shard to scan the same data in parallel, effectively letting "replicas" temporarily double as "shards," so a single query also gets N× parallelism. This is especially valuable in a 1-shard topology — when "a single query is slow" but you do not yet want real sharding, enabling this first can often postpone sharding for a long time. (Maturity: it has become more stable in recent versions; check the changelog when pinning a version.)
+**Evaluate `parallel_replicas` before sharding**. Once enabled, a query can call multiple replicas of the same shard to scan data in parallel, increasing single-query parallelism. In a 1-shard topology, this can mitigate a single-query compute limit, but the benefit depends on query type and introduces coordination overhead. Validate it on the pinned version and check the changelog before enabling it.
 
 ---
 
 ## 3. Quantitative Sizing
 
 ### Number of shards vs data volume
-Do not simply divide the total volume. Take the **maximum of three limits**:
+The shard count must account for three constraints:
 ```
 shards = max( storage-driven, single-query-latency-driven, ingestion-driven )
 ```
 1. **Storage-driven**: `shards = ceil(total compressed data volume / target capacity per shard)`. The target capacity of a single shard depends on the query shape:
    - Good index selectivity (point lookups/filters on leading columns, scanning only a few granules) → a single node can reach **tens of TB**; capacity is constrained by disk, not queries.
    - Scan/aggregation-heavy (large-range GROUP BY) → consider sharding at **1–4 TB**, because the amount scanned by one query ∝ the amount of data on one node.
-   - ⚠️ Always calculate using the **compressed** size (CK typically achieves 5–10× compression); do not let raw volume scare you into excessive sharding.
+   - ⚠️ Calculate using the **compressed** size (CK typically achieves 5–10× compression) to avoid over-sharding based on raw volume.
 2. **Single-query-latency-driven**: fan-out width = number of shards; scanning N rows across K shards → each scans N/K, for approximately linear speedup. Work backward from "this large aggregation must finish within X seconds" to determine the required parallelism.
 3. **Ingestion-driven**: a single node can insert hundreds of MB/s to GB/s, so this is usually not the binding constraint.
 
 - Total nodes = `shards × replicas`; each machine stores `total volume/shards` (not /number of nodes, because replicas are complete copies).
-- Recommendation: first build a large single node → add shards only after hitting "does not fit/cannot scan fast enough" → choose the shard count from the larger storage/latency limit, and **leave enough room from the start** (re-sharding is far more expensive than provisioning headroom).
+- Recommendation: scale up a single node first and add shards after reaching a storage or scan limit. Choose the shard count that satisfies both storage and latency constraints, and reserve capacity because re-sharding generally has a higher operational cost than provisioning headroom.
 
 ### Number of replicas vs QPS
-- **Read QPS grows approximately linearly with the number of replicas**, and the read path does not touch Keeper (Keeper is used only on write/DDL paths), so scaling is clean.
+- **Read QPS can grow approximately linearly with the number of replicas**, and the read path does not use Keeper (Keeper is used on write and DDL paths).
 - Two prerequisites for obtaining linear scaling:
   1. **Concurrency must be distributed across replicas**: use `load_balancing` (the default in newer versions is `random`) + **spread client connections across all nodes** (put an LB in front for round-robin). Otherwise, all connections pressure the same coordinator, hit its aggregation bottleneck first, and additional replicas are useless.
   2. **The bottleneck must be data-node CPU/IO**. If the bottleneck is aggregation on a single coordinator or a single connection, adding replicas does not solve it.
@@ -117,18 +117,18 @@ shards = max( storage-driven, single-query-latency-driven, ingestion-driven )
 |---|---|---|
 | 1 | 0 | Pure dev / rebuildable |
 | 2 | 1 | Minimum HA (⚠️ temporarily only 1 copy remains during a rolling restart) |
-| **3** | 2 | **Production sweet spot** (2 redundant copies remain during a rolling restart; HA/cost balance) |
+| **3** | 2 | Common production configuration (2 redundant copies remain during a rolling restart) |
 | 4 | 3 | Extremely high availability or extremely high read concurrency (usually added for read throughput; excessive for HA alone) |
 
-- **Decision logic**: the number of replicas is driven by (1) how many simultaneous failures must be tolerated (including during rolling maintenance) + (2) read concurrency. **For HA alone, 3 is generally a sufficient ceiling**; beyond that, replicas are essentially being used for read scaling. Do not blindly pile on replicas for "more safety"; every copy adds proportional storage cost + write amplification.
+- **Decision logic**: the number of replicas is driven by (1) the required simultaneous-failure tolerance, including rolling maintenance, and (2) read concurrency. Three replicas are common when HA is the only objective; additional replicas mainly provide read scaling and add proportional storage cost and write amplification.
 
 ---
 
 ## 4. Instance Type: ARM (Graviton) or x86? → ARM by Default
 
-CK is one of the few workloads where ARM wins almost without qualification:
-1. **Price/performance**: an equivalent Graviton configuration is about 20% cheaper, while CK scanning/aggregation is memory-bandwidth + integer/SIMD intensive. Graviton (especially the Neoverse V2 in r8g/i8g) delivers strong bandwidth and per-core throughput, so **cost per TB scanned** is usually significantly lower than x86.
-2. **A first-class CK platform**: native aarch64 + NEON/SVE vectorized paths, and an Altinity-recommended platform. It is optimized, not merely "able to run."
+This project defaults to ARM when there is no architecture-specific dependency:
+1. **Price/performance**: an equivalent Graviton configuration is about 20% cheaper. CK scanning and aggregation depend on memory bandwidth and integer/SIMD performance, so Graviton, especially Neoverse V2 in r8g/i8g, can reduce **cost per TB scanned**. The actual difference still requires testing with the target queries.
+2. **Software support**: ClickHouse provides native aarch64 and NEON/SVE vectorized paths, and Altinity lists ARM as a recommended platform.
 3. **Energy efficiency/density**: advantageous for power costs and rack density in large clusters.
 
 **The few exceptions that should remain on x86:**
@@ -136,7 +136,7 @@ CK is one of the few workloads where ARM wins almost without qualification:
 - Workloads requiring extreme peak single-core frequency (rare; CK benefits from parallelism, not a single core).
 - The team's images/CI are entirely x86 and it does not want to deal with multi-architecture builds in the short term.
 
-**Conclusion: no hard x86 dependency → choose Graviton without hesitation.**
+**Conclusion:** when there are no x86-only binary or toolchain constraints, evaluate Graviton first and confirm the choice with the target workload.
 
 ---
 
@@ -149,15 +149,15 @@ CK is one of the few workloads where ARM wins almost without qualification:
 | Recovery from node failure | **Reattach the old volume in seconds** | **Minutes to hours** to reload all data from a replica |
 | Recovery dependency on replicas | Weak (the volume remains) | **Strong; the only method**; a source replica must be alive |
 | Cross-AZ / anti-affinity | Recommended | **Mandatory**, otherwise everything may be lost |
-| Cost | Storage billed separately | Disk included in the instance price, often more cost-effective |
+| Cost | Storage billed separately | Disk included in the instance price; compare total monthly instance and volume cost |
 
-**Why local NVMe is often an upgrade for CK**: merges (continually combining parts in the background) and large-range scans are IO-heavy; local disk's low latency + high IOPS feed them directly, while also removing the hidden EBS network-bandwidth bottleneck (on large instance types, EBS throughput and network allowance are coupled).
+**Performance benefits of local NVMe**: merges and large-range scans are I/O-intensive. Local disk can reduce storage wait through lower latency and higher IOPS, and it is not limited by the instance EBS channel. The benefit depends on whether the working set fits in page cache and whether the workload is persistently storage-bound.
 
 **The fundamental tradeoff: the data is not durable.** Instance store shares the instance's lifecycle and is designed to be lost.
 
-- **Starting out / prioritizing stability → gp3**: fast recovery and lower cognitive burden. 3 replicas + gp3 is the simplest production topology.
-- **After hitting an IO wall (merge backlog, scans slowed by disk) → im4gn/i8g**, with these prerequisites welded in place: 3 replicas + strict distribution across 3 AZs + hostname anti-affinity + `karpenter.sh/do-not-disrupt` to prevent voluntary relocation.
-- **To get both benefits → local NVMe for hot data + S3 tiering/backups for cold data** (see §7).
+- **Default to gp3**: replacement nodes can reattach the original volume, reducing recovery work. Three replicas + gp3 applies when lower operational complexity is the priority.
+- **Evaluate im4gn/i8g when storage is a sustained bottleneck**, with these prerequisites: 3 replicas, strict distribution across 3 AZs, hostname anti-affinity, and `karpenter.sh/do-not-disrupt` to prevent voluntary relocation.
+- **Tiered option**: local NVMe for hot data and S3 tiering or backups for cold data (see §7).
 
 **⚠️ Only when the upstream lakehouse SoT in §7 is replayable can loss of local NVMe avoid authoritative data loss; however, local PVs still require manual release and recreation and are not "irrelevant."**
 
@@ -165,7 +165,7 @@ CK is one of the few workloads where ARM wins almost without qualification:
 
 ## 6. Let the Pod Consume the Entire EC2 Instance (One Node, One Pod)
 
-**One EC2 instance = one CK pod is the recommended topology, not a compromise.** CK is "greedy": it consumes all CPU for parallelism, needs large contiguous RAM for aggregation, and depends heavily on the OS page cache to read compressed blocks. Co-locating it with other pods causes mutual interference (CPU contention, page-cache eviction, cross-node NUMA access), with low and unpredictable performance.
+This project runs **one CK Pod per EC2 instance**. ClickHouse uses substantial CPU parallelism, aggregation memory, and OS page cache. Co-location with other workloads introduces CPU contention, page-cache eviction, and cross-node NUMA access, increasing performance variance.
 
 ### Key pitfall: size against allocatable, not capacity
 ```
@@ -241,7 +241,7 @@ spec:
 
 ### Karpenter / EBS Pitfalls
 - **Lock `instance-size`**, otherwise Karpenter may select a smaller instance based on requests or, when the request is too close to allocatable, jump to a larger instance.
-- **Do not use `WhenEmptyOrUnderutilized` for `consolidationPolicy`**, or add `karpenter.sh/do-not-disrupt: "true"` to the pod — proactively consolidating and rescheduling a DB pod is disastrous.
+- **Do not use `WhenEmptyOrUnderutilized` for `consolidationPolicy`**, or add `karpenter.sh/do-not-disrupt: "true"` to the Pod. Proactive relocation of a stateful database Pod triggers unnecessary recovery work.
 - **EBS is AZ-bound**: when a pod is recreated, Karpenter must start a new machine in the PVC's AZ; the NodePool zone requirement must include that AZ, or recreation will be stuck.
 
 ### Node-Level Tuning (Outside the Pod Definition; Strongly Recommended by CK)
@@ -249,9 +249,9 @@ spec:
 
 ---
 
-## 7. Core Architectural Position: The Upstream Lakehouse Is the Sole SoT, and CK Is a Rebuildable Derived Serving Layer
+## 7. Data Role: The Upstream Lakehouse Is the Sole SoT, and CK Is a Rebuildable Derived Serving Layer
 
-**This is the key role that connects all the preceding tradeoffs.**
+The following data role is the common premise for the storage and recovery strategies above.
 
 ```
    ┌─────────────── Source of Truth ───────────────┐
@@ -267,12 +267,12 @@ spec:
    └────────────────────────────────────────────────┘
 ```
 
-**Mental-model shift: CK changes from an "authoritative database" to a "derived materialized acceleration layer." The data's home is the upstream lakehouse (usually S3-based); CK is only a copy optimized for queries. The clickhouse-backup S3 bucket in this repository is an auxiliary recovery point, not the lakehouse.** Once this role is accepted, all the tradeoffs follow:
+CK does not act as the authoritative database; it is a derived, materialized acceleration layer for lakehouse data. The upstream lakehouse, usually based on S3, retains authoritative data, while CK stores a query-optimized copy. The clickhouse-backup S3 bucket in this repository is an auxiliary recovery point, not the lakehouse. Under this premise:
 - ✅ Loss of local NVMe does not cause authoritative data loss — after releasing the failed local PV, recovery can proceed from a healthy replica, and if necessary the data can be reloaded from the lakehouse (§5 converges here).
 - ✅ DDL through CICD rebuilds the schema in seconds (DDL is instantaneous). Version the essence of tuning — `ORDER BY`/partition/codec/TTL — as code.
 - ✅ **Two-level recovery**: fetch from a healthy replica after a partial failure (fast path); reload from the upstream lakehouse after total failure (authoritative slow path); ClickHouse S3 backups shorten RTO.
 - ✅ The replica count can be based on "read QPS + online availability," while authoritative durability is the responsibility of the upstream lakehouse.
-- ✅ It is even possible to run the cluster "on demand": start it for peak periods and scale it down while idle, because the data is in S3 anyway.
+- ✅ On-demand cluster operation can be evaluated, but scale-down policies must account for local-NVMe data loss, reload time, and recovery cost.
 
 ### Ingestion Methods for Importing from the Lakehouse into CK (Choose by SoT Form)
 | SoT form | Recommended ingestion | Scenario |
@@ -286,16 +286,16 @@ spec:
 ⚠️ Maturity: `S3Queue`, refreshable MV, and Iceberg **writes** have only stabilized in the past year or two; reads are very stable, but check the changelog for write/exactly-once semantics against the cluster version.
 
 ### Distinguish Two Kinds of "Storage-Compute Separation" (We Choose the First)
-- **(A) ELT copy** (this proposal): the lake is the SoT, and CK holds a MergeTree copy on fast local disk. Recovery = reload. Fast queries, authoritative lake, simple operations. **For a lightweight BI serving layer → this is almost always better.**
+- **(A) ELT copy** (this proposal): the lake is the SoT, and CK holds a MergeTree copy on fast local disk. Recovery uses reload. This applies to BI serving workloads that prioritize query latency and can accept the reload RTO.
 - **(B) Native CK S3 disk + zero-copy**: data lives directly in S3, nodes are pure compute+cache, and recovery = repointing, with no reload. Maximum elasticity, but cold reads incur S3 latency and operations are heavier.
 
 ### 4 Things the Implementation Must Get Right
-1. **Idempotency / deduplication** (the lifeline of replay):
+1. **Idempotency / deduplication** (to keep replay results consistent):
    - Replay by partition: `PARTITION BY toYYYYMMDD(...)`; during recovery, `DROP PARTITION` and then perform a clean reinsert instead of redoing the entire table.
    - Block-level deduplication (`insert_deduplicate`, with Keeper recording hashes of recently inserted blocks) prevents duplicate identical blocks.
    - Row-level upsert → `ReplacingMergeTree`.
    - Record a watermark / high-water mark so you know what has been ingested and where to resume replay; do not perform a full reload every time.
-2. **Incremental, not full**: recovery from a node failure should not replay all history — replicas cover recent hot data + S3 replays only affected/recent partitions. Reserve a full reload for the true disaster where "all replicas of an entire shard are gone simultaneously." Partition design determines whether only a small slice can be replayed.
+2. **Prefer incremental recovery**: node-failure recovery should not replay all history by default. Replicas recover recent hot data, and S3 replays only affected or recent partitions. Perform a full reload only when all replicas of an entire shard are lost. Partition design determines whether recovery can be limited to a small range.
 3. **Manage schema drift**: Iceberg schema evolution does **not automatically propagate** to CK (CK is a downstream copy); column additions/removals and type changes require explicit mapping in CICD. Lock `ORDER BY`/codec in version control so a rebuild is byte-for-byte consistent.
 4. **Put consistency lag in the SLA**: CK is derived downstream from the lake → eventually consistent; BI sees the "last synchronization point." The role allows this, but freshness = X minutes must be stated explicitly; do not let users assume it is real time.
 
@@ -303,7 +303,7 @@ spec:
 
 ## 8. Recovery Comparison: Replica Fetch vs S3 Reload
 
-**The root cause of the difference is not data volume, but "the work being done":**
+The two recovery paths process different data forms and perform different computation:
 ```
 Inter-replica recovery (fetch): copy [ready-made MergeTree parts] — bytes already sorted/compressed/indexed
                                 → network file copy, with almost no CPU work (interserver port 9009,
@@ -321,13 +321,13 @@ S3 reload recovery (re-ingest): read Parquet → [sort again + compress again + 
 | Order of magnitude | Baseline | **About one order of magnitude slower** |
 
 - ⚠️ The numbers are order-of-magnitude estimates (for narrative purposes, not commitments); actual results depend on parallelism, network, S3 bandwidth, part fragmentation, and instance compute.
-- **RTO breakdown (recovery from total failure using S3)**: Karpenter starts nodes (a few minutes) + DDL creates tables (seconds ✅) + **read from S3 + rebuild MergeTree (the long pole, tens of minutes to hours)**. Do not treat S3 recovery as "fast failover"; it is an "acceptable DR RTO."
+- **RTO breakdown (full recovery using S3)**: Karpenter starts nodes (a few minutes) + DDL creates tables (seconds) + **read from S3 and rebuild MergeTree (typically tens of minutes to hours)**. S3 reload is a DR recovery path, not fast failover.
 
 ### Impact During Replica Recovery (Calibrating the "Only QPS Decreases" Claim)
 - ✅ **The read-QPS ceiling falls**: 3→2 remain in service, so read capacity drops by ~1/3. The direction is correct.
-- ⚠️ **But it is not clean — the source replica does double duty**: the replica acting as the source both serves queries and pushes parts outward, slowing its own query latency. The overall decline is more pronounced than simply "one fewer machine."
+- ⚠️ **The source replica carries both query and recovery traffic**: while serving queries, it also transfers parts, which can increase query latency. The capacity reduction can therefore exceed the effect of losing one replica alone.
 - ✅ **Unaffected**: writes are uninterrupted (new writes queue and catch up together); query correctness is unaffected (the lagging replica is not routed to, controlled by `max_replica_delay_for_distributed_queries`); there is no write pause/split brain/inconsistency.
-- ➕ **Redundancy is temporarily degraded**: 3→2; if another machine fails during this window, only 1 remains. The longer recovery takes, the longer the unprotected window. This is an availability risk and the real reason "recovery must be fast."
+- ➕ **Redundancy is temporarily degraded**: after 3→2, another replica loss during recovery leaves only 1 replica. Shorter recovery reduces this risk window.
 
 ### Control Knobs: Recovery Speed ↔ QPS Protection
 - `max_replicated_fetches_network_bandwidth_for_server`: cap recovery-traffic bandwidth, reserving bandwidth for queries (trade recovery speed for stable QPS).
@@ -345,6 +345,6 @@ S3 reload recovery (re-ingest): read Parquet → [sort again + compress again + 
 
 ---
 
-## 10. Guiding Principle in One Sentence
+## 10. Design Summary
 
-**The upstream lakehouse holds the sole SoT + CK is a rebuildable materialized serving layer; start with 1 shard × 3 replicas on large Graviton nodes, one node per pod consuming the whole machine (request≈allocatable, no CPU limit, memory request==limit + ratio 0.9); switch to local NVMe after hitting an IO wall; DDL as code; two-level recovery — healthy-replica fetch is the fast path, lakehouse reload is the authoritative slow path, and ClickHouse S3 backups shorten RTO. Introduce sharding only after hitting "a single query can use only one machine's compute / the full dataset cannot fit on one machine"; before that, use parallel_replicas first.**
+The upstream lakehouse holds the sole SoT, and CK is a rebuildable materialized serving layer. The default topology is 1 shard × 3 replicas on large Graviton nodes, with one Pod per node (request near allocatable, no CPU limit, memory request equal to limit, and ratio 0.9). Evaluate local NVMe when storage becomes a sustained bottleneck, and manage DDL as code. Partial failures recover through healthy-replica fetch; loss of all replicas uses lakehouse reload, with ClickHouse S3 backups reducing RTO. Introduce sharding when single-query compute or single-node capacity reaches its limit; before that, validate `parallel_replicas` for the target queries.

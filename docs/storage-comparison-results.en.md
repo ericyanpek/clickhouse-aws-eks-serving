@@ -130,7 +130,7 @@ Closeout state on 2026-08-11: EKS and all nine EC2 nodes remain running; no EC2 
 
 ## 7. Decision
 
-1. For a ClickBench dataset that fits in memory, R8g + high-performance gp3 and i8g + NVMe are effectively on par for warm queries. NVMe showed no decision-grade advantage.
+1. For a ClickBench dataset that fits in memory, R8g + high-performance gp3 and i8g + NVMe are effectively on par for warm queries; the observed difference is insufficient to select a storage medium.
 2. EBS's primary architectural value remains same-AZ volume reattachment after node failure. This run did not execute a node-failure recovery test, so it provides no measured RTO.
 3. Direct I/O shows that storage-sensitive queries can still be affected by EBS. Demonstrating an NVMe advantage requires a larger dataset and sustained INSERT/merge workload with identical parts layouts at the same point in time.
 4. Exclude filtered-aggregation QPS from selection unless both sides first use the same parts-normalization policy and record `system.parts`.

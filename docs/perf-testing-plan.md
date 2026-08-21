@@ -49,7 +49,7 @@
 
 **与本集群的相关性：**
 - 用于找出单节点查询上限的主要基准（查询 Q3、Q6、Q12、Q14、Q33–Q43 是会使 16 个 vCPU 饱和的 CPU/扫描密集型查询）。
-- 14 GB 可轻松放入 3.75 TB NVMe，一次加载即可反复测试。
+- 14 GB 数据集仅占 3.75 TB NVMe 的较小比例,可在一次加载后重复执行测试。
 - 直接支持 `parallel_replicas` 开启与关闭的对比（见下文步骤 C2）。
 
 ---
@@ -207,7 +207,7 @@ while read -r query; do
 done < queries.sql
 ```
 
-`benchmark.clickhouse.com` 上发布的排行榜使用 `c6a.4xlarge` 作为参考机器；由于 Neoverse V2 核心具有更高的内存带宽，`i8g.4xlarge`（Graviton，16 vCPU / 128 GiB）在扫描密集型查询上的结果应当相当或更快。
+`benchmark.clickhouse.com` 上发布的排行榜使用 `c6a.4xlarge` 作为参考机器。`i8g.4xlarge`（Graviton，16 vCPU / 128 GiB）的 Neoverse V2 核心具有不同的内存带宽和指令集特征,因此排行榜结果只能作为参考;扫描密集型查询的实际差异需由本计划测量。
 
 ### B3 — 用于采集指标的系统表
 

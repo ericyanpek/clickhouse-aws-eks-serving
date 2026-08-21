@@ -26,9 +26,9 @@
 
 ---
 
-## 2. 核心架构权衡:本地 NVMe(已确认方案 A)
+## 2. 存储架构权衡:本地 NVMe(已确认方案 A)
 
-本地 NVMe 追求极致 IO 性能,但与 K8s "Pod 自由漂移" 理念天然冲突,是本方案风险最高的点。采用 **方案 A**:
+本地 NVMe 提供较高的 I/O 上限,但其数据与节点生命周期绑定,因此 Pod 不能在保留原数据的情况下迁移到其他节点。这是本方案的主要恢复约束。采用 **方案 A**:
 
 - 用 `local-static-provisioner`(或 `local` PV)把每个 ClickHouse Pod 钉死在特定 i8g.4xlarge 节点。
 - 反亲和保证:**3 个副本分别落在不同 AZ 的不同节点**。
@@ -46,11 +46,11 @@
 
 经审查上游 `Altinity/terraform-aws-eks-clickhouse`(v0.5.7)源码,确定分工:
 
-**复用 blueprint 的部分(成熟、AWS 官方合作,不重造轮子):**
+**复用 blueprint 的部分:**
 - `//eks` 子模块:VPC + 3 AZ 子网 + NAT + EKS 集群 + 节点组 + cluster-autoscaler + IAM。作为 child module 引用(该子模块不含内部 provider 块,可干净消费)。
 - `//clickhouse-operator` 子模块:安装 Altinity operator(版本钉到 `0.27.1`,覆盖其默认 `0.24.4`)。
 
-**丢弃 blueprint 的部分(封闭、表达不了本设计):**
+**不复用 blueprint 的部分:**
 - `//clickhouse-cluster` 子模块——弃用。其 CHI 拓扑写死在上游 helm chart `clickhouse-eks`(0.1.8),TF 仅暴露 zones/instance_type/name/user/password,**无法配置自定义分片/副本拓扑、本地 NVMe(它写死 `gp3-encrypted`)、反亲和、备份**。改为我们自己写 CHI/CHK manifests。
 
 **blueprint 接口约束(计划中必须遵守):**
@@ -87,7 +87,7 @@
 
 **设计原则**:
 - 三个独立节点组,职责隔离(系统组件 / ClickHouse / Keeper 互不干扰)。
-- Keeper 独立部署(CHK CRD),绝不与 ClickHouse 混布——研究报告的硬性最佳实践。
+- Keeper 独立部署(CHK CRD),不与 ClickHouse 混布,以隔离协调层和数据层资源。
 - 分层解耦:Terraform 管 AWS 基础设施 + Helm addons;manifests 管 ClickHouse 业务拓扑(CHI/CHK)。可改 CHI 拓扑而不动 Terraform。
 
 ---
@@ -144,7 +144,7 @@ clickhouse-deployment/
 
 ## 6. 验证与测试策略
 
-`smoke-test.sh` 做端到端验证(不止 "Pod Running"):
+`smoke-test.sh` 在 Pod Ready 之外执行以下端到端验证:
 - 建 `ReplicatedMergeTree` + `Distributed` 表
 - 向一个副本写入 → 查另一副本确认同步(验证 Keeper 生效)
 - `system.replicas` / `system.clusters` 检查拓扑健康

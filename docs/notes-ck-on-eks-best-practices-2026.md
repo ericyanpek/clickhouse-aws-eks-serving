@@ -2,26 +2,26 @@
 
 **中文** · [English](./notes-ck-on-eks-best-practices-2026.en.md)
 
-> 缘起：从 awslabs data-on-eks 的 clickhouse-on-eks reference stack（Altinity Operator + Keeper + Karpenter + ArgoCD，示例 3×3）出发，逐层推演，落成一套自己的部署主张。
+> 背景：以 awslabs data-on-eks 的 clickhouse-on-eks reference stack（Altinity Operator + Keeper + Karpenter + ArgoCD，示例 3×3）为起点，结合本项目的数据角色和运维边界形成部署建议。
 > 参考页：https://awslabs.github.io/data-on-eks/docs/datastacks/databases/clickhouse-on-eks
 
 ---
 
-## 0. 这套最佳实践的适用边界（先说清楚 scope）
+## 0. 适用边界
 
-**这套主张是针对一个具体定位的：上游数据湖仓承接唯一权威 Source of Truth,CK 作为其下游派生、最终一致、可重建的 OLAP / BI serving 加速层。**
+本文针对一个具体的数据角色：上游数据湖仓承接唯一权威 Source of Truth,CK 作为其下游派生、最终一致、可重建的 OLAP / BI serving 加速层。
 
-在这个定位下，下面所有取舍都自洽且接近最优。但它不是"CK on EKS 唯一正确解"——以下情况取舍会变，别硬套：
+以下建议仅在这一数据角色下成立。出现下列情况时,需要重新评估存储、分片和副本策略：
 
 - CK 必须是**主存储 / 唯一 SoT**（没有上游湖仓兜底）→ durability 要求陡增，本地 NVMe 那套不成立，得回到 EBS + 备份为主。
 - **极高吞吐实时摄入**（如大规模 Kafka 直灌、写重于读）→ 写放大成为主约束，副本策略、分片策略都要重估。
 - **超大规模、单查询要跨很多机器扇出** → 必须真正分片，1-shard scale-up 顶不住。
 
-**结论：叫它"CK 作为湖仓派生 serving 层在 EKS 上的最佳实践"更准确。范围内它很强；别当成放之四海皆准的通用模板。**
+因此,本文讨论的是"CK 作为湖仓派生 serving 层在 EKS 上的部署建议",不适用于所有 ClickHouse on EKS 场景。
 
 ---
 
-## 1. 拓扑基本功（先把概念钉死，后面全靠这个）
+## 1. 拓扑基础
 
 ### shard = 按行水平切分，不是按列
 - 每个 shard 存全表的一个**行子集**，schema 相同；拼起来才是全表。
@@ -30,19 +30,19 @@
 - shard 数最小是 **1**（不存在 0）。任意正整数都合法（2/4/7…）。
 
 ### replica = 同一 shard 的完整数据拷贝，multi-master，无主从
-- **关键纠偏**：CK 的 ReplicatedMergeTree 是**多主对等（masterless）**，不是 MySQL/PG/Redis 那种 primary-replica。
+- **模型说明**：CK 的 ReplicatedMergeTree 是**多主对等（masterless）**，不是 MySQL/PG/Redis 的 primary-replica 模型。
   - 没有"主副本"角色，**没有主从选举、没有故障 promotion**。
   - 每个副本都能读能写；挂一个，其余照常，重启后自己去 Keeper 对账追平。
   - （历史包袱：老版本有个 "leader" 只管调度 merge，与读写无关；20.5 后多 leader，该瓶颈基本消失。别用"主/从"套 CK。）
 - 副本数**无奇偶要求**（2/4 都行）。⚠️ 别和 **Keeper** 混——Keeper 是 Raft，要奇数（3/5）凑 quorum；**数据副本不走 quorum**（默认异步复制）。
 
-### 两个维度各解决什么（核心心智）
+### 两个维度分别解决的问题
 ```
 想让"一个查询"更快 / 装更多数据  →  加 SHARD（横向切分，按行）
 想扛更多"并发查询" / 挂机不停服  →  加 REPLICA（冗余，多主对等）
 ```
 
-### 和 Kafka/MSK 的类比（挪一格才对）
+### 与 Kafka/MSK 的类比
 ```
 Kafka partition  ≈  CK SHARD    ← 并行/切分单元
 Kafka replica    ≈  CK REPLICA  ← 冗余单元
@@ -54,9 +54,9 @@ Kafka replica    ≈  CK REPLICA  ← 冗余单元
 
 ## 2. 推荐起手式：1 shard × 3 replica + 大节点（scale-up 优先）
 
-**CK 的正确心法是"先垂直做大单节点，分片是最后手段"**，因为：
-- 单节点 CK 能扛的数据量远超直觉（压缩后 TB 级毫无压力）。
-- **re-sharding 极痛**：CK 无自动 rebalance，加 shard 后老数据不自动搬，得手动 `INSERT SELECT` 重灌或 `clickhouse-copier`。
+本项目默认先垂直扩容单节点,仅在容量或单查询算力达到上限后引入分片,原因如下：
+- 单节点 CK 可以承载压缩后的 TB 级数据,实际容量取决于查询形态和存储配置。
+- **re-sharding 操作成本较高**：CK 无自动 rebalance,增加 shard 后历史数据不会自动迁移,需要手动执行 `INSERT SELECT` 或使用 `clickhouse-copier`。
 
 所以推荐默认形态：**不分片（shardsCount: 1）+ 3 副本 + 每副本独占一台大 Graviton，跨 3 AZ。**
 
@@ -69,44 +69,44 @@ Kafka replica    ≈  CK REPLICA  ← 冗余单元
    1 个 shard = 每节点都有全表，无横向切分；每 pod 独占一台 EC2
 ```
 
-**为什么这是最优起手：**
-- ✅ 零 re-sharding 痛点（永远不用面对 CK 最痛的运维）。
-- ✅ 无跨 shard 扇出，查询路径最短，无 coordinator 多 shard 聚合开销。
+**采用该默认拓扑的原因：**
+- ✅ 初始阶段无需执行 re-sharding。
+- ✅ 无跨 shard 扇出,不产生 coordinator 的多 shard 聚合开销。
 - ✅ HA + 读扩展都到位：挂 1 台仍有 2 份；读 QPS 近似 3×。
-- ✅ 扩容极简：读不够→加副本（加个 STS，不动数据布局）；资源不够→换更大机型。都不碰数据切分。
+- ✅ 扩容路径明确：读吞吐不足时增加副本,单节点资源不足时更换更大机型,两者均不改变数据分片。
 
-**两个必记点：**
-1. **Keeper 不能省**。只要用 `Replicated` 引擎，复制协调就走 Keeper，**与 shard 数无关**。1×3 照样要 3 节点 Keeper ensemble。常见误解："不分片就不用 Keeper"——错。
-2. **不用 Distributed 表**。1 shard 下每副本都有全量，无跨节点扇出必要。Distributed 只会平白加一跳。客户端前挂 LB 轮询到 3 个 pod，**直接查 ReplicatedMergeTree 本地表**，读自动摊到 3 副本。
+**两个拓扑约束：**
+1. **使用 `Replicated` 引擎时需要 Keeper**。复制协调与 shard 数无关,因此 1×3 仍需 3 节点 Keeper ensemble。
+2. **1 shard 场景通常不需要 Distributed 表**。每个副本都保存全量数据,客户端可通过 LB 轮询 3 个 Pod,直接查询 ReplicatedMergeTree 本地表。Distributed 表会增加一次不必要的转发。
 
-**什么时候撞墙 → 才引入 shard（三条线，撞任一）：**
+**引入 shard 的条件：**
 1. 单节点存不下全量（压缩后超单机盘 / 超机型可挂最大 EBS/NVMe）。
 2. **单条大聚合太慢**——1 shard 下一个查询只能吃一台的算力，副本不加速单查询。扫大半表的重聚合会被单机 CPU 卡死。（最常见的隐性上限）
 3. 写入吞吐超单节点上限（较少见）。
 
-**推迟撞墙的杀手锏：`parallel_replicas`**。开启后一个查询能同时调用同 shard 的多个副本并行扫同一份数据，等于让"副本"临时兼职"shard"，单查询也拿到 N× 并行。在 1-shard 拓扑下尤其值钱——卡在"单查询慢"但还不想真分片时，先开这个往往能把分片再往后推很久。（成熟度：近版本趋稳，锁版本时查 changelog。）
+**分片前可评估 `parallel_replicas`**。开启后,一个查询可以调用同 shard 的多个副本并行扫描数据,提高单查询并行度。在 1-shard 拓扑中,它可用于缓解单查询算力限制,但收益取决于查询类型,并会引入协调开销。启用前应按固定版本验证,并检查 changelog。
 
 ---
 
 ## 3. Sizing 量化
 
 ### Shard 数 vs 数据量
-不是拿总量直接除，而是**三个上限取最大**：
+Shard 数需要同时考虑三个约束：
 ```
 shards = max( 存储驱动, 单查询延迟驱动, 写入驱动 )
 ```
 1. **存储驱动**：`shards = ceil(总压缩后数据量 / 单 shard 目标容量)`。单 shard 目标容量看查询形态：
    - 索引命中好（点查/前导列过滤，只扫少量 granule）→ 单节点可到**数十 TB**，容量只卡盘不卡查询。
    - 扫描/聚合重（大范围 GROUP BY）→ **1–4 TB** 就该考虑分片，因单查询扫描量 ∝ 单节点数据量。
-   - ⚠️ 一律按**压缩后**算（CK 典型 5–10× 压缩），别拿原始量吓自己多分片。
+   - ⚠️ 按**压缩后**的数据量计算（CK 典型压缩比为 5–10×）,避免根据原始数据量过度分片。
 2. **单查询延迟驱动**：扇出宽度 = shard 数；扫 N 行分 K shard → 每个扫 N/K，近似线性提速。按"这条大聚合要压到 X 秒"倒推所需并行度。
 3. **写入驱动**：单节点 insert 可达几百 MB/s ~ GB/s，通常不是绑定约束。
 
 - 总节点数 = `shards × replicas`；每台存 `总量/shards`（不是 /节点数，副本是全量拷贝）。
-- 建议：先做大单节点 → 撞"存不下/扫不动"才加 shard → shard 数按存储/延迟上限取大，**起步就留够**（re-shard 比预留贵得多）。
+- 建议：先垂直扩容单节点,达到存储或扫描上限后再增加 shard。Shard 数取满足存储与延迟约束的较大值,并预留容量,因为 re-sharding 的操作成本通常高于容量预留。
 
 ### Replica 数 vs QPS
-- **读 QPS 随副本数近似线性增长**，且读路径不碰 Keeper（Keeper 只在写/DDL 路径），扩展干净。
+- **读 QPS 可随副本数近似线性增长**，且读路径不经过 Keeper（Keeper 用于写入和 DDL 路径）。
 - 拿到线性的两个前提：
   1. **并发要分散到副本**：靠 `load_balancing`（新版默认 `random`）+ **客户端连接打散到所有节点**（前挂 LB 轮询）。否则所有连接压同一 coordinator，先撞聚合瓶颈，副本再多没用。
   2. **瓶颈在数据节点 CPU/IO**。若瓶颈在单 coordinator 聚合或单条连接，加副本不解决。
@@ -117,18 +117,18 @@ shards = max( 存储驱动, 单查询延迟驱动, 写入驱动 )
 |---|---|---|
 | 1 | 0 | 纯 dev / 可重灌 |
 | 2 | 1 | 最低 HA（⚠️ 滚动重启时临时只剩 1 份） |
-| **3** | 2 | **生产甜点**（滚动重启仍有 2 份冗余，HA/成本平衡） |
+| **3** | 2 | 常用生产配置（滚动重启时仍有 2 份冗余） |
 | 4 | 3 | 极高可用 or 超高读并发（通常为读吞吐加，纯 HA 过度） |
 
-- **决策逻辑**：副本数由 (1) 要扛几台同时故障（含滚动运维期）+ (2) 读并发驱动。**纯 HA 一般 3 封顶够用**；再往上基本是拿副本做读扩展。别为"更安全"无脑堆副本，每份都是等比存储成本 + 写放大。
+- **决策逻辑**：副本数由 (1) 需要容忍的同时故障数（含滚动运维期）和 (2) 读并发共同决定。仅考虑 HA 时通常使用 3 副本;更多副本主要用于读扩展,同时会等比例增加存储成本和写放大。
 
 ---
 
 ## 4. 机型：ARM（Graviton）还是 x86？→ 默认 ARM
 
-CK 是少数在 ARM 上几乎无脑赢的负载：
-1. **性价比**：同规格 Graviton 便宜 ~20%，而 CK 扫描/聚合是内存带宽 + 整数/SIMD 密集，Graviton（尤其 r8g/i8g 的 Neoverse V2）带宽和每核吞吐能打，**每 TB 扫描成本**通常明显低于 x86。
-2. **CK 官方一等公民**：原生 aarch64 + NEON/SVE 向量化路径，Altinity 推荐平台。调过，不是"能跑"。
+在没有架构依赖时,本项目默认选择 ARM：
+1. **性价比**：同规格 Graviton 价格约低 20%。CK 扫描和聚合依赖内存带宽及整数/SIMD 性能,Graviton（尤其 r8g/i8g 的 Neoverse V2）可降低**每 TB 扫描成本**,但具体差异仍需按目标查询测试。
+2. **软件支持**：ClickHouse 提供原生 aarch64 和 NEON/SVE 向量化路径,Altinity 也将其列为推荐平台。
 3. **能效/密度**：大集群电费、机架密度占优。
 
 **留在 x86 的少数例外：**
@@ -136,7 +136,7 @@ CK 是少数在 ARM 上几乎无脑赢的负载：
 - 极致单核峰值频率场景（少见，CK 吃并行不吃单核）。
 - 团队镜像/CI 全 x86，短期不想碰多架构构建。
 
-**结论：无硬性 x86 依赖 → 无脑 Graviton。**
+**结论：** 没有 x86-only 二进制或工具链约束时,优先评估 Graviton;最终选择应以目标负载测试为依据。
 
 ---
 
@@ -149,15 +149,15 @@ CK 是少数在 ARM 上几乎无脑赢的负载：
 | 节点故障恢复 | **秒级重挂**旧卷 | **分钟~小时级**从副本重灌全量 |
 | 恢复对副本依赖 | 弱（卷还在） | **强，唯一手段**，源副本必须活 |
 | 跨 AZ / 反亲和 | 建议 | **强制**，否则可能全丢 |
-| 成本 | 存储单独计费 | 盘含在实例价，常更划算 |
+| 成本 | 存储单独计费 | 盘含在实例价，需按实例与卷的总月成本比较 |
 
-**为什么本地 NVMe 对 CK 常是升级**：merge（后台不停合并 part）、大范围扫描是重 IO；本地盘低延迟 + 高 IOPS 直接喂饱，且省掉 EBS 网络带宽这条隐性瓶颈（大机型上 EBS 吞吐和网络额度耦合）。
+**本地 NVMe 的性能收益**：merge 和大范围扫描属于 I/O 密集型操作;本地盘的低延迟和高 IOPS 可以减少存储等待,也不受实例 EBS 通道限制。收益大小取决于工作集是否进入 page cache 以及负载是否持续受存储限制。
 
 **根本取舍：数据不持久。** instance store 与实例生死绑定，设计上就会丢。
 
-- **起步/求稳 → gp3**：恢复快、心智负担低。3 副本 + gp3 是最省事的生产形态。
-- **IO 撞墙（merge 堆积、扫描被盘拖慢）→ im4gn/i8g**，前置条件焊死：3 副本 + 严格跨 3 AZ + hostname 反亲和 + `karpenter.sh/do-not-disrupt` 防主动搬迁。
-- **两头兼顾 → 本地 NVMe 热数据 + S3 tiered/备份冷数据**（见 §7）。
+- **默认选择 gp3**：节点替换可重挂原卷,恢复流程较短。3 副本 + gp3 适用于优先降低运维复杂度的场景。
+- **存储成为持续瓶颈时评估 im4gn/i8g**：前置条件包括 3 副本、严格跨 3 AZ、hostname 反亲和,以及使用 `karpenter.sh/do-not-disrupt` 防止主动搬迁。
+- **分层方案**：本地 NVMe 保存热数据,S3 用于分层或备份冷数据（见 §7）。
 
 **⚠️ 只有在 §7 的上游湖仓 SoT 可重放前提下，本地 NVMe 的数据丢失才不会造成权威数据丢失;但 local PV 仍需人工释放和重建,不是"无所谓"。**
 
@@ -165,7 +165,7 @@ CK 是少数在 ARM 上几乎无脑赢的负载：
 
 ## 6. 让 pod 吃满整台 EC2（一 node 一 pod）
 
-**一台 EC2 = 一个 CK pod 是推荐形态，不是将就。** CK 是"贪婪型"：吃满 CPU 并行、要大块 RAM 聚合、极度依赖 OS page cache 读压缩块。与别的 pod 挤会互相踩（CPU 争抢、page cache 被驱逐、NUMA 跨节点），低且不可预测。
+本项目采用**一台 EC2 运行一个 CK Pod**。ClickHouse 会使用大量 CPU 并行度、聚合内存和 OS page cache;与其他工作负载共置会引入 CPU 争用、page cache 驱逐和 NUMA 跨节点访问,使性能波动增大。
 
 ### 关键误区：按 allocatable 填，不是按 capacity 填
 ```
@@ -241,7 +241,7 @@ spec:
 
 ### Karpenter / EBS 坑点
 - **锁 `instance-size`**，否则 Karpenter 按 requests 算可能挑更小机型，或（request 太贴 allocatable 时）反跳更大机型。
-- **`consolidationPolicy` 别用 `WhenEmptyOrUnderutilized`**，或给 pod 加 `karpenter.sh/do-not-disrupt: "true"`——DB pod 被主动整理重排是灾难。
+- **`consolidationPolicy` 不使用 `WhenEmptyOrUnderutilized`**,或为 Pod 添加 `karpenter.sh/do-not-disrupt: "true"`。主动重排有状态数据库 Pod 会触发不必要的恢复过程。
 - **EBS 是 AZ 绑定**：pod 重建时 Karpenter 必须在 PVC 所在 AZ 起新机；NodePool zone requirement 要覆盖，否则重建卡住。
 
 ### 节点级调优（pod 定义之外，CK 官方硬建议）
@@ -249,9 +249,9 @@ spec:
 
 ---
 
-## 7. 核心架构主张：上游湖仓是唯一 SoT，CK 是可重建的派生 serving 层
+## 7. 数据角色：上游湖仓是唯一 SoT，CK 是可重建的派生 serving 层
 
-**这是把前面所有取舍串起来的关键定位。**
+以下数据角色是前述存储和恢复策略的共同前提。
 
 ```
    ┌─────────────── Source of Truth ───────────────┐
@@ -266,12 +266,12 @@ spec:
    └────────────────────────────────────────────────┘
 ```
 
-**心智转变：CK 从"权威数据库"变成"派生物化加速层"。数据的家在上游湖仓（通常基于 S3）,CK 只是为查询优化过的一份拷贝。仓库内 clickhouse-backup 的 S3 bucket 是辅助恢复点,不是湖仓。** 一旦接受这个定位，取舍全顺：
+CK 不承担权威数据库角色,而是湖仓数据的派生物化加速层。上游湖仓（通常基于 S3）保存权威数据,CK 保存针对查询优化的副本。仓库内 clickhouse-backup 的 S3 bucket 是辅助恢复点,不是湖仓。在此前提下：
 - ✅ 本地 NVMe 丢失不会造成权威数据丢失——释放失效 local PV 后可从健康副本恢复,必要时从湖仓重灌（§5 与此合流）。
 - ✅ DDL 走 CICD 秒级重建 schema（DDL 是瞬时的）。`ORDER BY`/partition/codec/TTL 这些调优精华当代码版本化。
 - ✅ **两级恢复**：部分故障从健康副本 fetch（快路径），全挂从上游湖仓重灌（权威慢路径）；ClickHouse S3 备份用于缩短 RTO。
 - ✅ 副本数可按"读 QPS + 在线可用性"定,权威 durability 由上游湖仓承担。
-- ✅ 甚至可做"按需起集群"：高峰起、闲时缩，数据反正在 S3。
+- ✅ 可以评估按需运行集群,但缩容策略必须考虑本地 NVMe 数据丢失、重载时间和恢复成本。
 
 ### 从湖仓导入 CK 的摄入方式（按 SoT 形态选）
 | SoT 形态 | 推荐摄入 | 场景 |
@@ -285,16 +285,16 @@ spec:
 ⚠️ 成熟度：`S3Queue`、refreshable MV、Iceberg **写** 都是近一两年才转稳；读侧很稳，写/exactly-once 语义按集群版本查 changelog。
 
 ### 两种"存算分离"要分清（我们选第一种）
-- **(A) ELT 拷贝**（本方案）：湖是 SoT，CK 本地快盘持一份 MergeTree 拷贝。恢复 = 重灌。查询快、湖权威、运维简单。**轻量 BI serving 层 → 几乎总是更优。**
+- **(A) ELT 拷贝**（本方案）：湖是 SoT,CK 本地快盘保存 MergeTree 副本,故障后通过重载恢复。适用于查询延迟优先且可接受重载 RTO 的 BI serving 场景。
 - **(B) CK 原生 S3 disk + zero-copy**：数据直接住 S3，节点纯 compute+cache，恢复 = 重新指向、无需重灌。弹性极致，但冷读有 S3 延迟、运维更重。
 
 ### 落地必须做对的 4 件事
-1. **幂等 / 去重**（重放命根子）：
+1. **幂等 / 去重**（保证重放结果一致）：
    - 按分区重放：`PARTITION BY toYYYYMMDD(...)`，恢复时 `DROP PARTITION` 再干净重插，别全表重来。
    - block 级去重（`insert_deduplicate`，Keeper 记最近插入块 hash）挡重复相同块。
    - 行级 upsert → `ReplacingMergeTree`。
    - 记 watermark / high-water-mark，知道哪些已入、从哪重放，别每次全量。
-2. **增量非全量**：节点故障恢复不该重放全部历史——副本兜近期热数据 + S3 只重放受影响/近期分区。全量重灌只留给"整 shard 所有副本同时没了"的真灾难。分区设计决定能只重放一小片。
+2. **优先增量恢复**：节点故障恢复不应默认重放全部历史。副本用于恢复近期热数据,S3 只重放受影响或近期分区。仅在整个 shard 的全部副本丢失时执行全量重载;能否按小范围恢复取决于分区设计。
 3. **Schema 漂移要管**：Iceberg 的 schema evolution **不自动传导** CK（CK 是下游拷贝）；列增减、类型变更要在 CICD 显式映射。`ORDER BY`/codec 锁版本库，重建才字节级一致。
 4. **一致性 lag 写进 SLA**：CK 是湖下游派生 → 最终一致；BI 看到的是"上次同步时点"。定位允许，但要显式告知新鲜度 = X 分钟，别让人当实时。
 
@@ -302,7 +302,7 @@ spec:
 
 ## 8. 恢复对比：副本 fetch vs S3 重灌
 
-**差距根源不是数据量，是"干的活不同"：**
+两种恢复路径处理的数据形态和计算步骤不同：
 ```
 副本间恢复（fetch）     : 复制【已建好的 MergeTree part】—— 排好序/压好缩/建好索引的字节
                         → 网络文件拷贝，CPU 几乎不干活（interserver 9009 端口，原样推送，不解压/不重排）
@@ -319,13 +319,13 @@ S3 重灌恢复（re-ingest）: 读 Parquet →【重新排序 + 重新压缩 + 
 | 数量级 | 基准 | **慢约一个数量级** |
 
 - ⚠️ 数字是数量级估算（narrative 用途，非承诺值）；实际取决于并行度、网络、S3 带宽、part 碎片、机型算力。
-- **RTO 拆解（S3 全挂恢复）**：Karpenter 起节点（几分钟）+ DDL 建表（秒级 ✅）+ **从 S3 读+重建 MergeTree（长杆，几十分钟~小时级）**。别把 S3 恢复当"快速切换"，它是"可接受的 DR RTO"。
+- **RTO 拆解（S3 全量恢复）**：Karpenter 启动节点（几分钟）+ DDL 建表（秒级）+ **从 S3 读取并重建 MergeTree（通常为几十分钟到小时级）**。S3 重载属于 DR 恢复路径,不是快速故障切换。
 
 ### 副本恢复期间的影响（校准"只减 QPS"的说法）
 - ✅ **读 QPS 上限下降**：3→2 在服务，读容量掉 ~1/3。方向对。
-- ⚠️ **但不干净——源副本双重打工**：当源的那个副本既服务查询又往外推 part，它自己的查询延迟被拖慢。整体下滑比"少一台"更明显。
+- ⚠️ **源副本同时承担查询和恢复流量**：源副本在服务查询的同时传输 part,查询延迟可能上升,总体容量下降可能超过单纯减少一个副本的影响。
 - ✅ **不受影响**：写入不中断（新写入排队一起追）；查询正确性不受影响（未追平副本不被路由，`max_replica_delay_for_distributed_queries` 控制）；无写停顿/脑裂/不一致。
-- ➕ **冗余度临时降级**：3→2，窗口内再挂一台只剩 1；恢复越久裸奔窗口越长。这是可用性风险，也是"恢复要快"的真正理由。
+- ➕ **冗余度临时降级**：3→2 后,恢复窗口内再次丢失一个副本将只剩 1 个副本。缩短恢复时间可以减少这一风险窗口。
 
 ### 调节旋钮：恢复速度 ↔ QPS 保护
 - `max_replicated_fetches_network_bandwidth_for_server`：给恢复流量设带宽上限，留带宽给查询（牺牲恢复速度换 QPS 稳）。
@@ -343,6 +343,6 @@ S3 重灌恢复（re-ingest）: 读 Parquet →【重新排序 + 重新压缩 + 
 
 ---
 
-## 10. 一句话总纲
+## 10. 设计摘要
 
-**上游湖仓承接唯一 SoT + CK 当可重建的物化 serving 层；1 shard × 3 replica 大 Graviton 节点起手，一 node 一 pod 吃满整机（request≈allocatable、CPU 不设 limit、内存 request==limit + ratio 0.9）；IO 撞墙上本地 NVMe；DDL as code；两级恢复——健康副本 fetch 走快路径,湖仓重灌走权威慢路径,ClickHouse S3 备份用于缩短 RTO。撞到"单查询只用一台算力 / 全量塞不下一台"才引入分片，之前先用 parallel_replicas 顶。**
+上游湖仓承担唯一 SoT,CK 作为可重建的物化 serving 层。默认拓扑为大规格 Graviton 节点上的 1 shard × 3 replicas,每个节点运行一个 Pod（request 接近 allocatable、不设 CPU limit、内存 request 等于 limit,并设置 ratio 0.9）。存储持续成为瓶颈时评估本地 NVMe;DDL 由代码管理。部分故障优先从健康副本 fetch,全部副本丢失时从湖仓重载,ClickHouse S3 备份用于缩短 RTO。当单查询算力或单节点容量达到上限时再引入分片,此前可按查询验证 `parallel_replicas`。

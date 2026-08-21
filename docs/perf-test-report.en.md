@@ -4,7 +4,7 @@
 
 > Test date: 2026-07-05
 > Dataset: ClickBench `hits` (Yandex Metrica web analytics, 99,997,497 rows, a single wide table with 105 columns)
-> Conclusion first: **On a 1-shard × 2-replica topology with 2× i8g.4xlarge instances (local NVMe), the 43 ClickBench queries took 18.76s in total for best-of-3 runs, averaging 0.436s with a median of 0.175s. Read QPS differed by 1-2 orders of magnitude depending on query weight (full-table scan and aggregation: ~48; indexed point lookup: ~2,780); concurrency from 1→2 achieved nearly perfect linear scaling (2.0×); heavy scan queries could be accelerated by up to another 1.8× with `parallel_replicas`; and when one replica failed, service continued without interruption, QPS fell by approximately 50%, and the replica self-healed in approximately 65s.**
+> Results summary: **On a 1-shard × 2-replica topology with 2× i8g.4xlarge instances (local NVMe), the 43 ClickBench queries took 18.76s in total for best-of-3 runs, averaging 0.436s with a median of 0.175s. Read QPS differed by 1-2 orders of magnitude depending on query weight (full-table scan and aggregation: ~48; indexed point lookup: ~2,780); QPS at concurrency 2 was 2.0× the concurrency-1 result; `parallel_replicas` improved the heaviest scan query by up to 1.8×; and during one replica-Pod failure, service remained available, QPS fell by approximately 50%, and the replica recovered in approximately 65s.**
 >
 > **Status note:** This is a historical record of actual measurements from the 1×2 environment, and its original basis must be preserved. The current code targets 1×3; until testing with 3 replicas is complete, the linear extrapolations in this document must not be presented as measured 1×3 results. See [`docs/README.en.md`](./README.en.md) for the current authority level of this document.
 
@@ -24,7 +24,7 @@
 | Access | ClusterIP service `clickhouse-ch` (round-robin across 2 replicas within the cluster) |
 | Resource model | CPU request 14 / no limit; memory request==limit 110Gi; `max_server_memory_usage_to_ram_ratio=0.9` |
 
-> Note: Due to fluctuations in i8g.4xlarge spot capacity in us-east-1, the current environment has **2 replicas** (target: 3). Test conclusions are reported on the basis of 2 replicas; read scaling to 3 replicas can be extrapolated linearly.
+> Note: Due to fluctuations in i8g.4xlarge spot capacity in us-east-1, the current environment has **2 replicas** (target: 3). Test conclusions are reported on the basis of 2 replicas. Any value given for 3 replicas is a linear extrapolation, not a measurement.
 
 ### Dataset and Storage Efficiency
 
@@ -58,7 +58,7 @@ Each query was run 3 times and the best result was used (the standard ClickBench
 ### Distribution Characteristics
 
 - **Approximately 65% of queries completed in under one second** (<0.3s). Point lookups and queries filtering on leading columns hit the sparse index and returned in milliseconds.
-- **A small number of scan-intensive queries mark the single-node compute ceiling** (see below). They scan a broad range of columns and perform high-cardinality aggregation, and are limited by single-node CPU.
+- **A small number of scan-intensive queries were limited by single-node compute** (see below). They scan a broad range of columns and perform high-cardinality aggregation, with single-node CPU as the primary constraint.
 
 ### Five Slowest Queries (Single-Node Scan Ceiling)
 
@@ -88,7 +88,7 @@ Settings: `allow_experimental_parallel_reading_from_replicas=2, max_parallel_rep
 | Q33 | 1.232 | 2.669 | 0.46× (slower) ⚠️ |
 | Q34 | 1.392 | 4.627 | 0.30× (slower) ⚠️ |
 
-### Conclusion (Candidly, Not Every Query Was Accelerated)
+### Results and Applicability
 
 - **Effective for large scan/aggregation queries (Q24/Q29):** 2 replicas shared the scan volume, accelerating a single query by 1.3-1.8×. This validates that `parallel_replicas` can postpone the introduction of sharding when the "single-query compute ceiling" is reached.
 - **Lightweight queries, queries with LIMIT, and queries sensitive to coordination overhead became slower instead:** the fixed overhead of parallel coordination exceeded the benefit from scanning.
@@ -98,7 +98,7 @@ Settings: `allow_experimental_parallel_reading_from_replicas=2, max_parallel_rep
 
 ## 4. Phase 3: Read Concurrency / QPS Scaling
 
-> ⚠️ **First, one critical point must be clear:** QPS is not a fixed metric of a cluster; it is **a function of query complexity**. Section 4.1 uses one heavy "full-table scan and aggregation" query to measure the **linearity of replica read scaling** (so the QPS value is low, only in the dozens); Section 4.2 adds actual QPS measurements for queries of different weights (point lookups can reach thousands). **Do not treat the ~52 QPS in Section 4.1 as the cluster's throughput ceiling** - it is the lower bound for the heaviest query.
+> **Metric boundary:** QPS depends on query complexity and is not a fixed property of a cluster. Section 4.1 uses one full-table scan and aggregation query to measure replica read scaling, so its QPS is in the dozens. Section 4.2 records QPS for other query types, including point lookups in the thousands. The ~52 QPS in Section 4.1 applies only to that full-table scan and is not a throughput ceiling for other query types.
 
 ### 4.1 Linearity of Read Scaling (Using a Heavy Full-Table Scan Query)
 
@@ -107,7 +107,7 @@ From the dedicated benchmark node, `clickhouse-benchmark` targeted the ClusterIP
 | Concurrency | Steady-state QPS | Relative to c=1 | Notes |
 |---|---|---|---|
 | 1 | ~22.5 | 1.0× | Single-connection baseline |
-| 2 | ~44.8 | **2.0×** | **Nearly perfect linear scaling - read scaling across 2 replicas is working** |
+| 2 | ~44.8 | **2.0×** | QPS increased proportionally from concurrency 1→2 |
 | 4 | ~50.5 | 2.2× | Beginning to saturate |
 | 8 | ~52 | 2.3× | Saturated |
 | 16 | ~52 | 2.3× | Saturated (no further improvement) |
@@ -116,9 +116,9 @@ Peak scan throughput: **~5 billion rows/second, ~20 GiB/s** (RPS/bandwidth, loca
 
 **Read scaling conclusions:**
 
-- **Concurrency from 1→2 achieved nearly perfect linear scaling (2.0×):** this validates that read QPS scales linearly with replica count and that ClusterIP round-robin distributes load evenly across 2 replicas.
+- **QPS at concurrency 2 was 2.0× the concurrency-1 result:** this is consistent with ClusterIP distributing the load across 2 replicas in this run.
 - **Saturation at ~52 QPS after concurrency 4:** because the test query performs a full-table scan and aggregation (scanning 100 million rows per query), **the CPUs of the 2 i8g instances are fully utilized at approximately 4 concurrent queries** - exactly illustrating that "read throughput ceiling = number of replicas × single-node concurrency capacity." For this kind of heavy scan workload, the way to raise the QPS ceiling is to **add replicas** (linearly).
-- Peak scan throughput was **~5 billion rows/second, ~20 GiB/s:** measured as "rows scanned per second (RPS)," the scan capacity of 2 i8g instances is extremely high - **QPS is only 52 because each query scans so many rows, not because the cluster is weak**.
+- Peak scan throughput was **~5 billion rows/second, ~20 GiB/s**. The QPS value of approximately 52 reflects that every query scanned about 100 million rows, so both QPS and RPS are needed to describe the result.
 - Extrapolation: with 3 replicas, the expected saturation QPS would be approximately ~75 (linear extrapolation).
 
 ### 4.2 Actual QPS for Different Query Types (Concurrency 8)
@@ -137,8 +137,8 @@ On the same cluster, QPS differed by 1-2 orders of magnitude depending on query 
 **Key conclusions:**
 
 1. **QPS is determined by query complexity; it is not a fixed property of the cluster:** on the same cluster, changing a query from a "full-table scan" to an "indexed lookup" increased QPS from ~48 to ~2,780 (**58×**).
-2. **RPS (rows scanned per second) better reflects actual hardware capability:** although full-table aggregation delivered only 48 QPS, RPS reached 4.8 billion rows/second - scan throughput was extremely high; each individual query simply did a large amount of "work."
-3. **Real serving/BI workloads fall in the range between point lookups and filtered aggregations (hundreds to thousands of QPS),** not the dozens produced by full-table scans. Instance selection and capacity planning should measure QPS using the **actual shape of the target queries**; full-table scan numbers cannot represent cluster capacity.
+2. **RPS (rows scanned per second) supplements QPS when describing scan capacity:** full-table aggregation delivered 48 QPS, corresponding to 4.8 billion rows/second; the lower QPS follows from the rows scanned per query.
+3. **Point lookups and filtered aggregations measured hundreds to thousands of QPS in this run,** while full-table scans measured dozens. Instance selection and capacity planning should use the actual target-query shapes; full-table scan results cannot represent other workloads.
 
 ---
 
@@ -158,7 +158,7 @@ Under continuous read load (concurrency 4, `--continue_on_errors`), one replica 
 
 ### Conclusion
 
-The HA design was fully validated: **single-replica failure → QPS fell by approximately 50% (2→1), service remained available, only 1 instantaneous query was lost, and the replica self-healed in approximately 65s**. This is consistent with the ReplicatedMergeTree characteristics of "multi-primary peer replication, no primary/secondary election, and the remaining replicas continue as normal when one fails."
+This Pod-deletion test observed that **after one replica failed, QPS fell by approximately 50% (2→1), service remained available, one in-flight query failed, and the replica recovered in approximately 65s**. The result is consistent with ReplicatedMergeTree peer replication. Simultaneous node and local-disk loss was outside this test's scope.
 
 ---
 
@@ -166,18 +166,18 @@ The HA design was fully validated: **single-replica failure → QPS fell by appr
 
 | Dimension | Result | Design proposition validated |
 |---|---|---|
-| Single-node query performance | 43 queries averaged 0.436s; 65% completed in under one second | i8g + local NVMe + vectorized scanning, a sweet spot for wide-table OLAP |
+| Single-node query performance | 43 queries averaged 0.436s; 65% completed in under one second | Wide-table OLAP baseline for this hardware and dataset size |
 | Compression efficiency | 3.8× | Columnar storage + compression |
 | Single-query ceiling | Slowest was 5.2s (Q29); heavy scans were limited by single-node CPU | "Scale up first" - single-node capacity has a ceiling |
 | parallel_replicas | Heavy queries accelerated by 1.3-1.8× (light queries became slower) | "Use parallel_replicas before sharding" - valid for heavy queries; must be enabled selectively |
-| Read scaling | Concurrency from 1→2 scaled linearly by 2.0× | "Adding replicas = linear read scaling" |
+| Read scaling | QPS at concurrency 2 was 2.0× the concurrency-1 result | Supports distributed reads across two replicas in this run |
 | QPS (by query weight) | Full-table scan ~48 → filtered aggregation ~370 → point lookup ~2,780 → empty query ~5,860 | QPS is a function of query complexity, not a fixed cluster value |
 | Read throughput ceiling | Under a heavy scan workload, saturation at ~4 concurrent queries due to single-node CPU; peak scanning at ~5 billion rows/s | "Read throughput = number of replicas × single-node concurrency" |
 | HA | No interruption on single-replica failure; QPS fell 50%; self-healed in ~65s | "Multi-primary peers; when one fails, the others continue as normal" |
 
 ### Alignment with the Design Positioning
 
-This round of performance testing in a real AWS environment validated the core propositions of this design (see [`docs/community-corroboration.en.md`](./community-corroboration.en.md)): **scale up a single shard vertically, use local NVMe to maximize the IO ceiling, add replicas for linear read scaling, and use parallel_replicas for heavy queries to postpone sharding**. All figures are measured results, and **unfavorable results, such as `parallel_replicas` slowing down light queries, are also recorded faithfully** rather than selectively omitted.
+This test provides measurements from a 1×2 environment for the following design choices (see [`docs/community-corroboration.en.md`](./community-corroboration.en.md)): **vertical scaling of one shard, local NVMe, distributing reads across replicas, and selective use of parallel_replicas for heavy queries**. The data also records cases where `parallel_replicas` slowed lighter queries. Applying the conclusions to 1×3 or other workloads requires corresponding tests.
 
 ### Potential Follow-up Work (Not Covered in This Round)
 

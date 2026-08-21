@@ -823,7 +823,7 @@ git commit -m "feat(k8s): namespace + 3-node Keeper CHK cross-AZ on gp3"
 **文件：**
 - 创建：`manifests/20-clickhouse-chi.yaml`
 
-这是核心拓扑。2 分片 × 2 副本 = 4 个 pod。通过 `local-storage` 类使用本地 NVMe。反亲和性将每台主机限制为一个副本；可用区分布约束将其分散到各 AZ。引用任务 9 中的 Keeper。包含 clickhouse-backup sidecar 容器和带有 IRSA 注解的 ServiceAccount（SA 在任务 11 的 CronJob 文件中创建，此处的注解位于 pod SA 上）。
+该任务定义 2 分片 × 2 副本,共 4 个 Pod。数据卷通过 `local-storage` 类使用本地 NVMe。反亲和性限制每台主机运行一个副本,可用区分布约束将副本分散到各 AZ。CHI 引用任务 9 中的 Keeper,并包含 clickhouse-backup sidecar 和带有 IRSA 注解的 ServiceAccount（SA 在任务 11 的 CronJob 文件中创建,此处的注解位于 Pod SA 上）。
 
 - [ ] **步骤 1：编写 `manifests/20-clickhouse-chi.yaml`**
 
@@ -1010,7 +1010,7 @@ spec:
                   done
 ```
 
-> **注意：** 备份容器使用 pod ServiceAccount 获取 IRSA，但任务 10 中的 sidecar 运行在 CH pod 内（该 pod 使用 operator 管理的 SA）。要让 IRSA 作用于 sidecar，README 说明了为 CHI pod 的 ServiceAccount 添加注解，或者将备份作为独立 deployment 运行。此处选择更简单且正确的默认方式：CronJob 触发 sidecar 的 REST API；sidecar 的 S3 凭证来自节点/pod IRSA。README 说明了如何在 CHI 中添加一行 `podTemplate.spec.serviceAccountName: clickhouse-backup`，将 IRSA 连接到 sidecar。
+> **注意：** 备份容器使用 Pod ServiceAccount 获取 IRSA,但任务 10 中的 sidecar 运行在 CH Pod 内（该 Pod 使用 operator 管理的 SA）。要让 IRSA 作用于 sidecar,README 说明了两种方式：为 CHI Pod 指定带注解的 ServiceAccount,或将备份作为独立 deployment 运行。本计划采用 CronJob 触发 sidecar REST API 的方式;sidecar 的 S3 凭证来自节点或 Pod IRSA。README 同时记录 `podTemplate.spec.serviceAccountName: clickhouse-backup` 配置。
 
 - [ ] **步骤 2：验证**
 

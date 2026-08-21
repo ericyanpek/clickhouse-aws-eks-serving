@@ -8,9 +8,9 @@
 
 ---
 
-## 一、核心结论:Operator 是整个生态的中心
+## 一、主要结论:Operator 是部署与运维的主要入口
 
-**Altinity Kubernetes Operator for ClickHouse 是事实标准**,没有第二个成熟到能与之竞争的选择。
+截至调研日期,Altinity Kubernetes Operator for ClickHouse 拥有较完整的公开文档、EKS 测试记录和生产案例,因此是本项目的默认候选。本次调研未找到证据充分、成熟度相当的第二个选择。
 
 | 属性 | 事实(2026-07-03 核实) |
 |---|---|
@@ -18,14 +18,14 @@
 | Stars / Releases | ~2,526 stars,88 个 release,最新 **0.27.1(2026-06-04)** |
 | 平台覆盖 | **明确在 AWS EKS** 测试(以及 GKE / AKS / Minikube) |
 | 背书 | 自 2019 年起是 **Altinity.Cloud 的底层**,用户含 eBay、Cisco、Twilio |
-| 成熟度 | ★★★★★ 生产级,推荐默认选择 |
+| 成熟度 | 有公开生产使用记录,本项目默认候选 |
 
 来源(primary):
 - https://github.com/Altinity/clickhouse-operator
 - https://altinity.com/kubernetes-operator
 - https://docs.altinity.com/altinitykubernetesoperator
 
-**权威模式验证**:ClickHouse 官方的 BYOC on AWS 本身就是这个模式——在客户 VPC 里的 EKS 上跑一个 ClickHouse operator + 配套服务(ingress、DNS、证书管理、state exporters、scrapers),日志/指标存 EBS,用 Prometheus/Thanos 栈。管理面在 ClickHouse 自有 VPC,通过私有端点访问、不直接接触客户数据。这等于官方用规模化生产验证了 "operator on EKS" 这条路。
+**原厂案例**:ClickHouse BYOC on AWS 在客户 VPC 的 EKS 上运行 ClickHouse operator 及配套服务(ingress、DNS、证书管理、state exporters、scrapers),日志和指标存放在 EBS,监控采用 Prometheus/Thanos。管理面位于 ClickHouse 自有 VPC,通过私有端点访问且不直接接触客户数据。该案例证明 ClickHouse 已在其 BYOC 产品中采用 operator on EKS 模式。
 - https://clickhouse.com/docs/cloud/reference/byoc/architecture
 - https://clickhouse.com/blog/building-clickhouse-byoc-on-aws
 
@@ -83,12 +83,12 @@
 
 ---
 
-## 五、快速起步:官方 Terraform Blueprint
+## 五、参考实现:Terraform Blueprint
 
-**绿地首选:Altinity 开源的 Terraform AWS EKS Blueprint(与 AWS EKS 团队合作开发)。**
+Altinity 提供开源 Terraform AWS EKS Blueprint,可作为绿地部署的起点。该项目由 Altinity 与 AWS EKS 团队合作开发。
 
-- 一把梭:**EKS + EBS + autoscaling + operator + ClickHouse + Keeper**。
-- 简化到"改几行控制文件 + 两条 terraform 命令"。
+- 覆盖 **EKS + EBS + autoscaling + operator + ClickHouse + Keeper**。
+- 主要配置通过控制文件和 Terraform 命令完成。
 - 默认用 **ClickHouse Keeper(不是 ZooKeeper)**。
 
 来源:
@@ -104,9 +104,9 @@
 以下为问题中点名、但**没有被确认性证据支撑**的点,不要当成已解决:
 
 1. **官方 ClickHouse Operator(2026-01 发布)** 的能力 / 成熟度 / 与 Altinity 的对比 —— 选型关键,需专门查。
-2. **存储选型细节**:EBS CSI vs local NVMe、gp3 IOPS/吞吐调优、卷扩展、`WaitForFirstConsumer` 绑定、**EBS 的可用区绑定性 vs 副本跨 AZ 放置的冲突** —— 有状态负载在 EKS 上最容易踩的坑,本次未拿到确证。
+2. **存储选型细节**:EBS CSI vs local NVMe、gp3 IOPS/吞吐调优、卷扩展、`WaitForFirstConsumer` 绑定、**EBS 的可用区绑定性 vs 副本跨 AZ 放置的冲突** —— 本次未取得足够证据支持具体结论。
 3. **clickhouse-backup 与 operator 集成**:S3 目标、调度、恢复流程、增量备份 —— 问题里点名了,但没有一条断言活下来。
-4. **有状态负载的 K8s 陷阱**:EBS 跨 AZ detach/reattach 延迟、PVC/StatefulSet 重调度、滚动升级顺序与副本 quorum 安全、磁盘写满恢复 —— 未证实,值得专门研究。
+4. **有状态负载的 K8s 约束**:EBS 跨 AZ detach/reattach 延迟、PVC/StatefulSet 重调度、滚动升级顺序与副本 quorum 安全、磁盘写满恢复 —— 本次未验证,需单独测试。
 
 ---
 

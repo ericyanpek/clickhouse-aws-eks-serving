@@ -1228,7 +1228,7 @@ clickhouse_clusters = {
 }
 ```
 
-- [x] **Step 5: 验证 plan 在 ebs-* 地址零变更（核心验收标准）**
+- [x] **Step 5: 验证 plan 在 ebs-* 地址零变更（资源独立性验收标准）**
 
 ```bash
 terraform -chdir=terraform plan -lock=false -out=/tmp/add-nvme.plan 2>&1 | tee /tmp/plan-add.log
