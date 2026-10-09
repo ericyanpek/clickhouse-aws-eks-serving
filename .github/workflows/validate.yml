@@ -1,0 +1,29 @@
+name: Validate sample
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+      - run: python3 -m pip install -r tests/requirements.txt
+      - run: python3 -m unittest discover -s tests -v
+      - run: shellcheck scripts/*.sh
+      - run: bash scripts/check-docs.sh
+      - run: terraform fmt -check -recursive terraform
+      - run: terraform -chdir=terraform init -backend=false -input=false
+      - run: terraform -chdir=terraform validate -no-color

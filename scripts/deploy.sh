@@ -14,7 +14,7 @@ fi
 ADMIN_SHA=$(printf '%s' "$CLICKHOUSE_ADMIN_PASSWORD" | sha256sum | awk '{print $1}')
 
 # Keep approval interactive for people. CI must explicitly opt in.
-TF_APPLY_ARGS=()
+TF_APPLY_ARGS=(-input=true)
 if [ "${AUTO_APPROVE:-false}" = "true" ]; then
   TF_APPLY_ARGS=(-input=false -auto-approve)
 fi
@@ -31,6 +31,7 @@ terraform init
 # -target is a deliberate, documented use here (not a workaround for a broken graph).
 echo "==> [1/6] terraform apply — phase 1: AWS infra only (EKS/VPC/nodegroups/S3/IRSA)"
 terraform apply "${TF_APPLY_ARGS[@]}" \
+  -target=terraform_data.cluster_config \
   -target=module.eks \
   -target=aws_eks_node_group.clickhouse \
   -target=aws_eks_node_group.keeper \

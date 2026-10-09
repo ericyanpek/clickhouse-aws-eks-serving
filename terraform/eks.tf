@@ -2,7 +2,7 @@ locals {
   # One node group per (cluster, AZ). Keys are strings, so adding or removing a
   # cluster does not shift any other cluster's address.
   ck_node_groups = merge([
-    for name, c in var.clickhouse_clusters : {
+    for name, c in local.clickhouse_clusters : {
       for az in c.zones : "${name}-${az}" => {
         cluster       = name
         az            = az
@@ -18,7 +18,7 @@ locals {
   ]...)
 
   kp_node_groups = merge([
-    for name, c in var.clickhouse_clusters : {
+    for name, c in local.clickhouse_clusters : {
       for az in c.zones : "${name}-${az}" => {
         cluster       = name
         az            = az
@@ -28,9 +28,9 @@ locals {
   ]...)
 
   # gp3 StorageClasses are only needed when at least one ebs cluster exists
-  ebs_clusters = { for k, v in var.clickhouse_clusters : k => v if v.storage_profile == "ebs" }
+  ebs_clusters = { for k, v in local.clickhouse_clusters : k => v if v.storage_profile == "ebs" }
   # local-storage class and provisioner are only needed for local-nvme clusters
-  has_local_nvme = anytrue([for v in var.clickhouse_clusters : v.storage_profile == "local-nvme"])
+  has_local_nvme = anytrue([for v in local.clickhouse_clusters : v.storage_profile == "local-nvme"])
 }
 
 module "eks" {

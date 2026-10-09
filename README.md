@@ -2,6 +2,8 @@
 
 **中文** · [English](./README.en.md)
 
+本项目是**参考实现／实验示例**，不构成生产就绪认证。历史性能与恢复结果仅适用于各报告记录的配置。项目采用 Apache-2.0 许可证，见 [LICENSE](./LICENSE)。
+
 > **架构前提:** 数据湖仓是唯一权威数据事实来源（Source of Truth, SoT），保存完整历史并支持重放。ClickHouse 只保存从湖仓派生、可重建的 MergeTree 数据，用作低延迟 OLAP / BI 查询加速层；它不是主数据存储，也不是唯一事实来源。
 >
 > 本仓库只部署 ClickHouse on EKS，不创建上游湖仓，也不实现 Kafka/Flink 摄入作业。采用本方案前，必须已经有可重放的数据湖仓和对应的批量或流式同步链路。仓库创建的 S3 bucket 仅用于 ClickHouse 备份/灾备，**不是湖仓 SoT**。
@@ -237,7 +239,7 @@ clickhouse_clusters = {
 }
 ```
 
-`availability_zones` 必须是同一区域内三个真实、不同的 AZ，且每个集群的 `zones` 必须是它的子集。`public_access_cidrs` 默认值会开放 EKS 公网 API，生产环境必须收紧。
+`availability_zones` 必须是 `region` 内三个不同的标准 AZ。集群省略 `zones` 时继承该列表；显式指定时必须选其中三个不同的 AZ，因为每集群固定部署三个专属 Keeper 节点。`shards` 和 `replicas` 必须为正整数，且乘积能被三个 AZ 均分。Terraform 会在创建基础设施前拒绝不合法的组合。示例采用文档 CIDR `203.0.113.0/24`，部署前必须替换为实际办公网络或 VPN 的公网 CIDR。
 
 每集群的 `cpu_request`、`memory_request` 和 `data_volume_size_gib` 默认按 16 vCPU / 128 GiB 的 Graviton 规格定尺。改 `instance_type` 时必须同步调整这三项，否则 Pod 会因资源超过节点可分配量而无法调度。
 
@@ -307,7 +309,7 @@ CLICKHOUSE_NAMESPACE=ck-ebs CLICKHOUSE_CHI=ebs \
   CLICKHOUSE_ADMIN_PASSWORD='...' ./scripts/smoke-test.sh
 ```
 
-`deploy.sh` 已对每个集群跑过一次 smoke test，上面是事后单独复验的方式。它会从 CHI 读取期望拓扑并据此断言 `system.clusters`、验证 ReplicatedMergeTree 写入、跨副本复制和 `system.replicas` 队列归零——拓扑与副本数不是硬编码的，因此非 1×3 的集群同样适用。
+`deploy.sh` 会对每个集群执行 smoke test。测试核对 CHI 声明的每个 shard/replica 组合，创建唯一命名的临时数据库，经 Distributed 表写入后同步所有副本，**按 shard** 对比副本行数与校验值、检查复制队列，并核对全局行数和 ID。成功或失败均清理测试数据库，因此重复运行不依赖去重窗口，也不修改用户表。多分片脚本行为有离线回归测试覆盖；已发表的 AWS 性能与 HA 实测仍仅适用于报告注明的配置。
 
 ClickHouse 默认仅在集群内可用。临时访问：
 
@@ -328,7 +330,7 @@ kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
 
 ## 11. 备份与恢复
 
-每个启用了备份的集群都有自己的每日 CronJob，在 `02:00 UTC` 调用 `clickhouse-backup`，将该分片的一个完整副本上传到 S3。bucket 是共享的、版本化、加密并阻断公有访问，但**每个集群写入自己的前缀** `s3://<bucket>/<集群 key>/`，且各自的 IRSA 角色只被授权该前缀——一个集群的备份凭据无法读写另一个集群的备份。
+每个启用了备份的集群都有自己的每日 CronJob，在 `02:00 UTC` 调用 `clickhouse-backup`，将**每个 shard** 的 replica 0 上传到 S3。各 shard 使用不同的 `<backup-set>-shard-<index>` 名称；全部上传成功后 Job 才成功并输出 `BACKUP_SET_COMPLETE`。副本不可用或上传失败会使 Job 失败。各 shard 顺序备份，不构成跨分片原子快照；恢复时需将完整备份集还原到对应 shard，再从湖仓核对或重放至所需 watermark。bucket 是共享的、版本化、加密并阻断公有访问，但**每个集群写入自己的前缀** `s3://<bucket>/<集群 key>/`，且各自的 IRSA 角色只被授权该前缀——一个集群的备份凭据无法读写另一个集群的备份。
 
 查看备份（以 `ebs` 集群为例）：
 
@@ -340,14 +342,14 @@ cd terraform && terraform output -raw backup_bucket
 
 单个集群可以用 `enable_backup = false` 关闭备份，此时该集群的 ServiceAccount、ConfigMap、CronJob 和 CHI 里的 sidecar 都不会被渲染。
 
-永久丢失本地 NVMe 节点时，Kubernetes 不会自动把 PVC 移到新节点。确认故障节点不会恢复且至少一个其他副本健康后执行（参数是 StatefulSet 名，形如 `chi-<集群 key>-main-<shard>-<replica>`）：
+永久丢失本地 NVMe 节点时，Kubernetes 不会自动把 PVC 移到新节点。确认故障节点不会恢复，且**同一 shard** 至少还有一个健康副本。必须显式指定 namespace，参数使用带末尾 `-0` 的完整 **Pod 名**，不能使用 StatefulSet 名：
 
 ```bash
-CONFIRM_REPLICA_DATA_LOSS=yes \
-  ./scripts/recover-local-replica.sh chi-nvme-main-0-1
+CLICKHOUSE_NAMESPACE=ck-nvme CONFIRM_REPLICA_DATA_LOSS=yes \
+  ./scripts/recover-local-replica.sh chi-nvme-main-0-1-0
 ```
 
-脚本拒绝删除 Ready Pod，只处理 `local-storage` PVC，并在清理旧 Pod/PVC/PV 时短暂停止 operator，随后恢复 operator 并等待新副本。Pod Ready 后仍需检查 `system.replicas` 队列归零。
+脚本拒绝删除 Ready Pod 或 Ready 节点上的 Pod，核对 PVC 归属和同 shard 健康副本，再暂停共享 operator 与故障副本的 StatefulSet，清理旧 Pod/PVC/PV；退出时恢复两者副本数。若旧 Pod 已不存在，需把其数据 PVC 作为第二个参数。暂停共享 operator 会暂时停止该 EKS 上全部 ClickHouse 集群的协调。新 Pod Ready 后仍需检查 `system.replicas` 队列归零。
 
 改用 EBS 数据卷时不需要这个重灌流程：[2026-08-13 演练](./docs/ha-drill-report.md) 实测停止一个数据节点后，原卷在 111 秒内重新挂载到**同 AZ** 替换节点，数据零重建、服务中断 3 秒。前提是节点组绑定单一子网——gp3 卷是 AZ 绑定资源，若节点组跨多个子网，替换节点可能落到其他 AZ 而无法挂载。该结论来自受控的实例停止，未覆盖 AZ 级故障或卷本身损坏；卷损坏时恢复路径与本地盘相同。
 
@@ -363,9 +365,15 @@ CONFIRM_REPLICA_DATA_LOSS=yes \
 
 脚本先删除集群内资源，再销毁 EKS/VPC。S3 备份桶及其版本化、加密和公有访问阻断配置会被保留，并从 Terraform state 移除。脚本会打印准确桶名；确认备份不再需要后，必须人工删除全部对象版本和 bucket。
 
-销毁顺序不是风格问题。**必须先删 CHI，让 EBS CSI 驱动在控制面还活着时回收卷**：数据卷的 `DeleteOnTermination` 是 `false`，控制面一消失 CSI 驱动随之消失，就再没有东西能删卷，卷会永久留在账单上。gp3 类的 `reclaimPolicy` 又是 `Retain`（这正是节点替换能重挂原卷的前提），删 PVC 也不删卷——所以 `teardown.sh` 在删 namespace **之前**读出每个 PV 的 `csi.volumeHandle`，之后逐个删卷并按标签兜底清扫。
+脚本从 Terraform state 读取账号、区域、EKS endpoint 与 CA，核对 AWS 调用身份及明确绑定的 kubectl context，只发现该 state 管理的 namespace。删除 Kubernetes 资源前，将精确的 EBS PV 卷 ID 保存到 `.teardown/<state-lineage>.json`。它不会仅按 namespace 标签扫描或删除卷。这个本地日志已加入忽略规则，应保留至销毁完成；中断后重跑会复用已记录的 ID。账号/context 不匹配或卷删除失败时停止销毁。
 
-teardown 也刻意做成**可重入且不依赖 Kubernetes API**（先把 helm/kubernetes 资源移出 state 再 destroy）。两者都来自实测教训：SSM 隧道中断会让 `helm_release` 卡住数分钟后失败且零资源被销毁，本地 DNS 故障会中断一次删除请求已生效的运行。
+`reclaimPolicy: Retain` 保护的是 PVC 被删除后的卷；保留 PVC 的正常节点替换并不要求该策略。遗留卷必须显式删除。若在**已保存经过核对的卷清单之后** Kubernetes API 变得不可用，可用日志继续全量销毁：
+
+```bash
+./scripts/teardown.sh --aws-only
+```
+
+此模式先销毁基础设施，再只删除日志记录的卷。没有先前清单时会拒绝执行，不会根据 namespace 猜测归属，也不会扫描其他 EKS。请保留原 Terraform state 和对应的凭证 profile。
 
 ### 12.1 停机省钱：先确认存储介质
 
@@ -417,3 +425,17 @@ aws autoscaling complete-lifecycle-action --region us-east-1 \
 - 不把 ClickHouse 或备份桶定义为唯一 SoT。
 
 `README.md` 与 `README.en.md` 是同步维护的中英文权威入口，章节编号和技术事实必须保持一致。`docs/` 下的调研、测试报告和历史实施计划属于支持材料，其权威级别和适用版本见 [docs/README.md](./docs/README.md)。
+
+## 14. 许可证与本地验证
+
+项目代码采用 [Apache-2.0](./LICENSE)。引用的 [Altinity Terraform 模块](https://github.com/Altinity/terraform-aws-eks-clickhouse/tree/v0.5.7)、operator、容器镜像及其他依赖保留各自许可证。
+
+以下检查不需要 AWS 资源或凭证。测试模拟 CLI 响应，覆盖备份编排与恢复失败路径，并使用隔离的 Terraform 配置验证变量约束；它们不能代替 AWS 部署和备份恢复演练。
+
+```bash
+python3 -m pip install -r tests/requirements.txt
+python3 -m unittest discover -s tests -v
+terraform fmt -check -recursive terraform
+shellcheck scripts/*.sh
+./scripts/check-docs.sh
+```

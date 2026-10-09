@@ -2,6 +2,12 @@
 **/.terraform/*
 *.tfstate
 *.tfstate.*
+tfplan
+*.tfplan
+*.tfplan.*
+*.plan
+*.plan.*
+tfplan.*
 crash.log
 *.tfvars.backup
 override.tf
@@ -29,3 +35,7 @@ results/
 
 # Session handoff notes: live cluster identifiers and short-lived state
 HANDOFF-*.md
+
+# Exact volume-ID journals used to resume an interrupted teardown.
+.teardown/
+__pycache__/

@@ -2,6 +2,8 @@
 
 [中文](./README.md) · **English**
 
+This project is a **reference implementation / experimental sample**, not a production-readiness certification. Historical performance and recovery results apply only to their documented configurations. See [LICENSE](./LICENSE) for the Apache-2.0 license.
+
 > **Architecture prerequisite:** the data lakehouse is the sole authoritative Source of Truth (SoT). It retains complete history and supports replay. ClickHouse stores only derived, rebuildable MergeTree data and serves as a low-latency OLAP / BI acceleration layer; it is neither the primary data store nor the sole source of truth.
 >
 > This repository deploys ClickHouse on EKS only. It does not create the upstream lakehouse or implement Kafka/Flink ingestion jobs. Before adopting this design, you must already have a replayable lakehouse and a batch or streaming synchronization path. The S3 bucket created by this repository is only for ClickHouse backup/DR; it is **not the lakehouse SoT**.
@@ -239,7 +241,7 @@ clickhouse_clusters = {
 }
 ```
 
-`availability_zones` must contain three real, distinct AZs in the same region, and each cluster's `zones` must be a subset of it. The default `public_access_cidrs` exposes the EKS public API and must be restricted for production.
+`availability_zones` must contain three distinct standard AZs in `region`. Omitted cluster `zones` inherit that list; explicit `zones` must contain three distinct AZs from it, because each cluster has three dedicated Keeper nodes. `shards` and `replicas` must be positive integers, and their product must divide evenly across the three AZs. Terraform rejects invalid combinations before creating infrastructure. The example uses the documentation CIDR `203.0.113.0/24`: replace it with your actual office/VPN public CIDR before deployment.
 
 Each cluster's `cpu_request`, `memory_request`, and `data_volume_size_gib` are sized for a 16 vCPU / 128 GiB Graviton instance. Change `instance_type` and you must adjust all three, or pods will fail to schedule because their requests exceed what the node can allocate.
 
@@ -309,7 +311,7 @@ CLICKHOUSE_NAMESPACE=ck-ebs CLICKHOUSE_CHI=ebs \
   CLICKHOUSE_ADMIN_PASSWORD='...' ./scripts/smoke-test.sh
 ```
 
-`deploy.sh` already runs the smoke test once per cluster; the above is how to re-run it afterwards. It reads the expected topology from the CHI and asserts `system.clusters` against it, then validates ReplicatedMergeTree writes, cross-replica synchronization, and that the `system.replicas` queues drain. Topology and replica count are not hardcoded, so clusters that are not 1×3 are covered too.
+`deploy.sh` runs the smoke test for each cluster. The test verifies every shard/replica pair against the CHI, creates a uniquely named temporary database, and writes through a Distributed table. It synchronizes every replica, compares row counts and checksums **within each shard**, checks replication queues, and verifies the global row count and IDs. Cleanup runs on success and failure, so repeated tests do not depend on deduplication windows or modify user tables. Multi-shard script behavior is covered by offline regression tests; published AWS performance/HA measurements remain limited to the configurations stated in those reports.
 
 ClickHouse is available only inside the cluster by default. For temporary access:
 
@@ -330,7 +332,7 @@ Monitor replica delay, replication queues, disk usage, merge backlog, query late
 
 ## 11. Backup and Recovery
 
-Every cluster with backup enabled gets its own daily CronJob, which calls `clickhouse-backup` at `02:00 UTC` and uploads one complete replica of its shard to S3. The bucket is shared, versioned, encrypted, and public-access-blocked, but **each cluster writes to its own prefix**, `s3://<bucket>/<cluster key>/`, and each cluster's IRSA role is authorized only for that prefix — one cluster's backup credentials cannot read or write another's.
+Every cluster with backup enabled gets its own daily CronJob, which calls `clickhouse-backup` at `02:00 UTC` and uploads replica 0 of **every shard** to S3. Each shard uses a distinct `<backup-set>-shard-<index>` name. The Job succeeds and logs `BACKUP_SET_COMPLETE` only after every upload succeeds; an unavailable replica or failed upload fails the Job. Per-shard backups are sequential, not an atomic cross-shard snapshot. Restore a complete set into the corresponding shards and reconcile/replay from the lakehouse to the required watermark.  The bucket is shared, versioned, encrypted, and public-access-blocked, but **each cluster writes to its own prefix**, `s3://<bucket>/<cluster key>/`, and each cluster's IRSA role is authorized only for that prefix — one cluster's backup credentials cannot read or write another's.
 
 Inspect backups (using the `ebs` cluster):
 
@@ -342,14 +344,14 @@ cd terraform && terraform output -raw backup_bucket
 
 An individual cluster can set `enable_backup = false`, in which case its ServiceAccount, ConfigMap, CronJob, and the CHI sidecar are all left unrendered.
 
-When a local-NVMe node is permanently lost, Kubernetes does not automatically move its PVC to a new node. After confirming that the node will not return and at least one other replica is healthy, run the following (the argument is the StatefulSet name, of the form `chi-<cluster key>-main-<shard>-<replica>`):
+When a local-NVMe node is permanently lost, Kubernetes does not automatically move its PVC to a new node. Confirm that the node will not return and another replica of **the same shard** is healthy. Explicitly specify the namespace and pass the full **Pod name**, including the final `-0` (not the StatefulSet name):
 
 ```bash
-CONFIRM_REPLICA_DATA_LOSS=yes \
-  ./scripts/recover-local-replica.sh chi-nvme-main-0-1
+CLICKHOUSE_NAMESPACE=ck-nvme CONFIRM_REPLICA_DATA_LOSS=yes \
+  ./scripts/recover-local-replica.sh chi-nvme-main-0-1-0
 ```
 
-The script refuses to delete a Ready Pod, handles only a `local-storage` PVC, briefly pauses the operator while removing the old Pod/PVC/PV, restores the operator, and waits for the replacement replica. After the Pod is Ready, verify that `system.replicas` queues have drained.
+The script rejects a Ready Pod or Ready node, checks PVC ownership and a same-shard peer, then pauses both the shared operator and the failed replica's StatefulSet before deleting its Pod/PVC/PV. It restores their replica counts on exit. If the old Pod is already gone, pass its data PVC as the second argument. Pausing the shared operator temporarily pauses reconciliation for all ClickHouse clusters on that EKS. After the replacement Pod is Ready, verify that `system.replicas` queues have drained.
 
 This reload flow is not needed with EBS data volumes. In the [2026-08-13 drill](./docs/ha-drill-report.en.md), stopping a data node let the original volume reattach to a **same-AZ** replacement node within 111 seconds, with zero data rebuild and 3 seconds of service interruption. This depends on each node group being pinned to a single subnet: a gp3 volume is AZ-scoped, so if a node group spanned several subnets the replacement node could land in another AZ and fail to attach. The result comes from a controlled instance stop and does not cover AZ-level failure or loss of the volume itself; if the volume is lost, the recovery path is the same as local storage.
 
@@ -365,9 +367,15 @@ If every ClickHouse replica is lost, rebuild by partition from the upstream lake
 
 The script removes in-cluster resources before destroying EKS/VPC. It retains the S3 backup bucket together with versioning, encryption, and public-access-block settings, and removes those resources from Terraform state. It prints the exact bucket name. Delete all object versions and the bucket manually only after confirming that the backups are no longer needed.
 
-The ordering is not a matter of style. **The CHI must go first so the EBS CSI driver reclaims the volumes while the control plane is still alive**: data volumes have `DeleteOnTermination` set to `false`, so once the control plane is gone the CSI driver goes with it and nothing is left to delete them — they stay on the bill forever. The gp3 class also uses `reclaimPolicy: Retain`, which is precisely what lets a replacement node reattach the original volume, so deleting a PVC does not delete its volume either. `teardown.sh` therefore reads each PV's `csi.volumeHandle` **before** the namespace is deleted, then deletes the volumes and finishes with a tag-based sweep.
+The script reads the account, region, EKS endpoint and CA from Terraform state, checks the AWS caller and the explicitly pinned kubectl context, and discovers only namespaces owned by that state. Before deleting Kubernetes resources it records their exact EBS PV handles in `.teardown/<state-lineage>.json`. It never lists or deletes volumes based only on namespace tags. Keep this ignored local journal until teardown completes; an interrupted run reuses its recorded IDs. A mismatched account/context or failed volume deletion stops teardown.
 
-Teardown is also deliberately **re-entrant and free of any Kubernetes API dependency** (it removes helm/kubernetes resources from state before destroying). Both come from measured failures: a dropped SSM tunnel left a `helm_release` stalling for minutes before failing with zero resources destroyed, and a local DNS failure interrupted a run whose delete requests had already taken effect.
+`reclaimPolicy: Retain` protects a volume when its PVC is deleted; it is not required for ordinary node replacement while the PVC remains. Retained volumes must be deleted explicitly. If the Kubernetes API becomes unavailable **after a verified inventory was saved**, resume full teardown with the journal:
+
+```bash
+./scripts/teardown.sh --aws-only
+```
+
+This mode destroys infrastructure and then deletes only the recorded volumes. Without a prior inventory it refuses to proceed; it does not guess ownership from a namespace or scan other EKS clusters. Keep the original Terraform state and credential profile.
 
 ### 12.1 Stopping Nodes to Save Money: Check the Storage Medium First
 
@@ -419,3 +427,17 @@ Current non-goals:
 - It never defines ClickHouse or the backup bucket as the sole SoT.
 
 `README.md` and `README.en.md` are the synchronized Chinese and English canonical entry points. Their section numbering and technical facts must remain aligned. Research, test reports, and historical implementation plans under `docs/` are supporting artifacts; see [docs/README.en.md](./docs/README.en.md) for authority and version status.
+
+## 14. License and local validation
+
+The project code is licensed under [Apache-2.0](./LICENSE). The referenced [Altinity Terraform module](https://github.com/Altinity/terraform-aws-eks-clickhouse/tree/v0.5.7), operators, container images, and other dependencies retain their own licenses.
+
+Run the following checks without AWS resources or credentials. Tests simulate CLI responses, exercise backup orchestration and recovery failure paths, and use an isolated Terraform configuration for variable validation. They do not replace an AWS deployment or backup/restore drill.
+
+```bash
+python3 -m pip install -r tests/requirements.txt
+python3 -m unittest discover -s tests -v
+terraform fmt -check -recursive terraform
+shellcheck scripts/*.sh
+./scripts/check-docs.sh
+```

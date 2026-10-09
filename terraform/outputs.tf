@@ -26,6 +26,11 @@ output "region" {
   value = var.region
 }
 
+output "aws_profile" {
+  description = "AWS CLI profile used by deployment and teardown (null uses the credential chain)."
+  value       = var.aws_profile
+}
+
 output "clickhouse_cluster_names" {
   description = "Configured ClickHouse cluster keys, for deploy.sh to iterate."
   value       = keys(var.clickhouse_clusters)
@@ -34,7 +39,7 @@ output "clickhouse_cluster_names" {
 output "clickhouse_cluster_config" {
   description = "Per-cluster render parameters, for deploy.sh to fill the manifest templates."
   value = {
-    for k, v in var.clickhouse_clusters : k => {
+    for k, v in local.clickhouse_clusters : k => {
       storage_profile      = v.storage_profile
       storage_class        = v.storage_profile == "ebs" ? "ck-${k}-gp3" : "local-storage"
       shards               = v.shards

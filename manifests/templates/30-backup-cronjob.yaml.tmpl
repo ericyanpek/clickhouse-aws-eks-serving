@@ -33,6 +33,7 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
+      backoffLimit: 0
       template:
         spec:
           serviceAccountName: clickhouse-backup
@@ -40,16 +41,30 @@ spec:
           containers:
             - name: trigger
               image: curlimages/curl:8.10.1
+              env:
+                - name: POD_UID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.uid
               command:
                 - /bin/sh
                 - -c
                 - |
                   set -e
-                  BACKUP="backup-$(date +%Y%m%d-%H%M%S)"
-                  # 1 shard: any replica holds the full dataset, so back up one replica only.
-                  # (chi-<chi>-<cluster>-<shard>-<replica>; shard 0, replica 0.)
-                  BASE="http://chi-__CLUSTER__-main-0-0.__NAMESPACE__.svc.cluster.local:7171"
-                  # background=false makes the REST calls synchronous so curl -sf waits and
-                  # a real failure fails the job (create is async by default → upload would race).
-                  curl -sf -X POST "$BASE/backup/create?name=$BACKUP&background=false"
-                  curl -sf -X POST "$BASE/backup/upload/$BACKUP?background=false"
+                  BACKUP_SET="backup-$(date -u +%Y%m%d-%H%M%S)-$POD_UID"
+                  shard=0
+                  while [ "$shard" -lt "__SHARDS__" ]; do
+                    # Each shard owns different data. Use replica 0 of EVERY shard,
+                    # and distinct names to avoid overwriting another shard in S3.
+                    BACKUP="$BACKUP_SET-shard-$shard"
+                    BASE="http://chi-__CLUSTER__-main-$shard-0.__NAMESPACE__.svc.cluster.local:7171"
+                    echo "Creating $BACKUP"
+                    curl --fail --silent --show-error --connect-timeout 10 \
+                      -X POST "$BASE/backup/create?name=$BACKUP&background=false"
+                    curl --fail --silent --show-error --connect-timeout 10 \
+                      -X POST "$BASE/backup/upload/$BACKUP?background=false"
+                    shard=$((shard + 1))
+                  done
+                  # A failed/partial run never emits this marker or succeeds as a Job.
+                  # This is a set of per-shard backups, not an atomic cluster snapshot.
+                  echo "BACKUP_SET_COMPLETE=$BACKUP_SET SHARDS=__SHARDS__"

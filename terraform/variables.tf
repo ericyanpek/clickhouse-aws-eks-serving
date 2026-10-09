@@ -10,8 +10,8 @@ variable "availability_zones" {
   default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
 
   validation {
-    condition     = length(var.availability_zones) == 3
-    error_message = "This design assumes exactly 3 availability zones."
+    condition     = length(var.availability_zones) == 3 && length(distinct(var.availability_zones)) == 3
+    error_message = "This design requires exactly 3 distinct availability zones."
   }
 }
 
@@ -67,7 +67,7 @@ variable "clickhouse_clusters" {
     storage_profile      = optional(string, "ebs")
     shards               = optional(number, 1)
     replicas             = optional(number, 3)
-    zones                = optional(list(string), ["us-east-1a", "us-east-1b", "us-east-1c"])
+    zones                = optional(list(string))
     instance_type        = optional(string, "")
     gp3_iops             = optional(number, 20000)
     gp3_throughput_mibps = optional(number, 1250)
@@ -89,8 +89,8 @@ variable "clickhouse_clusters" {
   }
 
   validation {
-    condition     = alltrue([for k, v in var.clickhouse_clusters : can(regex("^[a-z0-9-]+$", k))])
-    error_message = "Cluster keys may contain only lowercase letters, digits, and hyphens."
+    condition     = alltrue([for k, v in var.clickhouse_clusters : can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", k))])
+    error_message = "Cluster keys must start and end with a lowercase letter or digit and contain only lowercase letters, digits, and hyphens."
   }
 
   validation {
@@ -102,26 +102,25 @@ variable "clickhouse_clusters" {
     # One pod per node and one node group per AZ, so total pods must divide evenly
     # across AZs. shards is included because the CHI provisions shards x replicas
     # pods while the node groups must supply a node for each of them.
-    condition     = alltrue([for k, v in var.clickhouse_clusters : (v.shards * v.replicas) % length(v.zones) == 0])
+    condition     = alltrue([for k, v in var.clickhouse_clusters : try((v.shards * v.replicas) % length(v.zones) == 0, (v.shards * v.replicas) % 3 == 0)])
     error_message = "shards x replicas must be a multiple of the number of zones (each AZ carries an equal share)."
   }
 
   validation {
-    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas >= 1 && v.shards >= 1])
-    error_message = "shards and replicas must both be at least 1."
+    condition     = alltrue([for k, v in var.clickhouse_clusters : v.replicas >= 1 && v.shards >= 1 && floor(v.replicas) == v.replicas && floor(v.shards) == v.shards])
+    error_message = "shards and replicas must both be positive integers."
   }
 
   validation {
-    # Keeper places one member per AZ, so an even AZ count yields an even Raft
-    # ensemble, which tolerates no failures at all.
-    condition     = alltrue([for k, v in var.clickhouse_clusters : length(v.zones) % 2 == 1])
-    error_message = "zones must contain an odd number of AZs so the Keeper ensemble forms a real quorum."
+    # The CHK template always creates three Keeper pods on dedicated nodes.
+    condition     = alltrue([for k, v in var.clickhouse_clusters : try(length(v.zones) == 3, true)])
+    error_message = "zones must contain exactly 3 AZs for the three dedicated Keeper nodes, or be omitted to inherit availability_zones."
   }
 
   validation {
     # A duplicate AZ would otherwise surface as "Two different items produced the
     # key" from deep inside a for expression, pointing at nothing the user typed.
-    condition     = alltrue([for k, v in var.clickhouse_clusters : length(distinct(v.zones)) == length(v.zones)])
+    condition     = alltrue([for k, v in var.clickhouse_clusters : try(length(distinct(v.zones)) == length(v.zones), true)])
     error_message = "zones must not contain duplicate availability zones."
   }
 

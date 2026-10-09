@@ -3,15 +3,19 @@ set -euo pipefail
 
 # Rebind one permanently lost ClickHouse local-NVMe replica to a fresh local PV.
 # This deliberately deletes the failed replica's Pod, PVC, and stale PV.
-NS=${CLICKHOUSE_NAMESPACE:-clickhouse}
+NS=${CLICKHOUSE_NAMESPACE:-}
 POD=${1:-}
 PVC=${2:-}
 TIMEOUT=${RECOVERY_TIMEOUT:-2h}
 OPERATOR_NS=${CLICKHOUSE_OPERATOR_NAMESPACE:-kube-system}
 OPERATOR_DEPLOYMENT=${CLICKHOUSE_OPERATOR_DEPLOYMENT:-altinity-clickhouse-operator}
 OPERATOR_SCALED=false
+STS_SCALED=false
 
 restore_operator() {
+  if [ "$STS_SCALED" = "true" ]; then
+    kubectl -n "$NS" scale "statefulset/$STS" --replicas="$STS_REPLICAS" >/dev/null || true
+  fi
   if [ "$OPERATOR_SCALED" = "true" ]; then
     echo "==> restoring operator deployment to $OPERATOR_REPLICAS replica(s)"
     kubectl -n "$OPERATOR_NS" scale "deployment/$OPERATOR_DEPLOYMENT" \
@@ -21,10 +25,10 @@ restore_operator() {
 trap restore_operator EXIT
 
 usage() {
-  echo "Usage: CONFIRM_REPLICA_DATA_LOSS=yes $0 <failed-pod> [data-pvc]" >&2
+  echo "Usage: CLICKHOUSE_NAMESPACE=ck-<key> CONFIRM_REPLICA_DATA_LOSS=yes $0 <failed-pod> [data-pvc]" >&2
 }
 
-if [ -z "$POD" ]; then
+if [ -z "$POD" ] || [ -z "$NS" ]; then
   usage
   exit 2
 fi
@@ -41,6 +45,15 @@ if kubectl -n "$NS" get pod "$POD" >/dev/null 2>&1; then
   if [ "$POD_READY" = "True" ]; then
     echo "ERROR: $NS/$POD is Ready; refusing to delete a healthy replica." >&2
     exit 1
+  fi
+  NODE=$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.nodeName}')
+  if [ -n "$NODE" ]; then
+    NODE_READY=$(kubectl get node "$NODE" --ignore-not-found \
+      -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}')
+    if [ "$NODE_READY" = "True" ]; then
+      echo "ERROR: node $NODE is Ready; this runbook is only for permanently lost nodes." >&2
+      exit 1
+    fi
   fi
 
   if [ -z "$PVC" ]; then
@@ -81,13 +94,38 @@ if [ -z "$CHI" ]; then
   exit 1
 fi
 
-READY_PEERS=$(kubectl -n "$NS" get pods -l "clickhouse.altinity.com/chi=$CHI" \
+SHARD=$(kubectl -n "$NS" get pvc "$PVC" -o jsonpath='{.metadata.labels.clickhouse\.altinity\.com/shard}')
+CLUSTER=$(kubectl -n "$NS" get pvc "$PVC" -o jsonpath='{.metadata.labels.clickhouse\.altinity\.com/cluster}')
+if [ -z "$SHARD" ] || [ -z "$CLUSTER" ]; then
+  echo "ERROR: PVC lacks shard/cluster labels; cannot prove a same-shard recovery source." >&2
+  exit 1
+fi
+READY_PEERS=$(kubectl -n "$NS" get pods \
+  -l "clickhouse.altinity.com/chi=$CHI,clickhouse.altinity.com/cluster=$CLUSTER,clickhouse.altinity.com/shard=$SHARD" \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' \
   | awk -v target="$POD" '$1 != target && $2 == "True" { count++ } END { print count + 0 }')
 if [ "$READY_PEERS" -lt 1 ]; then
-  echo "ERROR: no other Ready ClickHouse replica is available; restore from S3 instead." >&2
+  echo "ERROR: no other Ready replica of shard $SHARD is available; rebuild from the lakehouse or restore a verified backup." >&2
   exit 1
 fi
+
+# Pausing the operator alone does not pause Kubernetes' StatefulSet controller.
+# Verify the supplied PVC belongs to this Pod's StatefulSet before scaling it.
+STS=${POD%-*}
+STS_JSON=$(kubectl -n "$NS" get statefulset "$STS" -o json)
+printf '%s' "$STS_JSON" | python3 -c '
+import json,sys
+s=json.load(sys.stdin); pod,pvc,chi=sys.argv[1:]
+name=s["metadata"]["name"]
+labels=s["metadata"].get("labels", {})
+claims={t["metadata"]["name"]+"-"+pod for t in s["spec"].get("volumeClaimTemplates", [])}
+claims.update(v["persistentVolumeClaim"]["claimName"] for v in
+              s["spec"]["template"]["spec"].get("volumes", []) if "persistentVolumeClaim" in v)
+if labels.get("clickhouse.altinity.com/chi") != chi or pod != name+"-0" or pvc not in claims:
+    sys.exit("ERROR: Pod/PVC does not belong to the expected ClickHouse StatefulSet")
+' "$POD" "$PVC" "$CHI"
+STS_REPLICAS=$(printf '%s' "$STS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"]["replicas"])')
+[ "$STS_REPLICAS" = "1" ] || { echo "ERROR: expected a one-Pod StatefulSet." >&2; exit 1; }
 
 PV=$(kubectl -n "$NS" get pvc "$PVC" -o jsonpath='{.spec.volumeName}')
 if [ -z "$PV" ]; then
@@ -105,13 +143,20 @@ fi
 echo "==> recovering $NS/$POD from $READY_PEERS healthy peer replica(s)"
 echo "    deleting PVC $PVC and stale local PV $PV"
 echo "==> temporarily pausing the operator to prevent Pod/PVC recreation races"
-kubectl -n "$OPERATOR_NS" scale "deployment/$OPERATOR_DEPLOYMENT" --replicas=0
 OPERATOR_SCALED=true
+kubectl -n "$OPERATOR_NS" scale "deployment/$OPERATOR_DEPLOYMENT" --replicas=0
 kubectl -n "$OPERATOR_NS" rollout status "deployment/$OPERATOR_DEPLOYMENT" --timeout=2m
 
-kubectl -n "$NS" delete pod "$POD" --ignore-not-found --wait=true
-kubectl -n "$NS" delete pvc "$PVC" --wait=true
-kubectl delete pv "$PV" --ignore-not-found --wait=true
+STS_SCALED=true
+kubectl -n "$NS" scale "statefulset/$STS" --replicas=0
+# The caller confirmed permanent node loss. A dead kubelet cannot acknowledge
+# graceful deletion; the StatefulSet is now stopped so it cannot recreate the Pod.
+kubectl -n "$NS" delete pod "$POD" --ignore-not-found --grace-period=0 --force --wait=true --timeout=120s
+kubectl -n "$NS" delete pvc "$PVC" --wait=true --timeout=120s
+kubectl delete pv "$PV" --ignore-not-found --wait=true --timeout=120s
+
+kubectl -n "$NS" scale "statefulset/$STS" --replicas="$STS_REPLICAS"
+STS_SCALED=false
 
 echo "==> restoring operator deployment to $OPERATOR_REPLICAS replica(s)"
 kubectl -n "$OPERATOR_NS" scale "deployment/$OPERATOR_DEPLOYMENT" \

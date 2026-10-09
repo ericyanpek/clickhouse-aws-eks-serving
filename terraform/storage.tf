@@ -26,9 +26,9 @@ resource "kubernetes_storage_class" "clickhouse_gp3" {
     throughput = tostring(each.value.gp3_throughput_mibps)
   }
 
-  # Retain rather than Delete: the whole point of this profile is that a volume
-  # outlives its node. Delete would discard data the moment a PVC is removed,
-  # which is exactly the local-NVMe failure mode this profile exists to avoid.
+  # Retain protects data when a PVC is deleted. Both Retain and Delete allow
+  # same-AZ reattachment after node replacement while the PVC still exists.
+  # Retained volumes require explicit cleanup; teardown records exact PV handles.
   reclaim_policy = "Retain"
   # WaitForFirstConsumer binds the volume in the AZ where the pod is scheduled,
   # matching the AZ-scoped nature of a gp3 volume.

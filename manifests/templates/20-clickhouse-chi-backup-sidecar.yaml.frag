@@ -9,6 +9,8 @@
                   cpu: "500m"
                   memory: "512Mi"
               env:
+                - name: API_LISTEN
+                  value: "0.0.0.0:7171"
                 - name: LOG_LEVEL
                   value: "info"
                 - name: REMOTE_STORAGE
